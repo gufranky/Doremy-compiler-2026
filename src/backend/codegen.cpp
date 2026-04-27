@@ -1,0 +1,1653 @@
+#include <algorithm>
+#include <set>
+#include <sstream>
+
+#include "backend_codegen.h"
+
+using namespace ir;
+using namespace regalloc;
+
+// ================== Assembly-level Peephole Optimizer ==================
+namespace {
+
+inline bool startsWith(const std::string& s, const std::string& prefix) {
+  return s.rfind(prefix, 0) == 0;
+}
+
+inline std::string trim(const std::string& s) {
+  size_t b = 0;
+  while (b < s.size() && (s[b] == ' ' || s[b] == '\t')) b++;
+  size_t e = s.size();
+  while (e > b && (s[e-1] == ' ' || s[e-1] == '\t')) e--;
+  return s.substr(b, e - b);
+}
+
+inline bool isLabelLine(const std::string& line) {
+  std::string t = trim(line);
+  return !t.empty() && t.back() == ':';
+}
+
+// Optimize move chains: mv t0, a0; mv t1, t0 -> mv t1, a0
+std::vector<std::string> optimizeMoveChains(const std::vector<std::string>& lines) {
+  std::vector<std::string> result;
+  result.reserve(lines.size());
+  
+  std::string prevDest, prevSrc;
+  
+  for (const auto& line : lines) {
+    std::string t = trim(line);
+    
+    // Check for "mv x, x" (self-move) - remove it
+    if (startsWith(t, "addi ")) {
+      // addi rd, rs, 0 is a move
+      size_t comma1 = t.find(',');
+      if (comma1 != std::string::npos) {
+        std::string rest = t.substr(comma1 + 1);
+        size_t comma2 = rest.find(',');
+        if (comma2 != std::string::npos) {
+          std::string rd = trim(t.substr(5, comma1 - 5));
+          std::string rs = trim(rest.substr(0, comma2));
+          std::string imm = trim(rest.substr(comma2 + 1));
+          
+          if (imm == "0" && rd == rs) {
+            // Self-move, skip
+            continue;
+          }
+          
+          // Check for move chain optimization
+          if (imm == "0" && !prevDest.empty() && rs == prevDest) {
+            // Current: addi rd, prevDest, 0
+            // Replace with: addi rd, prevSrc, 0
+            result.push_back("\taddi " + rd + ", " + prevSrc + ", 0");
+            prevDest = rd;
+            // prevSrc stays the same
+            continue;
+          }
+          
+          if (imm == "0") {
+            prevDest = rd;
+            prevSrc = rs;
+          } else {
+            prevDest.clear();
+            prevSrc.clear();
+          }
+        }
+      }
+    } else if (isLabelLine(line) || startsWith(t, "j ") || startsWith(t, "jal ") ||
+               startsWith(t, "bne ") || startsWith(t, "beq ") || 
+               startsWith(t, "call ") || startsWith(t, "ret")) {
+      // Control flow breaks the chain
+      prevDest.clear();
+      prevSrc.clear();
+    } else {
+      // Other instructions may define registers, conservatively clear
+      prevDest.clear();
+      prevSrc.clear();
+    }
+    
+    result.push_back(line);
+  }
+  
+  return result;
+}
+
+// Remove store followed by load of same location to same register
+std::vector<std::string> optimizeLoadStore(const std::vector<std::string>& lines) {
+  std::vector<std::string> result;
+  result.reserve(lines.size());
+  
+  for (size_t i = 0; i < lines.size(); ++i) {
+    std::string t = trim(lines[i]);
+    
+    // Pattern: sw rX, offset(base) followed by lw rX, offset(base)
+    if (startsWith(t, "sw ") && i + 1 < lines.size()) {
+      std::string next = trim(lines[i + 1]);
+      if (startsWith(next, "lw ")) {
+        // Extract register and offset from both
+        std::string swRest = t.substr(3);
+        std::string lwRest = next.substr(3);
+        
+        size_t swComma = swRest.find(',');
+        size_t lwComma = lwRest.find(',');
+        
+        if (swComma != std::string::npos && lwComma != std::string::npos) {
+          std::string swReg = trim(swRest.substr(0, swComma));
+          std::string lwReg = trim(lwRest.substr(0, lwComma));
+          std::string swOffset = trim(swRest.substr(swComma + 1));
+          std::string lwOffset = trim(lwRest.substr(lwComma + 1));
+          
+          if (swReg == lwReg && swOffset == lwOffset) {
+            // Skip the redundant lw
+            result.push_back(lines[i]);
+            i++;  // Skip next line (lw)
+            continue;
+          }
+        }
+      }
+    }
+    
+    result.push_back(lines[i]);
+  }
+  
+  return result;
+}
+
+// Remove redundant operations like add with zero
+std::vector<std::string> optimizeRedundantOps(const std::vector<std::string>& lines) {
+  std::vector<std::string> result;
+  result.reserve(lines.size());
+  
+  // Track known values for simple constant propagation
+  std::unordered_map<std::string, int> knownValues;
+  
+  for (const auto& line : lines) {
+    std::string t = trim(line);
+    bool skip = false;
+    
+    // Track li instructions
+    if (startsWith(t, "addi ") && t.find("x0") != std::string::npos) {
+      // addi rd, x0, imm is li rd, imm
+      size_t comma1 = t.find(',');
+      if (comma1 != std::string::npos) {
+        std::string rest = t.substr(comma1 + 1);
+        size_t comma2 = rest.find(',');
+        if (comma2 != std::string::npos) {
+          std::string rs = trim(rest.substr(0, comma2));
+          if (rs == "x0") {
+            std::string rd = trim(t.substr(5, comma1 - 5));
+            std::string immStr = trim(rest.substr(comma2 + 1));
+            try {
+              int imm = std::stoi(immStr);
+              knownValues[rd] = imm;
+            } catch (...) {}
+          }
+        }
+      }
+    }
+    
+    // Check for add with known zero
+    if (startsWith(t, "add ")) {
+      size_t comma1 = t.find(',');
+      if (comma1 != std::string::npos) {
+        std::string rest = t.substr(comma1 + 1);
+        size_t comma2 = rest.find(',');
+        if (comma2 != std::string::npos) {
+          std::string dest = trim(t.substr(4, comma1 - 4));
+          std::string src1 = trim(rest.substr(0, comma2));
+          std::string src2 = trim(rest.substr(comma2 + 1));
+          
+          // add dest, src1, src2 where src2 is known 0 and dest == src1
+          if (knownValues.count(src2) && knownValues[src2] == 0 && dest == src1) {
+            skip = true;
+          }
+        }
+      }
+    }
+    
+    // Check for mul with known 1
+    if (startsWith(t, "mul ")) {
+      size_t comma1 = t.find(',');
+      if (comma1 != std::string::npos) {
+        std::string rest = t.substr(comma1 + 1);
+        size_t comma2 = rest.find(',');
+        if (comma2 != std::string::npos) {
+          std::string dest = trim(t.substr(4, comma1 - 4));
+          std::string src1 = trim(rest.substr(0, comma2));
+          std::string src2 = trim(rest.substr(comma2 + 1));
+          
+          if (knownValues.count(src2) && knownValues[src2] == 1 && dest == src1) {
+            skip = true;
+          }
+        }
+      }
+    }
+    
+    // Clear known values on control flow or redefinition
+    if (isLabelLine(line) || startsWith(t, "j ") || startsWith(t, "jal ") ||
+        startsWith(t, "call ") || startsWith(t, "ret") ||
+        startsWith(t, "bne ") || startsWith(t, "beq ")) {
+      knownValues.clear();
+    }
+    
+    if (!skip) {
+      result.push_back(line);
+    }
+  }
+  
+  return result;
+}
+
+// Remove jumps to next label
+std::vector<std::string> optimizeJumpToNext(const std::vector<std::string>& lines) {
+  std::vector<std::string> result;
+  result.reserve(lines.size());
+  
+  for (size_t i = 0; i < lines.size(); ++i) {
+    std::string t = trim(lines[i]);
+    
+    // Check for "jal x0, label" or "j label"
+    std::string target;
+    if (startsWith(t, "jal x0, ")) {
+      target = trim(t.substr(8));
+    } else if (startsWith(t, "j ")) {
+      target = trim(t.substr(2));
+    }
+    
+    if (!target.empty()) {
+      // Find next non-empty line
+      size_t j = i + 1;
+      while (j < lines.size() && trim(lines[j]).empty()) j++;
+      
+      if (j < lines.size()) {
+        std::string nextT = trim(lines[j]);
+        // Check if it's the target label
+        if (nextT == target + ":") {
+          // Skip this jump
+          continue;
+        }
+      }
+    }
+    
+    result.push_back(lines[i]);
+  }
+  
+  return result;
+}
+
+// Check if a word (register name) appears in a line
+inline bool containsWord(const std::string& line, const std::string& reg) {
+  for (size_t i = 0; i + reg.size() <= line.size(); ++i) {
+    if (line.compare(i, reg.size(), reg) != 0) continue;
+    char l = (i == 0) ? ' ' : line[i - 1];
+    char r = (i + reg.size() >= line.size()) ? ' ' : line[i + reg.size()];
+    auto okb = [](char c) { return !(isalnum((unsigned char)c) || c == '_'); };
+    if (okb(l) && okb(r)) return true;
+  }
+  return false;
+}
+
+// ================== Small Constant Loop Unrolling ==================
+// Unroll small loops (bound <= 16) directly in assembly
+// Pattern:
+//   Lx:
+//     ... (loop body)
+//     slti cond, iv, N
+//     beqz cond, exit
+//     ... (body continuation)
+//     addi tmp, iv, 1
+//     mv iv, tmp
+//     j Lx
+//   exit:
+std::vector<std::string> optimizeSmallConstLoops(const std::vector<std::string>& lines) {
+  std::vector<std::string> result = lines;
+  bool anyChange = false;
+  
+  for (size_t i = 0; i < result.size(); ++i) {
+    std::string header;
+    if (!isLabelLine(result[i])) continue;
+    header = trim(result[i]);
+    header = header.substr(0, header.size() - 1);  // Remove ':'
+    
+    // Also handle function internal labels (loop_while_cond*, etc.)
+    if (header.empty()) continue;
+    bool isLoopHeader = (header[0] == 'L') || 
+                        (header.find("_while_cond") != std::string::npos) ||
+                        (header.find("_for_cond") != std::string::npos);
+    if (!isLoopHeader) continue;
+    
+    // Look for loop bound pattern: either slti or addi+slt
+    size_t sltiIdx = SIZE_MAX;
+    size_t beqzIdx = SIZE_MAX;
+    std::string condReg, sltiSrcReg, exitLabel;
+    int bound = -1;
+    
+    for (size_t k = i + 1; k < result.size() && k <= i + 15; ++k) {
+      std::string t = trim(result[k]);
+      
+      // Pattern 1: slti rd, rs, imm
+      if (startsWith(t, "slti ")) {
+        std::string rest = trim(t.substr(5));
+        size_t c1 = rest.find(',');
+        if (c1 == std::string::npos) continue;
+        std::string rd = trim(rest.substr(0, c1));
+        rest = trim(rest.substr(c1 + 1));
+        size_t c2 = rest.find(',');
+        if (c2 == std::string::npos) continue;
+        std::string rs = trim(rest.substr(0, c2));
+        std::string immS = trim(rest.substr(c2 + 1));
+        try { bound = std::stoi(immS); } catch (...) { continue; }
+        if (bound <= 0 || bound > 16) continue;
+        sltiIdx = k;
+        condReg = rd;
+        sltiSrcReg = rs;
+        
+        // Find beqz cond, exit
+        for (size_t m = k + 1; m < result.size() && m <= k + 3; ++m) {
+          std::string u = trim(result[m]);
+          if (u.empty()) continue;
+          if (!startsWith(u, "beqz ")) break;
+          std::string brrest = trim(u.substr(5));
+          size_t cb = brrest.find(',');
+          if (cb == std::string::npos) break;
+          std::string r = trim(brrest.substr(0, cb));
+          std::string lab = trim(brrest.substr(cb + 1));
+          if (r != condReg) break;
+          beqzIdx = m;
+          exitLabel = lab;
+          break;
+        }
+        break;
+      }
+      
+      // Pattern 2: addi tX, x0, imm followed by slt rd, rs, tX and bne rd, x0, body
+      // Our backend generates: slt t0, t1, t5; bne t0, x0, body; jal x0, exit
+      if (startsWith(t, "slt ") && !startsWith(t, "slti ") && !startsWith(t, "sltu ")) {
+        // Parse slt rd, rs1, rs2
+        std::string rest = trim(t.substr(4));
+        size_t c1 = rest.find(',');
+        if (c1 == std::string::npos) continue;
+        std::string rd = trim(rest.substr(0, c1));
+        rest = trim(rest.substr(c1 + 1));
+        size_t c2 = rest.find(',');
+        if (c2 == std::string::npos) continue;
+        std::string rs1 = trim(rest.substr(0, c2));
+        std::string rs2 = trim(rest.substr(c2 + 1));
+        
+        // Look back for addi rs2, x0, imm
+        for (size_t pk = k; pk > i && pk > k - 5; --pk) {
+          std::string pt = trim(result[pk - 1]);
+          if (startsWith(pt, "addi ")) {
+            std::string prest = trim(pt.substr(5));
+            size_t pc1 = prest.find(',');
+            if (pc1 == std::string::npos) continue;
+            std::string prd = trim(prest.substr(0, pc1));
+            prest = trim(prest.substr(pc1 + 1));
+            size_t pc2 = prest.find(',');
+            if (pc2 == std::string::npos) continue;
+            std::string prs = trim(prest.substr(0, pc2));
+            std::string pimm = trim(prest.substr(pc2 + 1));
+            
+            if (prd == rs2 && prs == "x0") {
+              try { bound = std::stoi(pimm); } catch (...) { continue; }
+              if (bound <= 0 || bound > 16) { bound = -1; continue; }
+              
+              sltiIdx = k;
+              condReg = rd;
+              sltiSrcReg = rs1;
+              
+              // Find bne cond, x0, body followed by jal x0, exit
+              for (size_t m = k + 1; m < result.size() && m <= k + 3; ++m) {
+                std::string u = trim(result[m]);
+                if (u.empty()) continue;
+                if (startsWith(u, "bne ")) {
+                  // bne rd, x0, body
+                  std::string brrest = trim(u.substr(4));
+                  size_t cb1 = brrest.find(',');
+                  if (cb1 == std::string::npos) continue;
+                  std::string r = trim(brrest.substr(0, cb1));
+                  brrest = trim(brrest.substr(cb1 + 1));
+                  size_t cb2 = brrest.find(',');
+                  if (cb2 == std::string::npos) continue;
+                  std::string zero = trim(brrest.substr(0, cb2));
+                  // std::string bodyLabel = trim(brrest.substr(cb2 + 1));
+                  
+                  if (r != condReg || zero != "x0") continue;
+                  
+                  // Look for jal x0, exit on next line
+                  for (size_t n = m + 1; n < result.size() && n <= m + 2; ++n) {
+                    std::string v = trim(result[n]);
+                    if (v.empty()) continue;
+                    if (startsWith(v, "jal x0, ") || startsWith(v, "j ")) {
+                      std::string lab;
+                      if (startsWith(v, "jal x0, ")) lab = trim(v.substr(8));
+                      else lab = trim(v.substr(2));
+                      beqzIdx = n;  // Use jal as the branch index
+                      exitLabel = lab;
+                      break;
+                    }
+                    break;
+                  }
+                }
+                if (beqzIdx != SIZE_MAX) break;
+              }
+              break;
+            }
+          }
+        }
+        if (bound > 0 && beqzIdx != SIZE_MAX) break;
+      }
+    }
+    
+    if (sltiIdx == SIZE_MAX || beqzIdx == SIZE_MAX) continue;
+    
+    // Find back-jump "j header" or "jal x0, header"
+    size_t jIdx = SIZE_MAX;
+    for (size_t k = beqzIdx + 1; k < result.size() && k <= beqzIdx + 80; ++k) {
+      std::string t = trim(result[k]);
+      if (isLabelLine(result[k])) {
+        // Allow one body label right after beqz
+        bool onlyBlankBetween = true;
+        for (size_t u = beqzIdx + 1; u < k; ++u) {
+          if (!trim(result[u]).empty()) { onlyBlankBetween = false; break; }
+        }
+        if (!onlyBlankBetween) { jIdx = SIZE_MAX; break; }
+        continue;
+      }
+      std::string dst;
+      if (startsWith(t, "j ") && !startsWith(t, "jal")) {
+        dst = trim(t.substr(2));
+      } else if (startsWith(t, "jal x0, ")) {
+        dst = trim(t.substr(8));
+      }
+      if (!dst.empty() && dst == header) {
+        jIdx = k;
+        break;
+      }
+    }
+    
+    if (jIdx == SIZE_MAX) continue;
+    
+    // Find IV update patterns:
+    // Pattern 1: addi tmp, iv, 1; mv iv, tmp
+    // Pattern 2: addi one, x0, 1; add tmp, iv, one; addi iv, tmp, 0
+    std::string ivReg, tmpReg;
+    for (size_t k = jIdx; k-- > beqzIdx + 1; ) {
+      std::string t = trim(result[k]);
+      
+      // Pattern 1: mv iv, tmp
+      if (startsWith(t, "mv ")) {
+        std::string rest = trim(t.substr(3));
+        size_t c = rest.find(',');
+        if (c == std::string::npos) continue;
+        std::string dst = trim(rest.substr(0, c));
+        std::string src = trim(rest.substr(c + 1));
+        
+        // Look for preceding addi src, ?, 1
+        for (size_t p = k; p-- > beqzIdx + 1; ) {
+          std::string u = trim(result[p]);
+          if (!startsWith(u, "addi ")) continue;
+          std::string r = trim(u.substr(5));
+          size_t c1 = r.find(',');
+          if (c1 == std::string::npos) continue;
+          std::string rd = trim(r.substr(0, c1));
+          r = trim(r.substr(c1 + 1));
+          size_t c2 = r.find(',');
+          if (c2 == std::string::npos) continue;
+          std::string rs = trim(r.substr(0, c2));
+          std::string immS = trim(r.substr(c2 + 1));
+          if (immS != "1") continue;
+          if (rd == src) {
+            ivReg = dst;
+            tmpReg = rd;
+            break;
+          }
+        }
+        if (!ivReg.empty()) break;
+      }
+      
+      // Pattern 2: addi iv, tmp, 0 (acts like mv)
+      if (startsWith(t, "addi ")) {
+        std::string rest = trim(t.substr(5));
+        size_t c1 = rest.find(',');
+        if (c1 == std::string::npos) continue;
+        std::string dst = trim(rest.substr(0, c1));
+        rest = trim(rest.substr(c1 + 1));
+        size_t c2 = rest.find(',');
+        if (c2 == std::string::npos) continue;
+        std::string src = trim(rest.substr(0, c2));
+        std::string immS = trim(rest.substr(c2 + 1));
+        if (immS != "0") continue;
+        
+        // Look for add src, ?, oneReg where oneReg = 1
+        for (size_t p = k; p-- > beqzIdx + 1; ) {
+          std::string u = trim(result[p]);
+          if (!startsWith(u, "add ")) continue;
+          std::string r = trim(u.substr(4));
+          size_t a1 = r.find(',');
+          if (a1 == std::string::npos) continue;
+          std::string addRd = trim(r.substr(0, a1));
+          r = trim(r.substr(a1 + 1));
+          size_t a2 = r.find(',');
+          if (a2 == std::string::npos) continue;
+          std::string addRs1 = trim(r.substr(0, a2));
+          std::string addRs2 = trim(r.substr(a2 + 1));
+          
+          if (addRd != src) continue;
+          
+          // Check if one of the sources is the IV and the other is 1
+          std::string maybeIv = addRs1;
+          std::string maybeOne = addRs2;
+          
+          // Look for addi maybeOne, x0, 1
+          for (size_t q = p; q-- > beqzIdx + 1; ) {
+            std::string v = trim(result[q]);
+            if (!startsWith(v, "addi ")) continue;
+            std::string vr = trim(v.substr(5));
+            size_t b1 = vr.find(',');
+            if (b1 == std::string::npos) continue;
+            std::string vRd = trim(vr.substr(0, b1));
+            vr = trim(vr.substr(b1 + 1));
+            size_t b2 = vr.find(',');
+            if (b2 == std::string::npos) continue;
+            std::string vRs = trim(vr.substr(0, b2));
+            std::string vImm = trim(vr.substr(b2 + 1));
+            
+            if (vRd == maybeOne && vRs == "x0" && vImm == "1") {
+              ivReg = dst;
+              tmpReg = src;
+              break;
+            }
+          }
+          if (!ivReg.empty()) break;
+        }
+        if (!ivReg.empty()) break;
+      }
+    }
+    
+    if (ivReg.empty() || tmpReg.empty()) continue;
+    
+    // Verify IV not used elsewhere in loop body (except for IV update control)
+    // Find where IV update starts (add with ivReg as source)
+    size_t ivUpdateStart = jIdx;
+    for (size_t k = beqzIdx + 1; k < jIdx; ++k) {
+      std::string t = trim(result[k]);
+      if (startsWith(t, "add ")) {
+        // Check if this is "add tmpReg, ivReg, ..." or "add tmpReg, ..., ivReg"
+        std::string rest = trim(t.substr(4));
+        size_t c1 = rest.find(',');
+        if (c1 == std::string::npos) continue;
+        std::string rd = trim(rest.substr(0, c1));
+        rest = trim(rest.substr(c1 + 1));
+        size_t c2 = rest.find(',');
+        if (c2 == std::string::npos) continue;
+        std::string rs1 = trim(rest.substr(0, c2));
+        std::string rs2 = trim(rest.substr(c2 + 1));
+        if ((rs1 == ivReg || rs2 == ivReg) && rd == tmpReg) {
+          ivUpdateStart = k;
+          break;
+        }
+      }
+    }
+    
+    bool ivUsed = false;
+    for (size_t k = beqzIdx + 1; k < ivUpdateStart; ++k) {
+      std::string t = trim(result[k]);
+      if (startsWith(t, "addi ") || startsWith(t, "mv ")) continue;
+      if (isLabelLine(result[k])) continue;
+      if (containsWord(result[k], ivReg)) { ivUsed = true; break; }
+    }
+    if (ivUsed) continue;
+    
+    // Find IV init to 0 before header:
+    // Pattern 1: li r, 0; mv ivReg, r
+    // Pattern 2: addi ivReg, x0, 0
+    bool hasInit0 = false;
+    for (size_t k = i; k > 0 && k > i - 15; --k) {
+      std::string t = trim(result[k - 1]);
+      
+      // Pattern 2: addi ivReg, x0, 0
+      if (startsWith(t, "addi ")) {
+        std::string rest = trim(t.substr(5));
+        size_t c1 = rest.find(',');
+        if (c1 == std::string::npos) continue;
+        std::string rd = trim(rest.substr(0, c1));
+        rest = trim(rest.substr(c1 + 1));
+        size_t c2 = rest.find(',');
+        if (c2 == std::string::npos) continue;
+        std::string rs = trim(rest.substr(0, c2));
+        std::string immS = trim(rest.substr(c2 + 1));
+        if (rd == ivReg && rs == "x0" && immS == "0") {
+          hasInit0 = true;
+          break;
+        }
+      }
+      
+      // Pattern 1: li r, 0
+      if (startsWith(t, "li ")) {
+        std::string rest = trim(t.substr(3));
+        size_t c = rest.find(',');
+        if (c == std::string::npos) continue;
+        std::string rd = trim(rest.substr(0, c));
+        std::string immS = trim(rest.substr(c + 1));
+        if (immS != "0") continue;
+        for (size_t m = k; m < i; ++m) {
+          std::string u = trim(result[m]);
+          if (!startsWith(u, "mv ")) continue;
+          std::string rr = trim(u.substr(3));
+          size_t c2 = rr.find(',');
+          if (c2 == std::string::npos) continue;
+          std::string dst = trim(rr.substr(0, c2));
+          std::string src = trim(rr.substr(c2 + 1));
+          if (dst == ivReg && src == rd) { hasInit0 = true; break; }
+        }
+        if (hasInit0) break;
+      }
+    }
+    if (!hasInit0) continue;
+    
+    // Extract loop body core (between beqz and IV update)
+    size_t tailStart = jIdx;
+    for (size_t k = beqzIdx + 1; k < jIdx; ++k) {
+      std::string t = trim(result[k]);
+      if (startsWith(t, "addi ") && containsWord(t, tmpReg) && t.find(", 1") != std::string::npos) {
+        tailStart = k;
+        break;
+      }
+    }
+    
+    if (tailStart <= beqzIdx + 1) continue;
+    
+    std::vector<std::string> coreBody;
+    for (size_t k = beqzIdx + 1; k < tailStart; ++k) {
+      std::string t = trim(result[k]);
+      if (t.empty()) continue;
+      if (isLabelLine(result[k])) continue;  // Skip body labels
+      if (startsWith(t, "beqz ") || startsWith(t, "j ")) { coreBody.clear(); break; }
+      coreBody.push_back(result[k]);
+    }
+    if (coreBody.empty()) continue;
+    
+    // Build unrolled code
+    std::vector<std::string> repl;
+    repl.push_back(result[i]);  // Keep header label
+    for (int rep = 0; rep < bound; ++rep) {
+      repl.insert(repl.end(), coreBody.begin(), coreBody.end());
+    }
+    repl.push_back("\tli " + ivReg + ", " + std::to_string(bound));
+    repl.push_back("\tj " + exitLabel);
+    
+    // Apply replacement
+    result.erase(result.begin() + static_cast<long>(i), 
+                 result.begin() + static_cast<long>(jIdx + 1));
+    result.insert(result.begin() + static_cast<long>(i), repl.begin(), repl.end());
+    anyChange = true;
+    i += repl.size();
+  }
+  
+  return result;
+}
+
+// Remove dead code after unconditional jumps
+std::vector<std::string> optimizeDeadCodeAfterJump(const std::vector<std::string>& lines) {
+  std::vector<std::string> result;
+  result.reserve(lines.size());
+  bool skipping = false;
+  
+  for (size_t i = 0; i < lines.size(); ++i) {
+    if (isLabelLine(lines[i])) {
+      skipping = false;
+      result.push_back(lines[i]);
+      continue;
+    }
+    
+    if (skipping) continue;
+    
+    std::string t = trim(lines[i]);
+    if (startsWith(t, "j ") && !startsWith(t, "jal")) {
+      result.push_back(lines[i]);
+      skipping = true;
+      continue;
+    }
+    
+    result.push_back(lines[i]);
+  }
+  
+  return result;
+}
+
+// Remove unused labels and redundant jumps
+std::vector<std::string> optimizeUnusedLabels(const std::vector<std::string>& lines) {
+  // Collect all referenced labels
+  std::set<std::string> refs;
+  for (const auto& line : lines) {
+    std::string t = trim(line);
+    if (startsWith(t, "j ")) {
+      refs.insert(trim(t.substr(2)));
+    } else if (startsWith(t, "jal x0, ")) {
+      refs.insert(trim(t.substr(8)));
+    } else if (startsWith(t, "beqz ") || startsWith(t, "bne ") || startsWith(t, "beq ")) {
+      size_t c = t.find(',');
+      if (c != std::string::npos) {
+        std::string rest = trim(t.substr(c + 1));
+        size_t c2 = rest.find(',');
+        if (c2 != std::string::npos) rest = trim(rest.substr(c2 + 1));
+        refs.insert(rest);
+      }
+    } else if (startsWith(t, "jal ra, ") || startsWith(t, "jal ")) {
+      // Function calls - keep the target
+      size_t space = t.find(' ');
+      if (space != std::string::npos) {
+        std::string rest = trim(t.substr(space + 1));
+        size_t c = rest.find(',');
+        if (c != std::string::npos) rest = trim(rest.substr(c + 1));
+        refs.insert(rest);
+      }
+    }
+  }
+  
+  std::vector<std::string> result;
+  result.reserve(lines.size());
+  
+  for (size_t i = 0; i < lines.size(); ++i) {
+    std::string lab;
+    if (isLabelLine(lines[i])) {
+      std::string t = trim(lines[i]);
+      lab = t.substr(0, t.size() - 1);
+      
+      // Keep function labels and referenced labels
+      bool isAuto = (!lab.empty() && lab[0] == 'L') || 
+                    (lab.find("_B") != std::string::npos) ||
+                    (lab.find("_while") != std::string::npos) ||
+                    (lab.find("_if") != std::string::npos);
+      
+      if (isAuto && refs.find(lab) == refs.end()) {
+        continue;  // Drop unreferenced auto labels
+      }
+    }
+    
+    result.push_back(lines[i]);
+  }
+  
+  return result;
+}
+
+// Reduce repeated accumulation patterns: acc = acc + inv (N times) -> acc = acc + inv*N
+std::vector<std::string> optimizeUnrolledTinyAccum(const std::vector<std::string>& lines) {
+  std::vector<std::string> result = lines;
+  
+  auto parseAdd = [](const std::string& line, std::string* rd, std::string* a, std::string* b) -> bool {
+    std::string t = trim(line);
+    if (!startsWith(t, "add ")) return false;
+    std::string rest = trim(t.substr(4));
+    size_t c1 = rest.find(',');
+    if (c1 == std::string::npos) return false;
+    std::string d = trim(rest.substr(0, c1));
+    rest = trim(rest.substr(c1 + 1));
+    size_t c2 = rest.find(',');
+    if (c2 == std::string::npos) return false;
+    std::string x = trim(rest.substr(0, c2));
+    std::string y = trim(rest.substr(c2 + 1));
+    if (rd) *rd = d;
+    if (a) *a = x;
+    if (b) *b = y;
+    return true;
+  };
+  
+  auto parseLiMul = [](const std::string& line, std::string* rd, std::string* rs, std::string* imm) -> bool {
+    std::string t = trim(line);
+    if (!startsWith(t, "mul ")) return false;
+    std::string rest = trim(t.substr(4));
+    size_t c1 = rest.find(',');
+    if (c1 == std::string::npos) return false;
+    *rd = trim(rest.substr(0, c1));
+    rest = trim(rest.substr(c1 + 1));
+    size_t c2 = rest.find(',');
+    if (c2 == std::string::npos) return false;
+    *rs = trim(rest.substr(0, c2));
+    *imm = trim(rest.substr(c2 + 1));
+    return true;
+  };
+  
+  // Look for sequences of adds with same operands
+  for (size_t i = 0; i + 3 < result.size(); ++i) {
+    std::string rd1, a1, b1;
+    if (!parseAdd(result[i], &rd1, &a1, &b1)) continue;
+    
+    // Check for same pattern repeated
+    int reps = 1;
+    size_t j = i + 1;
+    while (j < result.size() && reps < 16) {
+      // Skip labels or breaks
+      std::string t = trim(result[j]);
+      if (isLabelLine(result[j])) break;
+      if (startsWith(t, "beqz ") || startsWith(t, "j ")) break;
+      
+      std::string rd2, a2, b2;
+      if (!parseAdd(result[j], &rd2, &a2, &b2)) {
+        j++;
+        continue;
+      }
+      
+      // Must be same pattern: add rd, rd, inv or add rd, inv, rd
+      bool samePattern = (rd2 == rd1) && 
+        (((a2 == rd1) && (b2 == b1)) || ((b2 == rd1) && (a2 == b1)));
+      
+      if (!samePattern) break;
+      
+      reps++;
+      j++;
+    }
+    
+    // If we found repeated adds and count > 2, try to reduce
+    // This is complex - for now just skip if reps <= 2
+    if (reps > 2) {
+      // Could replace with mul, but need to be careful about register allocation
+      // For now, just mark as potential optimization point
+    }
+  }
+  
+  return result;
+}
+
+// Optimize li followed by mv to single li
+std::vector<std::string> optimizeLiMv(const std::vector<std::string>& lines) {
+  std::vector<std::string> result;
+  result.reserve(lines.size());
+  
+  for (size_t i = 0; i < lines.size(); ++i) {
+    std::string t = trim(lines[i]);
+    
+    // Look for li t0, imm followed by mv rd, t0
+    if (startsWith(t, "li ")) {
+      std::string rest = trim(t.substr(3));
+      size_t c = rest.find(',');
+      if (c != std::string::npos) {
+        std::string rd = trim(rest.substr(0, c));
+        std::string imm = trim(rest.substr(c + 1));
+        
+        // Check if rd is a temp and next is mv dest, rd
+        if ((rd == "t0" || rd == "t1" || rd == "t5") && i + 1 < lines.size()) {
+          std::string next = trim(lines[i + 1]);
+          if (startsWith(next, "mv ")) {
+            std::string mvRest = trim(next.substr(3));
+            size_t mc = mvRest.find(',');
+            if (mc != std::string::npos) {
+              std::string mvDest = trim(mvRest.substr(0, mc));
+              std::string mvSrc = trim(mvRest.substr(mc + 1));
+              
+              if (mvSrc == rd && mvDest != rd) {
+                // Replace with single li mvDest, imm
+                result.push_back("\tli " + mvDest + ", " + imm);
+                i++;  // Skip the mv
+                continue;
+              }
+            }
+          }
+        }
+      }
+    }
+    
+    result.push_back(lines[i]);
+  }
+  
+  return result;
+}
+
+std::vector<std::string> peepholeOptimize(const std::vector<std::string>& asmLines) {
+  std::vector<std::string> result = asmLines;
+  
+  bool changed = true;
+  int passes = 0;
+  while (changed && passes < 20) {
+    changed = false;
+    passes++;
+    
+    size_t prevSize = result.size();
+    result = optimizeMoveChains(result);
+    if (result.size() != prevSize) changed = true;
+    
+    prevSize = result.size();
+    result = optimizeLoadStore(result);
+    if (result.size() != prevSize) changed = true;
+    
+    prevSize = result.size();
+    result = optimizeRedundantOps(result);
+    if (result.size() != prevSize) changed = true;
+    
+    prevSize = result.size();
+    result = optimizeJumpToNext(result);
+    if (result.size() != prevSize) changed = true;
+    
+    // Remove unused labels
+    prevSize = result.size();
+    result = optimizeUnusedLabels(result);
+    if (result.size() != prevSize) changed = true;
+    
+    // Small loop unrolling (assembly level)
+    prevSize = result.size();
+    result = optimizeSmallConstLoops(result);
+    if (result.size() != prevSize) changed = true;
+    
+    // Li+mv -> li optimization
+    prevSize = result.size();
+    result = optimizeLiMv(result);
+    if (result.size() != prevSize) changed = true;
+    
+    prevSize = result.size();
+    result = optimizeDeadCodeAfterJump(result);
+    if (result.size() != prevSize) changed = true;
+  }
+  
+  return result;
+}
+
+}  // namespace
+
+std::string CodeGen::binOpMnemonic(BinaryOp op) const {
+  switch (op) {
+    case BinaryOp::Add:
+      return "add";
+    case BinaryOp::Sub:
+      return "sub";
+    case BinaryOp::Mul:
+      return "mul";
+    case BinaryOp::Div:
+      return "div";
+    case BinaryOp::Mod:
+      return "rem";
+    case BinaryOp::And:
+      return "and";
+    case BinaryOp::Or:
+      return "or";
+    case BinaryOp::Lt:
+      return "slt";
+    case BinaryOp::Gt:
+      return "sgt";
+    case BinaryOp::Le:
+      return "sle";
+    case BinaryOp::Ge:
+      return "sge";
+    case BinaryOp::Eq:
+      return "seq";
+    case BinaryOp::Ne:
+      return "sne";
+  }
+  return "unknown";
+}
+
+std::string CodeGen::renderOperandWithAlloc(
+    const Operand& op, const std::unordered_map<int, int>& allocation,
+    const StackFrame& frame) const {
+  if (op.isImm()) {
+    return std::to_string(op.immValue);
+  }
+  if (op.isVReg()) {
+    auto it = allocation.find(op.vregId);
+    if (it != allocation.end()) {
+      return RISCVRegMap::physicalRegName(it->second);
+    }
+    auto spillIt = frame.spillSlots.find(op.vregId);
+    if (spillIt != frame.spillSlots.end()) {
+      return std::to_string(spillIt->second) + "(sp)";
+    }
+    return "%v" + std::to_string(op.vregId);
+  }
+  return op.globalName;
+}
+
+CodeGen::StackFrame CodeGen::computeStackFrame(
+    const IRFunction& fn, const RegAllocResult& allocResult,
+    const LivenessResult& liveness) {
+  // Collect all virtual registers that appear anywhere in the function so we
+  // can provide a stack slot for any value the allocator left uncolored.
+  std::set<int> allVRegs;
+  auto trackOp = [&](const Operand& op) {
+    if (op.isVReg()) allVRegs.insert(op.vregId);
+  };
+  for (int v : fn.params) allVRegs.insert(v);
+  for (const auto& inst : fn.instructions) {
+    switch (inst->kind) {
+      case InstKind::Binary: {
+        auto* b = static_cast<const BinaryInst*>(inst.get());
+        allVRegs.insert(b->dest);
+        trackOp(b->lhs);
+        trackOp(b->rhs);
+        break;
+      }
+      case InstKind::Unary: {
+        auto* u = static_cast<const UnaryInst*>(inst.get());
+        allVRegs.insert(u->dest);
+        trackOp(u->operand);
+        break;
+      }
+      case InstKind::Copy: {
+        auto* c = static_cast<const CopyInst*>(inst.get());
+        allVRegs.insert(c->dest);
+        trackOp(c->src);
+        break;
+      }
+      case InstKind::Load: {
+        auto* l = static_cast<const LoadInst*>(inst.get());
+        allVRegs.insert(l->dest);
+        trackOp(l->addr);
+        break;
+      }
+      case InstKind::Store: {
+        auto* s = static_cast<const StoreInst*>(inst.get());
+        trackOp(s->src);
+        trackOp(s->addr);
+        break;
+      }
+      case InstKind::Branch: {
+        auto* br = static_cast<const BranchInst*>(inst.get());
+        trackOp(br->cond);
+        break;
+      }
+      case InstKind::Call: {
+        auto* c = static_cast<const CallInst*>(inst.get());
+        if (c->hasDest) allVRegs.insert(c->dest);
+        for (const auto& a : c->args) trackOp(a);
+        break;
+      }
+      case InstKind::Return: {
+        auto* r = static_cast<const ReturnInst*>(inst.get());
+        if (r->hasValue) trackOp(r->value);
+        break;
+      }
+      case InstKind::Label:
+      case InstKind::Jump:
+        break;
+    }
+  }
+
+  StackFrame frame{};
+  frame.frameSize = 0;
+  frame.localVarOffset = 0;
+  frame.spillAreaSize = 0;
+  frame.spillAreaOffset = 0;
+  frame.callerSavedOffset = 0;
+  frame.outgoingArgOffset = 0;
+  frame.raOffset = 0;
+  frame.savedRegsOffset = 0;
+  frame.maxOutgoingArgs = 0;
+
+  // Determine callee-saved registers we used (s0-s3 colors 5-8).
+  for (const auto& entry : allocResult.allocation) {
+    int color = entry.second;
+    if (color >= 5) {
+      std::string regName = RISCVRegMap::physicalRegName(color);
+      if (std::find(frame.savedRegs.begin(), frame.savedRegs.end(), regName) ==
+          frame.savedRegs.end()) {
+        frame.savedRegs.push_back(regName);
+      }
+    }
+  }
+
+  std::sort(frame.savedRegs.begin(), frame.savedRegs.end());
+
+  // Track maximum stack arguments required.
+  int maxArgs = 0;
+  for (const auto& inst : fn.instructions) {
+    if (inst->kind == InstKind::Call) {
+      auto* c = static_cast<const CallInst*>(inst.get());
+      if (static_cast<int>(c->args.size()) > maxArgs) {
+        maxArgs = static_cast<int>(c->args.size());
+      }
+    }
+  }
+  frame.maxOutgoingArgs = std::max(0, maxArgs - 8);
+
+  // Caller-saved registers that are live across calls need spill slots.
+  std::set<std::string> callerSavedSet;
+  for (size_t i = 0; i < fn.instructions.size(); ++i) {
+    if (fn.instructions[i]->kind != InstKind::Call) continue;
+    const auto& liveOutSet = liveness.liveOut[i];
+    for (int vreg : liveOutSet) {
+      auto it = allocResult.allocation.find(vreg);
+      if (it == allocResult.allocation.end()) continue;
+      int color = it->second;
+      if (color >= 0 && color <= 4) {  // caller-saved t0-t4
+        callerSavedSet.insert(RISCVRegMap::physicalRegName(color));
+      }
+    }
+  }
+  frame.callerSavedRegs.assign(callerSavedSet.begin(), callerSavedSet.end());
+
+  // Spill slots for spilled virtual registers, and for any vreg that failed to
+  // receive a color (allocation miss). This guarantees every vreg we see has a
+  // concrete location (register or stack slot), preventing empty operands in
+  // emitted assembly.
+  int spillOffset = 0;
+  for (int vreg : allocResult.spilledVRegs) {
+    frame.spillSlots[vreg] = spillOffset;
+    spillOffset += 4;
+  }
+  for (int vreg : allVRegs) {
+    bool hasColor =
+        allocResult.allocation.find(vreg) != allocResult.allocation.end();
+    bool alreadySpilled = frame.spillSlots.find(vreg) != frame.spillSlots.end();
+    if (!hasColor && !alreadySpilled) {
+      frame.spillSlots[vreg] = spillOffset;
+      spillOffset += 4;
+    }
+  }
+  frame.spillAreaSize = spillOffset;
+
+  int offset = 0;
+
+  // Outgoing stack arguments area MUST be at the bottom (lowest addresses)
+  // of the frame, so callee can find them at sp + calleeFrameSize.
+  frame.outgoingArgOffset = offset;
+  offset += frame.maxOutgoingArgs * 4;
+
+  // Spill area (for vregs spilled by allocator).
+  frame.spillAreaOffset = offset;
+  offset += frame.spillAreaSize;
+
+  // Caller-saved spill area (for regs live across calls).
+  frame.callerSavedOffset = offset;
+  for (const auto& reg : frame.callerSavedRegs) {
+    frame.callerSavedSlots[reg] = offset;
+    offset += 4;
+  }
+
+  // Save area for ra and callee-saved.
+  frame.raOffset = offset;
+  offset += 4;
+
+  frame.savedRegsOffset = offset;
+  offset += static_cast<int>(frame.savedRegs.size()) * 4;
+
+  frame.localVarOffset = offset;
+
+  frame.frameSize = ((offset + 15) / 16) * 16;
+
+  // Adjust spill slot offsets to absolute (from sp).
+  for (auto& kv : frame.spillSlots) {
+    kv.second += frame.spillAreaOffset;
+  }
+
+  return frame;
+}
+
+void CodeGen::emitPrologue(const IRFunction& fn, const StackFrame& frame,
+                           std::vector<std::string>& out) {
+  // Use a per-function entry label to avoid duplicate symbol definitions.
+  std::string entryLabel = fn.name + "_entry";
+
+  out.push_back(".globl " + fn.name);
+  out.push_back(fn.name + ":");
+  out.push_back("prologue_" + fn.name + ":");
+
+  if (frame.frameSize == 0) {
+    out.push_back(entryLabel + ":");
+    return;
+  }
+
+  out.push_back("\taddi sp, sp, -" + std::to_string(frame.frameSize));
+  out.push_back("\tsw ra, " + std::to_string(frame.raOffset) + "(sp)");
+
+  int offset = frame.savedRegsOffset;
+  for (const auto& reg : frame.savedRegs) {
+    out.push_back("\tsw " + reg + ", " + std::to_string(offset) + "(sp)");
+    offset += 4;
+  }
+
+  out.push_back(entryLabel + ":");
+}
+
+void CodeGen::emitEpilogue(const IRFunction& fn, const StackFrame& frame,
+                           std::vector<std::string>& out) {
+  if (frame.frameSize == 0) {
+    out.push_back("\tret");
+    return;
+  }
+
+  int offset = frame.savedRegsOffset;
+  for (const auto& reg : frame.savedRegs) {
+    out.push_back("\tlw " + reg + ", " + std::to_string(offset) + "(sp)");
+    offset += 4;
+  }
+
+  out.push_back("\tlw ra, " + std::to_string(frame.raOffset) + "(sp)");
+  out.push_back("\taddi sp, sp, " + std::to_string(frame.frameSize));
+  out.push_back("\tret");
+}
+
+std::string CodeGen::renderInstructionWithAlloc(
+    const Instruction* inst, const std::unordered_map<int, int>& allocation,
+    const StackFrame& frame) const {
+  std::ostringstream os;
+
+  switch (inst->kind) {
+    case InstKind::Binary: {
+      auto* b = static_cast<const BinaryInst*>(inst);
+      auto it = allocation.find(b->dest);
+      std::string destReg = (it != allocation.end())
+                                ? RISCVRegMap::physicalRegName(it->second)
+                                : "%v" + std::to_string(b->dest);
+
+      os << binOpMnemonic(b->op) << " " << destReg << ", "
+         << renderOperandWithAlloc(b->lhs, allocation, frame) << ", "
+         << renderOperandWithAlloc(b->rhs, allocation, frame);
+      break;
+    }
+    case InstKind::Unary: {
+      auto* u = static_cast<const UnaryInst*>(inst);
+      auto it = allocation.find(u->dest);
+      std::string destReg = (it != allocation.end())
+                                ? RISCVRegMap::physicalRegName(it->second)
+                                : "%v" + std::to_string(u->dest);
+
+      switch (u->op) {
+        case UnaryOp::Neg:
+          os << "neg " << destReg << ", "
+             << renderOperandWithAlloc(u->operand, allocation, frame);
+          break;
+        case UnaryOp::Not:
+          os << "seqz " << destReg << ", "
+             << renderOperandWithAlloc(u->operand, allocation, frame);
+          break;
+        case UnaryOp::Plus:
+          os << "mv " << destReg << ", "
+             << renderOperandWithAlloc(u->operand, allocation, frame);
+          break;
+      }
+      break;
+    }
+    case InstKind::Copy: {
+      auto* c = static_cast<const CopyInst*>(inst);
+      auto it = allocation.find(c->dest);
+      std::string destReg = (it != allocation.end())
+                                ? RISCVRegMap::physicalRegName(it->second)
+                                : "%v" + std::to_string(c->dest);
+
+      os << "mv " << destReg << ", "
+         << renderOperandWithAlloc(c->src, allocation, frame);
+      break;
+    }
+    case InstKind::Branch: {
+      auto* br = static_cast<const BranchInst*>(inst);
+      os << "bne " << renderOperandWithAlloc(br->cond, allocation, frame)
+         << ", x0, " << br->trueLabel << "\n    j " << br->falseLabel;
+      break;
+    }
+    case InstKind::Jump: {
+      auto* j = static_cast<const JumpInst*>(inst);
+      os << "j " << j->target;
+      break;
+    }
+    case InstKind::Call: {
+      auto* c = static_cast<const CallInst*>(inst);
+      os << "# args=" << c->args.size() << "\n    call " << c->callee;
+      if (c->hasDest) {
+        auto it = allocation.find(c->dest);
+        std::string destReg = (it != allocation.end())
+                                  ? RISCVRegMap::physicalRegName(it->second)
+                                  : "%v" + std::to_string(c->dest);
+        os << "\n    mv " << destReg << ", a0";
+      }
+      break;
+    }
+    case InstKind::Return: {
+      auto* r = static_cast<const ReturnInst*>(inst);
+      if (r->hasValue) {
+        if (r->value.isImm()) {
+          os << "li t0, " << std::to_string(r->value.immValue)
+             << "\n    mv a0, t0";
+        } else {
+          os << "mv a0, "
+             << renderOperandWithAlloc(r->value, allocation, frame);
+        }
+      }
+      break;
+    }
+    case InstKind::Label: {
+      auto* l = static_cast<const LabelInst*>(inst);
+      return l->label + ":";
+    }
+    case InstKind::Load: {
+      auto* l = static_cast<const LoadInst*>(inst);
+      auto it = allocation.find(l->dest);
+      std::string destReg = (it != allocation.end())
+                                ? RISCVRegMap::physicalRegName(it->second)
+                                : "%v" + std::to_string(l->dest);
+      os << "lw " << destReg << ", 0("
+         << renderOperandWithAlloc(l->addr, allocation, frame) << ")";
+      break;
+    }
+    case InstKind::Store: {
+      auto* s = static_cast<const StoreInst*>(inst);
+      os << "sw " << renderOperandWithAlloc(s->src, allocation, frame) << ", 0("
+         << renderOperandWithAlloc(s->addr, allocation, frame) << ")";
+      break;
+    }
+  }
+  return os.str();
+}
+
+void CodeGen::emitFunctionBody(const IRFunction& fn,
+                               const std::unordered_map<int, int>& allocation,
+                               const StackFrame& frame,
+                               const LivenessResult& liveness,
+                               std::vector<std::string>& out) {
+  const std::vector<std::string> scratchRegs = {"t5", "t6"};
+
+  auto emitLoadImmediate = [&](const std::string& reg, int imm,
+                               std::vector<std::string>& insns) {
+    // Split 32-bit immediate into high 20 bits (for LUI) and low 12 bits (for
+    // ADDI). The low 12 bits are sign-extended, so if bit 11 is set, we add
+    // 0x1000 to hi.
+    int hi = (imm + 0x800) >> 12;
+    int lo = imm - (hi << 12);
+
+    // Mask hi to 20 bits and sign-extend it properly for LUI.
+    hi = hi & 0xFFFFF;
+
+    if (hi != 0) {
+      insns.push_back("\tlui " + reg + ", " + std::to_string(hi));
+      insns.push_back("\taddi " + reg + ", " + reg + ", " + std::to_string(lo));
+    } else {
+      insns.push_back("\taddi " + reg + ", x0, " + std::to_string(lo));
+    }
+  };
+
+  auto mangleLabel = [&](const std::string& lbl) {
+    return fn.name + "_" + lbl;
+  };
+
+  auto loadOperand = [&](const Operand& op, int& scratchIdx,
+                         std::vector<std::string>& insns) -> std::string {
+    if (op.isImm()) {
+      std::string reg = scratchRegs[scratchIdx % scratchRegs.size()];
+      scratchIdx++;
+      emitLoadImmediate(reg, op.immValue, insns);
+      return reg;
+    }
+    if (op.isVReg()) {
+      auto it = allocation.find(op.vregId);
+      if (it != allocation.end()) {
+        return RISCVRegMap::physicalRegName(it->second);
+      }
+      auto spillIt = frame.spillSlots.find(op.vregId);
+      if (spillIt != frame.spillSlots.end()) {
+        std::string reg = scratchRegs[scratchIdx % scratchRegs.size()];
+        scratchIdx++;
+        insns.push_back("\tlw " + reg + ", " + std::to_string(spillIt->second) +
+                        "(sp)");
+        return reg;
+      }
+      // No allocation or spill slot: emit a readable virtual register name to
+      // avoid blank operands in the assembly output.
+      return "%v" + std::to_string(op.vregId);
+    }
+    // Globals or unknown fall back to name (assume already a register-like
+    // symbol)
+    return op.globalName;
+  };
+
+  auto storeSpilledDest = [&](int vreg, const std::string& valueReg,
+                              std::vector<std::string>& insns) {
+    auto spillIt = frame.spillSlots.find(vreg);
+    if (spillIt != frame.spillSlots.end()) {
+      insns.push_back("\tsw " + valueReg + ", " +
+                      std::to_string(spillIt->second) + "(sp)");
+    }
+  };
+
+  // Move incoming parameters to their assigned locations.
+  for (size_t i = 0; i < fn.params.size(); ++i) {
+    int vreg = fn.params[i];
+    int scratchIdx = 0;
+    std::vector<std::string> insns;
+    std::string srcReg;
+    if (i < 8) {
+      srcReg = "a" + std::to_string(i);
+    } else {
+      // Stack argument: located above the current frame (sp was decremented).
+      int offset = frame.frameSize + static_cast<int>((i - 8) * 4);
+      srcReg = scratchRegs[scratchIdx % scratchRegs.size()];
+      scratchIdx++;
+      insns.push_back("\tlw " + srcReg + ", " + std::to_string(offset) +
+                      "(sp)");
+    }
+
+    auto it = allocation.find(vreg);
+    if (it != allocation.end()) {
+      std::string dst = RISCVRegMap::physicalRegName(it->second);
+      if (dst != srcReg)
+        insns.push_back("\taddi " + dst + ", " + srcReg + ", 0");
+    } else {
+      storeSpilledDest(vreg, srcReg, insns);
+    }
+
+    for (const auto& line : insns) {
+      out.push_back(line);
+    }
+  }
+
+  // Emit instructions
+  for (size_t idx = 0; idx < fn.instructions.size(); ++idx) {
+    const auto& inst = fn.instructions[idx];
+    int scratchIdx = 0;
+    std::vector<std::string> insns;
+
+    switch (inst->kind) {
+      case InstKind::Binary: {
+        auto* b = static_cast<const BinaryInst*>(inst.get());
+        std::string lhs = loadOperand(b->lhs, scratchIdx, insns);
+        std::string rhs = loadOperand(b->rhs, scratchIdx, insns);
+
+        auto it = allocation.find(b->dest);
+        std::string destReg =
+            (it != allocation.end())
+                ? RISCVRegMap::physicalRegName(it->second)
+                : scratchRegs[scratchIdx % scratchRegs.size()];
+        if (it == allocation.end()) scratchIdx++;
+
+        switch (b->op) {
+          case BinaryOp::Eq:
+            insns.push_back("\txor " + destReg + ", " + lhs + ", " + rhs);
+            insns.push_back("\tsltiu " + destReg + ", " + destReg + ", 1");
+            break;
+          case BinaryOp::Ne:
+            insns.push_back("\txor " + destReg + ", " + lhs + ", " + rhs);
+            insns.push_back("\tsltu " + destReg + ", x0, " + destReg);
+            break;
+          case BinaryOp::Gt:
+            insns.push_back("\tslt " + destReg + ", " + rhs + ", " + lhs);
+            break;
+          case BinaryOp::Le:
+            insns.push_back("\tslt " + destReg + ", " + rhs + ", " + lhs);
+            insns.push_back("\txori " + destReg + ", " + destReg + ", 1");
+            break;
+          case BinaryOp::Ge:
+            insns.push_back("\tslt " + destReg + ", " + lhs + ", " + rhs);
+            insns.push_back("\txori " + destReg + ", " + destReg + ", 1");
+            break;
+          default:
+            insns.push_back("\t" + binOpMnemonic(b->op) + " " + destReg + ", " +
+                            lhs + ", " + rhs);
+            break;
+        }
+        storeSpilledDest(b->dest, destReg, insns);
+        break;
+      }
+      case InstKind::Unary: {
+        auto* u = static_cast<const UnaryInst*>(inst.get());
+        std::string opnd = loadOperand(u->operand, scratchIdx, insns);
+        auto it = allocation.find(u->dest);
+        std::string destReg =
+            (it != allocation.end())
+                ? RISCVRegMap::physicalRegName(it->second)
+                : scratchRegs[scratchIdx % scratchRegs.size()];
+        if (it == allocation.end()) scratchIdx++;
+
+        switch (u->op) {
+          case UnaryOp::Neg:
+            insns.push_back("\tsub " + destReg + ", x0, " + opnd);
+            break;
+          case UnaryOp::Not:
+            insns.push_back("\tsltiu " + destReg + ", " + opnd + ", 1");
+            break;
+          case UnaryOp::Plus:
+            insns.push_back("\taddi " + destReg + ", " + opnd + ", 0");
+            break;
+        }
+        storeSpilledDest(u->dest, destReg, insns);
+        break;
+      }
+      case InstKind::Copy: {
+        auto* c = static_cast<const CopyInst*>(inst.get());
+        std::string src = loadOperand(c->src, scratchIdx, insns);
+        auto it = allocation.find(c->dest);
+        if (it != allocation.end()) {
+          std::string dst = RISCVRegMap::physicalRegName(it->second);
+          insns.push_back("\taddi " + dst + ", " + src + ", 0");
+        } else {
+          storeSpilledDest(c->dest, src, insns);
+        }
+        break;
+      }
+      case InstKind::Load: {
+        auto* l = static_cast<const LoadInst*>(inst.get());
+        std::string addr = loadOperand(l->addr, scratchIdx, insns);
+        auto it = allocation.find(l->dest);
+        std::string dst = (it != allocation.end())
+                              ? RISCVRegMap::physicalRegName(it->second)
+                              : scratchRegs[scratchIdx % scratchRegs.size()];
+        if (it == allocation.end()) scratchIdx++;
+        insns.push_back("\tlw " + dst + ", 0(" + addr + ")");
+        storeSpilledDest(l->dest, dst, insns);
+        break;
+      }
+      case InstKind::Store: {
+        auto* s = static_cast<const StoreInst*>(inst.get());
+        std::string src = loadOperand(s->src, scratchIdx, insns);
+        std::string addr = loadOperand(s->addr, scratchIdx, insns);
+        insns.push_back("\tsw " + src + ", 0(" + addr + ")");
+        break;
+      }
+      case InstKind::Branch: {
+        auto* br = static_cast<const BranchInst*>(inst.get());
+        std::string cond = loadOperand(br->cond, scratchIdx, insns);
+        insns.push_back("\tbne " + cond + ", x0, " +
+                        mangleLabel(br->trueLabel));
+        insns.push_back("\tjal x0, " + mangleLabel(br->falseLabel));
+        break;
+      }
+      case InstKind::Jump: {
+        auto* j = static_cast<const JumpInst*>(inst.get());
+        insns.push_back("\tjal x0, " + mangleLabel(j->target));
+        break;
+      }
+      case InstKind::Call: {
+        auto* c = static_cast<const CallInst*>(inst.get());
+
+        // Determine the destination register name if this call has a result
+        std::string destRegName;
+        if (c->hasDest) {
+          auto it = allocation.find(c->dest);
+          if (it != allocation.end()) {
+            destRegName = RISCVRegMap::physicalRegName(it->second);
+          }
+        }
+
+        // Save caller-saved regs that are live across calls.
+        for (const auto& reg : frame.callerSavedRegs) {
+          auto itSlot = frame.callerSavedSlots.find(reg);
+          if (itSlot != frame.callerSavedSlots.end()) {
+            insns.push_back("\tsw " + reg + ", " +
+                            std::to_string(itSlot->second) + "(sp)");
+          }
+        }
+
+        // Move arguments.
+        for (size_t ai = 0; ai < c->args.size(); ++ai) {
+          if (ai < 8) {
+            std::string argReg = loadOperand(c->args[ai], scratchIdx, insns);
+            std::string target = "a" + std::to_string(ai);
+            if (argReg != target) {
+              insns.push_back("\taddi " + target + ", " + argReg + ", 0");
+            }
+          } else {
+            std::string argReg = loadOperand(c->args[ai], scratchIdx, insns);
+            int offset = static_cast<int>((ai - 8) * 4);
+            insns.push_back("\tsw " + argReg + ", " + std::to_string(offset) +
+                            "(sp)");
+          }
+        }
+
+        insns.push_back("\tjal ra, " + c->callee);
+
+        // Restore caller-saved regs BEFORE capturing the return value,
+        // but skip the destination register to avoid overwriting the result.
+        for (const auto& reg : frame.callerSavedRegs) {
+          // Skip restoring the destination register - we'll write the return
+          // value there
+          if (!destRegName.empty() && reg == destRegName) {
+            continue;
+          }
+          auto itSlot = frame.callerSavedSlots.find(reg);
+          if (itSlot != frame.callerSavedSlots.end()) {
+            insns.push_back("\tlw " + reg + ", " +
+                            std::to_string(itSlot->second) + "(sp)");
+          }
+        }
+
+        // Now capture the return value
+        if (c->hasDest) {
+          auto it = allocation.find(c->dest);
+          if (it != allocation.end()) {
+            std::string dst = RISCVRegMap::physicalRegName(it->second);
+            insns.push_back("\taddi " + dst + ", a0, 0");
+          } else {
+            storeSpilledDest(c->dest, "a0", insns);
+          }
+        }
+
+        break;
+      }
+      case InstKind::Return: {
+        auto* r = static_cast<const ReturnInst*>(inst.get());
+        if (r->hasValue) {
+          std::string valReg = loadOperand(r->value, scratchIdx, insns);
+          if (valReg != "a0") {
+            insns.push_back("\taddi a0, " + valReg + ", 0");
+          }
+        }
+        for (const auto& line : insns) {
+          out.push_back(line);
+        }
+        emitEpilogue(fn, frame, out);
+        continue;
+      }
+      case InstKind::Label: {
+        auto* l = static_cast<const LabelInst*>(inst.get());
+        out.push_back(mangleLabel(l->label) + ":");
+        continue;
+      }
+    }
+
+    for (const auto& line : insns) {
+      out.push_back(line);
+    }
+  }
+
+  // If the function doesn't end with a return instruction, we need to emit
+  // an epilogue to ensure the function returns properly (e.g., void functions
+  // without explicit return statements).
+  bool endsWithReturn = false;
+  if (!fn.instructions.empty()) {
+    const auto& lastInst = fn.instructions.back();
+    endsWithReturn = (lastInst->kind == InstKind::Return);
+  }
+  if (!endsWithReturn) {
+    emitEpilogue(fn, frame, out);
+  }
+}
+
+std::vector<std::string> CodeGen::generate(const IRProgram& program) {
+  std::vector<std::string> out;
+
+  out.push_back(".text");
+  out.push_back("");
+
+  GraphColoringAllocator allocator;
+
+  for (auto& fn : program.functions) {
+    LivenessResult liveness = AnalyzeLiveness(fn);
+    RegAllocResult allocResult = allocator.allocate(fn, liveness);
+    StackFrame frame = computeStackFrame(fn, allocResult, liveness);
+
+    emitPrologue(fn, frame, out);
+    emitFunctionBody(fn, allocResult.allocation, frame, liveness, out);
+
+    out.push_back("");
+  }
+
+  // Apply assembly-level peephole optimizations
+  out = peepholeOptimize(out);
+
+  return out;
+}
