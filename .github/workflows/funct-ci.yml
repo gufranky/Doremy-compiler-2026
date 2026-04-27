@@ -15,57 +15,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  compile-rate:
-    name: Compile pass rate
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y make g++ flex bison gcc-riscv64-linux-gnu qemu-user
-
-      - name: Run compile-rate evaluation
-        shell: bash
-        run: |
-          set -o pipefail
-          set +e
-          python3 run_funct_tests.py \
-            --mode compile \
-            --runner host \
-            --build-cmd "make clean && make" \
-            --summary-json compile-summary.json \
-            --quiet | tee compile.log
-          status=${PIPESTATUS[0]}
-          set -e
-          echo "compile_script_exit=$status" >> "$GITHUB_ENV"
-          exit 0
-
-      - name: Write compile summary
-        if: always()
-        shell: bash
-        run: |
-          {
-            echo "## Compile pass rate"
-            echo
-            grep -E '^(执行环境|总用例|编译通过|编译通过率|执行通过|失败分布:|  )' compile.log || true
-            echo
-            echo "script_exit_code=${compile_script_exit:-unknown}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload compile artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: compile-artifacts
-          path: |
-            compile.log
-            compile-summary.json
-
   full-baseline:
     name: Full baseline gate
     runs-on: ubuntu-latest
@@ -104,6 +53,8 @@ jobs:
           status=${PIPESTATUS[0]}
           set -e
           echo "full_script_exit=$status" >> "$GITHUB_ENV"
+          echo "current_compile_passes=$(jq -r '.compile_passes' full-summary.json)" >> "$GITHUB_ENV"
+          echo "current_compile_rate=$(jq -r '.compile_rate' full-summary.json)" >> "$GITHUB_ENV"
           echo "current_full_passes=$(jq -r '.full_passes' full-summary.json)" >> "$GITHUB_ENV"
           echo "current_full_rate=$(jq -r '.full_rate' full-summary.json)" >> "$GITHUB_ENV"
           exit 0
@@ -146,6 +97,8 @@ jobs:
             echo
             echo "baseline_full_passes=${baseline_full_passes:-unknown}"
             echo "baseline_full_rate=${baseline_full_rate:-unknown}%"
+            echo "current_compile_passes=${current_compile_passes:-unknown}"
+            echo "current_compile_rate=${current_compile_rate:-unknown}%"
             echo "current_full_passes=${current_full_passes:-unknown}"
             echo "current_full_rate=${current_full_rate:-unknown}%"
             echo "delta=${full_delta:-unknown}"
