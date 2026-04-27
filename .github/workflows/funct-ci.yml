@@ -2,8 +2,13 @@ name: funct-ci
 
 on:
   push:
+    paths-ignore:
+      - '.github/baselines/funct-full.json'
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 concurrency:
   group: funct-ci-${{ github.workflow }}-${{ github.ref }}
@@ -16,6 +21,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install dependencies
         run: |
@@ -30,7 +37,11 @@ jobs:
             --mode compile \
             --runner host \
             --build-cmd "make clean && make" \
+            --summary-json compile-summary.json \
             --quiet | tee compile.log
+          status=${PIPESTATUS[0]}
+          echo "compile_script_exit=$status" >> "$GITHUB_ENV"
+          exit 0
 
       - name: Write compile summary
         if: always()
@@ -40,26 +51,41 @@ jobs:
             echo "## Compile pass rate"
             echo
             grep -E '^(执行环境|总用例|编译通过|编译通过率|执行通过|失败分布:|  )' compile.log || true
+            echo
+            echo "script_exit_code=${compile_script_exit:-unknown}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload compile log
-        if: failure()
+      - name: Upload compile artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: compile-log
-          path: compile.log
+          name: compile-artifacts
+          path: |
+            compile.log
+            compile-summary.json
 
-  full-rate:
-    name: Full execution pass rate
+  full-baseline:
+    name: Full baseline gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y make g++ flex bison gcc-riscv64-linux-gnu qemu-user
+          sudo apt-get install -y make g++ flex bison gcc-riscv64-linux-gnu qemu-user jq
+
+      - name: Load baseline from main
+        shell: bash
+        run: |
+          git fetch origin main
+          mkdir -p baseline
+          git show origin/main:.github/baselines/funct-full.json > baseline/funct-full.json
+          echo "baseline_full_passes=$(jq -r '.full_passes' baseline/funct-full.json)" >> "$GITHUB_ENV"
+          echo "baseline_full_rate=$(jq -r '.full_rate' baseline/funct-full.json)" >> "$GITHUB_ENV"
 
       - name: Run full-rate evaluation
         shell: bash
@@ -70,21 +96,76 @@ jobs:
             --runner host \
             --build-cmd "make clean && make" \
             --runtime libsysy_riscv.a \
+            --summary-json full-summary.json \
             --quiet | tee full.log
+          status=${PIPESTATUS[0]}
+          echo "full_script_exit=$status" >> "$GITHUB_ENV"
+          echo "current_full_passes=$(jq -r '.full_passes' full-summary.json)" >> "$GITHUB_ENV"
+          echo "current_full_rate=$(jq -r '.full_rate' full-summary.json)" >> "$GITHUB_ENV"
+          exit 0
 
-      - name: Write full summary
+      - name: Compare against baseline
+        shell: bash
+        run: |
+          baseline=${baseline_full_passes}
+          current=${current_full_passes}
+          delta=$((current - baseline))
+          echo "full_delta=$delta" >> "$GITHUB_ENV"
+          if [ "$current" -ge "$baseline" ]; then
+            echo "baseline_met=true" >> "$GITHUB_ENV"
+          else
+            echo "baseline_met=false" >> "$GITHUB_ENV"
+          fi
+          if [ "$current" -gt "$baseline" ]; then
+            echo "baseline_improved=true" >> "$GITHUB_ENV"
+          else
+            echo "baseline_improved=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Update baseline on main
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.baseline_improved == 'true'
+        shell: bash
+        run: |
+          python3 -c "import json, pathlib; summary_path = pathlib.Path('full-summary.json'); baseline_path = pathlib.Path('.github/baselines/funct-full.json'); summary = json.loads(summary_path.read_text(encoding='utf-8')); summary['updated_from'] = '${{ github.sha }}'; baseline_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .github/baselines/funct-full.json
+          git commit -m "Update funct full baseline" || exit 0
+          git push
+
+      - name: Write full baseline summary
         if: always()
         shell: bash
         run: |
           {
-            echo "## Full execution pass rate"
+            echo "## Full baseline gate"
+            echo
+            echo "baseline_full_passes=${baseline_full_passes:-unknown}"
+            echo "baseline_full_rate=${baseline_full_rate:-unknown}%"
+            echo "current_full_passes=${current_full_passes:-unknown}"
+            echo "current_full_rate=${current_full_rate:-unknown}%"
+            echo "delta=${full_delta:-unknown}"
+            echo "baseline_improved=${baseline_improved:-unknown}"
+            echo "baseline_met=${baseline_met:-unknown}"
+            echo "script_exit_code=${full_script_exit:-unknown}"
             echo
             grep -E '^(执行环境|总用例|编译通过|编译通过率|执行通过|执行通过率|失败分布:|  )' full.log || true
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload full log
-        if: failure()
+      - name: Upload full artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: full-log
-          path: full.log
+          name: full-artifacts
+          path: |
+            baseline/funct-full.json
+            full.log
+            full-summary.json
+
+      - name: Enforce baseline improvement
+        shell: bash
+        run: |
+          if [ "${baseline_met}" != "true" ]; then
+            echo "Current full result did not meet main baseline."
+            exit 1
+          fi

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import json
 import shlex
 import shutil
 import subprocess
@@ -241,6 +242,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diff-lines", type=int, default=12, help="失败时最多显示多少行 diff")
     parser.add_argument("--list-only", action="store_true", help="仅列出用例，不实际执行")
     parser.add_argument("--quiet", action="store_true", help="只输出失败用例和最终汇总")
+    parser.add_argument("--summary-json", help="将汇总结果写入 JSON 文件")
     return parser.parse_args()
 
 
@@ -387,9 +389,26 @@ def main() -> int:
             print(f"  {stage}: {count}")
     print("=" * 60)
 
-    if args.mode == "compile":
-        return 0 if compile_passes == total else 1
-    return 0 if full_passes == total else 1
+    exit_code = 0 if compile_passes == total else 1
+    if args.mode != "compile":
+        exit_code = 0 if full_passes == total else 1
+
+    if args.summary_json:
+        summary_path = Path(args.summary_json)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary = {
+            "mode": args.mode,
+            "total": total,
+            "compile_passes": compile_passes,
+            "compile_rate": round(compile_rate, 2),
+            "full_passes": full_passes,
+            "full_rate": round(full_rate, 2),
+            "stage_summary": stage_summary,
+            "exit_code": exit_code,
+        }
+        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    return exit_code
 
 
 if __name__ == "__main__":

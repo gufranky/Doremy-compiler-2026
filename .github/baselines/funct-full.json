@@ -1,0 +1,13 @@
+{
+  "mode": "full",
+  "total": 140,
+  "compile_passes": 24,
+  "compile_rate": 17.14,
+  "full_passes": 24,
+  "full_rate": 17.14,
+  "stage_summary": {
+    "compile": 116
+  },
+  "exit_code": 1,
+  "updated_from": "94a4fac"
+}
