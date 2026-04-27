@@ -1,0 +1,6 @@
+generated/
+compiler
+build/
+.serena/
+*.pdf
+funct/*.sy.s
