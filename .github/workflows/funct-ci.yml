@@ -1,0 +1,90 @@
+name: funct-ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: funct-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile-rate:
+    name: Compile pass rate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make g++ flex bison gcc-riscv64-linux-gnu qemu-user
+
+      - name: Run compile-rate evaluation
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 run_funct_tests.py \
+            --mode compile \
+            --runner host \
+            --build-cmd "make clean && make" \
+            --quiet | tee compile.log
+
+      - name: Write compile summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Compile pass rate"
+            echo
+            grep -E '^(执行环境|总用例|编译通过|编译通过率|执行通过|失败分布:|  )' compile.log || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload compile log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compile-log
+          path: compile.log
+
+  full-rate:
+    name: Full execution pass rate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make g++ flex bison gcc-riscv64-linux-gnu qemu-user
+
+      - name: Run full-rate evaluation
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 run_funct_tests.py \
+            --mode full \
+            --runner host \
+            --build-cmd "make clean && make" \
+            --runtime libsysy_riscv.a \
+            --quiet | tee full.log
+
+      - name: Write full summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Full execution pass rate"
+            echo
+            grep -E '^(执行环境|总用例|编译通过|编译通过率|执行通过|执行通过率|失败分布:|  )' full.log || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-log
+          path: full.log
