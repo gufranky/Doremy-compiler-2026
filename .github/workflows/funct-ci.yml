@@ -33,6 +33,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          set +e
           python3 run_funct_tests.py \
             --mode compile \
             --runner host \
@@ -40,6 +41,7 @@ jobs:
             --summary-json compile-summary.json \
             --quiet | tee compile.log
           status=${PIPESTATUS[0]}
+          set -e
           echo "compile_script_exit=$status" >> "$GITHUB_ENV"
           exit 0
 
@@ -91,6 +93,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          set +e
           python3 run_funct_tests.py \
             --mode full \
             --runner host \
@@ -99,6 +102,7 @@ jobs:
             --summary-json full-summary.json \
             --quiet | tee full.log
           status=${PIPESTATUS[0]}
+          set -e
           echo "full_script_exit=$status" >> "$GITHUB_ENV"
           echo "current_full_passes=$(jq -r '.full_passes' full-summary.json)" >> "$GITHUB_ENV"
           echo "current_full_rate=$(jq -r '.full_rate' full-summary.json)" >> "$GITHUB_ENV"
