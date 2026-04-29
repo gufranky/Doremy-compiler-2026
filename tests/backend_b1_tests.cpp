@@ -60,11 +60,14 @@ int main() {
 
     bool hasMain = false;
     bool hasRet = false;
+    bool hasData = prog.globals.empty();
     for (const auto& line : asmLines) {
       if (line.find("main:") != std::string::npos) hasMain = true;
       if (line.find("ret") != std::string::npos) hasRet = true;
+      if (line == ".data") hasData = true;
     }
     assert(hasMain && hasRet);
+    if (!prog.globals.empty()) assert(hasData);
   }
 
   return 0;

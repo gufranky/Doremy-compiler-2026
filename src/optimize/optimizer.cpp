@@ -952,8 +952,8 @@ bool localMemOpt(IRFunction& func) {
   }
   
   // Apply replacements
-  for (auto& [idx, newInst] : replacements) {
-    func.instructions[idx] = std::move(newInst);
+  for (auto& replacement : replacements) {
+    func.instructions[replacement.first] = std::move(replacement.second);
   }
   
   return changed;
@@ -1020,7 +1020,6 @@ bool globalVarConst(IRFunction& func) {
 // in the optimization pass. It marks stores as dead if the variable
 // is never loaded in the entire function.
 bool deadStoreElim(IRFunction& func) {
-  // Build set of all loaded variables
   std::unordered_set<std::string> loadedVars;
   for (const auto& instPtr : func.instructions) {
     if (!instPtr) continue;  // Safety check
@@ -1031,20 +1030,20 @@ bool deadStoreElim(IRFunction& func) {
     }
   }
   
-  // Mark stores to never-loaded variables for removal
   std::vector<size_t> toRemove;
   for (size_t i = 0; i < func.instructions.size(); ++i) {
     if (!func.instructions[i]) continue;  // Safety check
     if (auto* st = dynamic_cast<StoreInst*>(func.instructions[i].get())) {
-      if (st->addr.isGlobal() && !loadedVars.count(st->addr.globalName)) {
-        toRemove.push_back(i);
-      }
+      if (!st->addr.isGlobal()) continue;
+
+      // Global stores are externally visible across calls/functions, so
+      // function-local dead store analysis must not remove them.
+      continue;
     }
   }
   
   if (toRemove.empty()) return false;
   
-  // Remove marked stores by building new vector
   std::unordered_set<size_t> removeSet(toRemove.begin(), toRemove.end());
   std::vector<std::unique_ptr<Instruction>> newInstructions;
   newInstructions.reserve(func.instructions.size() - toRemove.size());
@@ -1182,7 +1181,6 @@ bool loopIVModElim(IRFunction& func) {
 
 bool runOnce(IRFunction& func) {
   bool changed = false;
-  // LocalMemOpt is the most important - reduces stack traffic significantly
   changed |= localMemOpt(func);
   changed |= globalVarConst(func);
   changed |= constantFold(func);
@@ -1202,7 +1200,6 @@ bool runOnce(IRFunction& func) {
 }  // namespace
 
 void OptimizeFunction(IRFunction& func) {
-  // Iterate to reach a fixed point (more iterations for better optimization)
   for (int i = 0; i < 10; ++i) {
     if (!runOnce(func)) break;
   }
@@ -1325,37 +1322,30 @@ bool simplifyCallsInFunc(IRFunction& func,
 }
 
 void OptimizeProgram(IRProgram& program) {
-  // First pass: basic local optimizations on each function
   for (auto& fn : program.functions) {
     OptimizeFunction(fn);
   }
-  
-  // Interprocedural: build function summaries and apply call simplification
-  // NOTE: Only conservative call simplifications are applied:
-  // - Replace call with constant if function always returns same constant
-  // - Replace call with parameter copy if function returns that parameter unchanged
+
   auto summaries = buildFuncSummaries(program);
-  
+
   bool ipaChanged = true;
   int ipaPass = 0;
-  while (ipaChanged && ipaPass < 5) {  // More IPA passes
+  while (ipaChanged && ipaPass < 5) {
     ipaChanged = false;
     ipaPass++;
-    
+
     for (auto& fn : program.functions) {
       if (simplifyCallsInFunc(fn, summaries)) {
         ipaChanged = true;
-        OptimizeFunction(fn);  // Re-run local optimizations after call simplification
+        OptimizeFunction(fn);
       }
     }
-    
-    // Rebuild summaries if anything changed
+
     if (ipaChanged) {
       summaries = buildFuncSummaries(program);
     }
   }
-  
-  // Multiple final cleanup passes
+
   for (int pass = 0; pass < 3; ++pass) {
     for (auto& fn : program.functions) {
       OptimizeFunction(fn);

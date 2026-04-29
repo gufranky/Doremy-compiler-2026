@@ -11,41 +11,42 @@ class SemanticAnalyzer : public ASTVisitor {
  private:
   SymbolTable symbolTable;
   std::vector<std::string> errors;
+  int loopDepth = 0;
+  FuncDef* currentFunction = nullptr;
+  bool hasReturn = false;
 
-  // Context tracking
-  int loopDepth;  // Track if we're inside a loop (for break/continue)
-  FuncDef* currentFunction;  // Track current function being analyzed
-  bool hasReturn;            // Track if current path has a return statement
-
-  // Type tracking for expressions
-  bool lastExprIsVoid;  // True if last expression was a void function call
+  Type lastExprType = Type::Invalid();
+  bool lastExprIsConst = false;
+  int lastExprConstValue = 0;
 
   void addError(const std::string& msg) { errors.push_back(msg); }
+  bool isIntType(const Type& type) const;
+  void setExprResult(const Type& type, bool isConst = false, int constValue = 0);
+  bool evalConstExpr(Expr* expr, int* value);
+  void visitDeclDefs(VarDeclStmt* node);
 
  public:
-  SemanticAnalyzer()
-      : loopDepth(0),
-        currentFunction(nullptr),
-        hasReturn(false),
-        lastExprIsVoid(false) {}
+  SemanticAnalyzer() = default;
 
-  // Run semantic analysis on the AST
   bool analyze(CompUnit* root) {
     errors.clear();
+    symbolTable.reset();
+    loopDepth = 0;
+    currentFunction = nullptr;
+    hasReturn = false;
+    lastExprType = Type::Invalid();
+    lastExprIsConst = false;
+    lastExprConstValue = 0;
+
     root->accept(this);
-
-    // Check for main function
     if (!symbolTable.hasMainFunction()) {
-      addError(
-          "Program must have a 'main' function with signature: int main()");
+      addError("Program must have a 'main' function with signature: int main()");
     }
-
     return errors.empty();
   }
 
   const std::vector<std::string>& getErrors() const { return errors; }
 
-  // Visitor methods
   void visit(NumberExpr* node) override;
   void visit(IdentifierExpr* node) override;
   void visit(ParenExpr* node) override;
@@ -68,4 +69,4 @@ class SemanticAnalyzer : public ASTVisitor {
   void visit(CompUnit* node) override;
 };
 
-#endif  // SEMANTIC_ANALYZER_H
+#endif

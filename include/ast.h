@@ -5,54 +5,96 @@
 #include <string>
 #include <vector>
 
-// Forward declarations
 class ASTVisitor;
 
-// Base class for all AST nodes
 class ASTNode {
  public:
   virtual ~ASTNode() = default;
   virtual void accept(ASTVisitor* visitor) = 0;
 };
 
-// Expression nodes
+enum class BaseType { INVALID, INT, VOID, FLOAT };
+
+struct Type {
+  BaseType base = BaseType::INVALID;
+  bool isConst = false;
+  bool isArray = false;
+  std::vector<int> arrayDimensions;
+  bool firstDimUnsized = false;
+
+  static Type Invalid() { return Type{}; }
+  static Type Int() {
+    Type t;
+    t.base = BaseType::INT;
+    return t;
+  }
+  static Type ConstInt() {
+    Type t = Int();
+    t.isConst = true;
+    return t;
+  }
+  static Type Void() {
+    Type t;
+    t.base = BaseType::VOID;
+    return t;
+  }
+  static Type Float() {
+    Type t;
+    t.base = BaseType::FLOAT;
+    return t;
+  }
+
+  bool isValid() const { return base != BaseType::INVALID; }
+  bool isIntScalar() const { return base == BaseType::INT && !isArray; }
+  bool isVoidScalar() const { return base == BaseType::VOID && !isArray; }
+
+  bool equalsIgnoringConst(const Type& other) const {
+    return base == other.base && isArray == other.isArray &&
+           arrayDimensions == other.arrayDimensions &&
+           firstDimUnsized == other.firstDimUnsized;
+  }
+
+  Type withoutConst() const {
+    Type t = *this;
+    t.isConst = false;
+    return t;
+  }
+};
+
 class Expr : public ASTNode {
  public:
   virtual ~Expr() = default;
 };
 
-// Primary Expression
 class NumberExpr : public Expr {
  public:
   int value;
-  NumberExpr(int val) : value(val) {}
+  explicit NumberExpr(int val) : value(val) {}
   void accept(ASTVisitor* visitor) override;
 };
 
 class IdentifierExpr : public Expr {
  public:
   std::string name;
-  IdentifierExpr(const std::string& n) : name(n) {}
+  explicit IdentifierExpr(const std::string& n) : name(n) {}
   void accept(ASTVisitor* visitor) override;
 };
 
 class ParenExpr : public Expr {
  public:
   std::unique_ptr<Expr> expr;
-  ParenExpr(Expr* e) : expr(e) {}
+  explicit ParenExpr(Expr* e) : expr(e) {}
   void accept(ASTVisitor* visitor) override;
 };
 
-// Function Call
 class FunctionCallExpr : public Expr {
  public:
   std::string funcName;
   std::vector<std::unique_ptr<Expr>> args;
-  FunctionCallExpr(const std::string& name) : funcName(name) {}
+  explicit FunctionCallExpr(const std::string& name) : funcName(name) {}
   void accept(ASTVisitor* visitor) override;
 };
 
-// Unary Expression
 class UnaryExpr : public Expr {
  public:
   enum OpType { U_PLUS, U_MINUS, U_NOT };
@@ -60,7 +102,8 @@ class UnaryExpr : public Expr {
   std::unique_ptr<Expr> operand;
   UnaryExpr(OpType o, Expr* e) : op(o), operand(e) {}
   void accept(ASTVisitor* visitor) override;
-};  // Binary Expression
+};
+
 class BinaryExpr : public Expr {
  public:
   enum OpType {
@@ -85,34 +128,45 @@ class BinaryExpr : public Expr {
   void accept(ASTVisitor* visitor) override;
 };
 
-// Statement nodes
 class Stmt : public ASTNode {
  public:
   virtual ~Stmt() = default;
 };
 
-// Block Statement
+class VarDef {
+ public:
+  std::string name;
+  std::unique_ptr<Expr> initExpr;
+  bool hasInit = false;
+  bool initIsConst = false;
+  int constInitValue = 0;
+  bool isArray = false;
+  std::vector<int> arrayDimensions;
+  bool firstDimUnsized = false;
+
+  explicit VarDef(const std::string& n) : name(n) {}
+  VarDef(const std::string& n, Expr* init)
+      : name(n), initExpr(init), hasInit(true) {}
+};
+
 class Block : public Stmt {
  public:
   std::vector<std::unique_ptr<Stmt>> stmts;
   void accept(ASTVisitor* visitor) override;
 };
 
-// Empty Statement
 class EmptyStmt : public Stmt {
  public:
   void accept(ASTVisitor* visitor) override;
 };
 
-// Expression Statement
 class ExprStmt : public Stmt {
  public:
   std::unique_ptr<Expr> expr;
-  ExprStmt(Expr* e) : expr(e) {}
+  explicit ExprStmt(Expr* e) : expr(e) {}
   void accept(ASTVisitor* visitor) override;
 };
 
-// Assignment Statement
 class AssignStmt : public Stmt {
  public:
   std::string varName;
@@ -121,28 +175,25 @@ class AssignStmt : public Stmt {
   void accept(ASTVisitor* visitor) override;
 };
 
-// Variable Declaration
 class VarDeclStmt : public Stmt {
  public:
-  std::string varName;
-  std::unique_ptr<Expr> initExpr;
-  VarDeclStmt(const std::string& name, Expr* init)
-      : varName(name), initExpr(init) {}
+  Type declaredType;
+  std::vector<std::unique_ptr<VarDef>> defs;
+
+  explicit VarDeclStmt(Type t) : declaredType(std::move(t)) {}
   void accept(ASTVisitor* visitor) override;
 };
 
-// If Statement
 class IfStmt : public Stmt {
  public:
   std::unique_ptr<Expr> condition;
   std::unique_ptr<Stmt> thenStmt;
   std::unique_ptr<Stmt> elseStmt;
-  IfStmt(Expr* cond, Stmt* then, Stmt* els = nullptr)
-      : condition(cond), thenStmt(then), elseStmt(els) {}
+  IfStmt(Expr* cond, Stmt* thenBranch, Stmt* elseBranch = nullptr)
+      : condition(cond), thenStmt(thenBranch), elseStmt(elseBranch) {}
   void accept(ASTVisitor* visitor) override;
 };
 
-// While Statement
 class WhileStmt : public Stmt {
  public:
   std::unique_ptr<Expr> condition;
@@ -151,54 +202,49 @@ class WhileStmt : public Stmt {
   void accept(ASTVisitor* visitor) override;
 };
 
-// Break Statement
 class BreakStmt : public Stmt {
  public:
   void accept(ASTVisitor* visitor) override;
 };
 
-// Continue Statement
 class ContinueStmt : public Stmt {
  public:
   void accept(ASTVisitor* visitor) override;
 };
 
-// Return Statement
 class ReturnStmt : public Stmt {
  public:
   std::unique_ptr<Expr> returnValue;
-  // returnValue may be null for `return;` in void functions
-  ReturnStmt(Expr* val = nullptr) : returnValue(val) {}
+  explicit ReturnStmt(Expr* val = nullptr) : returnValue(val) {}
   void accept(ASTVisitor* visitor) override;
 };
 
-// Function Parameter
 class Param {
  public:
+  Type type;
   std::string name;
-  Param(const std::string& n) : name(n) {}
+
+  Param(Type t, const std::string& n) : type(std::move(t)), name(n) {}
 };
 
-// Function Definition
 class FuncDef : public ASTNode {
  public:
-  enum ReturnType { RT_INT, RT_VOID };
-  ReturnType returnType;
+  Type returnType;
   std::string name;
   std::vector<std::unique_ptr<Param>> params;
   std::unique_ptr<Block> body;
 
-  FuncDef(ReturnType rt, const std::string& n, Block* b)
-      : returnType(rt), name(n), body(b) {}
-  void accept(ASTVisitor* visitor) override;
-};  // Compilation Unit (root of AST)
-class CompUnit : public ASTNode {
- public:
-  std::vector<std::unique_ptr<FuncDef>> functions;
+  FuncDef(Type rt, const std::string& n, Block* b)
+      : returnType(std::move(rt)), name(n), body(b) {}
   void accept(ASTVisitor* visitor) override;
 };
 
-// Visitor interface
+class CompUnit : public ASTNode {
+ public:
+  std::vector<std::unique_ptr<ASTNode>> items;
+  void accept(ASTVisitor* visitor) override;
+};
+
 class ASTVisitor {
  public:
   virtual ~ASTVisitor() = default;
@@ -225,4 +271,4 @@ class ASTVisitor {
   virtual void visit(CompUnit* node) = 0;
 };
 
-#endif  // AST_H
+#endif

@@ -94,6 +94,7 @@ int main() {
   // Run IR creation over all functional testcases
   auto files = collectTestcases();
   std::cout << "IR m1 invariants over " << files.size() << " testcases\n";
+  bool sawGlobals = false;
   for (const auto& path : files) {
     IRProgram prog = buildProgramFromFile(path);
     assert(!prog.functions.empty());
@@ -105,12 +106,18 @@ int main() {
         if (inst->kind == InstKind::Return) returnCount++;
       }
     }
+    if (path.find("f21_global_const.c") != std::string::npos) {
+      assert(!prog.globals.empty());
+      assert(prog.globals[0].name == "g");
+      sawGlobals = true;
+    }
     assert(totalInst > 0);
     assert(returnCount > 0);
     std::cout << "  ok: " << path << " (functions=" << prog.functions.size()
               << ", insts=" << totalInst << ", returns=" << returnCount
               << ")\n";
   }
+  assert(sawGlobals);
 
   return 0;
 }
