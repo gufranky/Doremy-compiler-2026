@@ -8,7 +8,6 @@
 
 namespace ir {
 
-// Operand for IR instructions
 struct Operand {
   enum class Kind { Immediate, VirtualRegister, GlobalVariable };
 
@@ -26,7 +25,6 @@ struct Operand {
   bool isGlobal() const { return kind == Kind::GlobalVariable; }
 };
 
-// Instruction kinds
 enum class InstKind {
   Binary,
   Unary,
@@ -40,7 +38,6 @@ enum class InstKind {
   Label
 };
 
-// Operation enums
 enum class BinaryOp {
   Add,
   Sub,
@@ -59,7 +56,6 @@ enum class BinaryOp {
 
 enum class UnaryOp { Neg, Not, Plus };
 
-// Base instruction
 struct Instruction {
   explicit Instruction(InstKind k) : kind(k) {}
   virtual ~Instruction() = default;
@@ -68,7 +64,7 @@ struct Instruction {
 
 struct BinaryInst : public Instruction {
   BinaryOp op;
-  int dest;  // virtual register id
+  int dest;
   Operand lhs;
   Operand rhs;
   BinaryInst(BinaryOp op, int dest, Operand lhs, Operand rhs)
@@ -108,9 +104,7 @@ struct StoreInst : public Instruction {
   Operand src;
   Operand addr;
   StoreInst(Operand src, Operand addr)
-      : Instruction(InstKind::Store),
-        src(std::move(src)),
-        addr(std::move(addr)) {}
+      : Instruction(InstKind::Store), src(std::move(src)), addr(std::move(addr)) {}
 };
 
 struct BranchInst : public Instruction {
@@ -132,7 +126,7 @@ struct JumpInst : public Instruction {
 
 struct CallInst : public Instruction {
   bool hasDest;
-  int dest;  // valid only if hasDest
+  int dest;
   std::string callee;
   std::vector<Operand> args;
 
@@ -155,15 +149,9 @@ struct ReturnInst : public Instruction {
   bool hasValue;
   Operand value;
 
-  ReturnInst()
-      : Instruction(InstKind::Return),
-        hasValue(false),
-        value(Operand::Imm(0)) {}
-
+  ReturnInst() : Instruction(InstKind::Return), hasValue(false), value(Operand::Imm(0)) {}
   explicit ReturnInst(Operand value)
-      : Instruction(InstKind::Return),
-        hasValue(true),
-        value(std::move(value)) {}
+      : Instruction(InstKind::Return), hasValue(true), value(std::move(value)) {}
 };
 
 struct LabelInst : public Instruction {
@@ -176,7 +164,7 @@ struct IRFunction {
   std::string name;
   std::vector<std::unique_ptr<Instruction>> instructions;
   int nextVReg = 0;
-  std::vector<int> params;  // virtual registers for parameters (in order)
+  std::vector<int> params;
 
   explicit IRFunction(std::string name) : name(std::move(name)) {}
 
@@ -196,7 +184,18 @@ struct IRFunction {
   }
 };
 
+struct GlobalVar {
+  std::string name;
+  int initialValue = 0;
+  bool isConst = false;
+
+  GlobalVar() = default;
+  GlobalVar(std::string n, int init, bool isConstValue)
+      : name(std::move(n)), initialValue(init), isConst(isConstValue) {}
+};
+
 struct IRProgram {
+  std::vector<GlobalVar> globals;
   std::vector<IRFunction> functions;
 
   IRProgram() = default;
@@ -208,4 +207,4 @@ struct IRProgram {
 
 }  // namespace ir
 
-#endif  // IR_H
+#endif

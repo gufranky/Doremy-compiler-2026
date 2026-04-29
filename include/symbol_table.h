@@ -6,112 +6,111 @@
 #include <string>
 #include <vector>
 
-// Symbol types
-enum class SymbolType { VARIABLE, FUNCTION };
+#include "ast.h"
 
-// Symbol information
+enum class SymbolKind { VARIABLE, CONSTANT, FUNCTION };
+
 struct Symbol {
   std::string name;
-  SymbolType type;
+  SymbolKind kind;
+  Type type;
+  bool isParameter = false;
+  bool isGlobal = false;
+  bool hasConstValue = false;
+  int constValue = 0;
+  std::vector<Type> paramTypes;
 
-  // For variables
-  bool isParameter;
-
-  // For functions
-  bool isVoidReturn;
-  int paramCount;
-
-  Symbol(const std::string& n, SymbolType t)
-      : name(n),
-        type(t),
-        isParameter(false),
-        isVoidReturn(false),
-        paramCount(0) {}
+  Symbol(const std::string& n, SymbolKind k, const Type& t)
+      : name(n), kind(k), type(t) {}
 };
 
-// Symbol table with scope management
 class SymbolTable {
  private:
-  // Each scope is a map from name to symbol
-  std::vector<std::map<std::string, std::unique_ptr<Symbol>>> scopes;
-
-  // Global function table (functions are only in global scope)
+  std::vector<std::map<std::string, std::unique_ptr<Symbol>>> valueScopes;
   std::map<std::string, std::unique_ptr<Symbol>> functionTable;
 
  public:
-  SymbolTable() {
-    // Start with global scope
+  SymbolTable() { reset(); }
+
+  void reset() {
+    valueScopes.clear();
+    functionTable.clear();
     enterScope();
   }
 
-  // Scope management
-  void enterScope() { scopes.emplace_back(); }
+  void enterScope() { valueScopes.emplace_back(); }
 
   void exitScope() {
-    if (scopes.size() > 1) {  // Keep at least global scope
-      scopes.pop_back();
+    if (valueScopes.size() > 1) {
+      valueScopes.pop_back();
     }
   }
 
-  int getScopeLevel() const { return scopes.size(); }
+  int getScopeLevel() const { return static_cast<int>(valueScopes.size()); }
+  bool isGlobalScope() const { return valueScopes.size() == 1; }
 
-  // Variable operations
-  bool declareVariable(const std::string& name, bool isParam = false) {
-    if (scopes.empty()) return false;
-
-    // Check if variable already exists in current scope
-    auto& currentScope = scopes.back();
-    if (currentScope.find(name) != currentScope.end()) {
-      return false;  // Variable already declared in this scope
+  bool declareValue(const std::string& name, const Type& type,
+                    bool isParam = false, bool hasConstValue = false,
+                    int constValue = 0) {
+    if (valueScopes.empty()) return false;
+    auto& currentScope = valueScopes.back();
+    if (currentScope.find(name) != currentScope.end()) return false;
+    if (isGlobalScope() && functionTable.find(name) != functionTable.end()) {
+      return false;
     }
 
-    auto symbol = std::make_unique<Symbol>(name, SymbolType::VARIABLE);
+    SymbolKind kind = type.isConst ? SymbolKind::CONSTANT : SymbolKind::VARIABLE;
+    auto symbol = std::make_unique<Symbol>(name, kind, type);
     symbol->isParameter = isParam;
+    symbol->isGlobal = isGlobalScope();
+    symbol->hasConstValue = hasConstValue;
+    symbol->constValue = constValue;
     currentScope[name] = std::move(symbol);
     return true;
   }
 
-  Symbol* lookupVariable(const std::string& name) {
-    // Search from innermost to outermost scope
-    for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+  Symbol* lookupValue(const std::string& name) {
+    for (auto it = valueScopes.rbegin(); it != valueScopes.rend(); ++it) {
       auto found = it->find(name);
-      if (found != it->end()) {
-        return found->second.get();
-      }
+      if (found != it->end()) return found->second.get();
     }
     return nullptr;
   }
 
-  // Function operations
-  bool declareFunction(const std::string& name, bool isVoid, int paramCount) {
-    // Check if function already exists
-    if (functionTable.find(name) != functionTable.end()) {
-      return false;  // Function already declared
+  Symbol* lookupGlobalValue(const std::string& name) {
+    if (valueScopes.empty()) return nullptr;
+    auto found = valueScopes.front().find(name);
+    if (found == valueScopes.front().end()) return nullptr;
+    return found->second.get();
+  }
+
+  bool declareFunction(const std::string& name, const Type& returnType,
+                       const std::vector<Type>& paramTypes) {
+    if (functionTable.find(name) != functionTable.end()) return false;
+    if (!valueScopes.empty() && valueScopes.front().find(name) != valueScopes.front().end()) {
+      return false;
     }
 
-    auto symbol = std::make_unique<Symbol>(name, SymbolType::FUNCTION);
-    symbol->isVoidReturn = isVoid;
-    symbol->paramCount = paramCount;
+    auto symbol = std::make_unique<Symbol>(name, SymbolKind::FUNCTION, returnType);
+    symbol->isGlobal = true;
+    symbol->paramTypes = paramTypes;
     functionTable[name] = std::move(symbol);
     return true;
   }
 
   Symbol* lookupFunction(const std::string& name) {
     auto found = functionTable.find(name);
-    if (found != functionTable.end()) {
-      return found->second.get();
-    }
+    if (found != functionTable.end()) return found->second.get();
     return nullptr;
   }
 
   bool hasMainFunction() const {
     auto it = functionTable.find("main");
     if (it == functionTable.end()) return false;
-
-    // Check that main returns int and has no parameters
     const Symbol* mainSym = it->second.get();
-    return !mainSym->isVoidReturn && mainSym->paramCount == 0;
+    return mainSym->type.base == BaseType::INT && !mainSym->type.isArray &&
+           mainSym->paramTypes.empty();
   }
 };
 
-#endif  // SYMBOL_TABLE_H
+#endif

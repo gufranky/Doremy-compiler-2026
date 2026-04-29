@@ -202,10 +202,11 @@ std::vector<std::string> optimizeRedundantOps(const std::vector<std::string>& li
       }
     }
     
-    // Clear known values on control flow or redefinition
+  // Clear known values on control flow, memory traffic, or redefinition.
     if (isLabelLine(line) || startsWith(t, "j ") || startsWith(t, "jal ") ||
         startsWith(t, "call ") || startsWith(t, "ret") ||
-        startsWith(t, "bne ") || startsWith(t, "beq ")) {
+        startsWith(t, "bne ") || startsWith(t, "beq ") ||
+        startsWith(t, "lw ") || startsWith(t, "sw ")) {
       knownValues.clear();
     }
     
@@ -975,6 +976,69 @@ std::string CodeGen::renderOperandWithAlloc(
   return op.globalName;
 }
 
+bool CodeGen::isInt12(int imm) const { return imm >= -2048 && imm <= 2047; }
+
+void CodeGen::emitLoadImmediate(const std::string& reg, int imm,
+                                std::vector<std::string>& out) const {
+  if (isInt12(imm)) {
+    out.push_back("\taddi " + reg + ", x0, " + std::to_string(imm));
+    return;
+  }
+
+  out.push_back("\tli " + reg + ", " + std::to_string(imm));
+}
+
+void CodeGen::emitStackAddress(const std::string& dstReg,
+                               const std::string& baseReg, int offset,
+                               std::vector<std::string>& out) const {
+  if (isInt12(offset)) {
+    out.push_back("\taddi " + dstReg + ", " + baseReg + ", " +
+                  std::to_string(offset));
+    return;
+  }
+
+  emitLoadImmediate(dstReg, offset, out);
+  out.push_back("\tadd " + dstReg + ", " + baseReg + ", " + dstReg);
+}
+
+void CodeGen::emitStackLoad(const std::string& dstReg, int offset,
+                            std::vector<std::string>& out,
+                            const std::string& addrScratch) const {
+  if (isInt12(offset)) {
+    out.push_back("\tlw " + dstReg + ", " + std::to_string(offset) + "(sp)");
+    return;
+  }
+
+  if (dstReg == addrScratch) {
+    out.push_back("\t# invalid stack load register overlap");
+  }
+  emitStackAddress(addrScratch, "sp", offset, out);
+  out.push_back("\tlw " + dstReg + ", 0(" + addrScratch + ")");
+}
+
+void CodeGen::emitStackStore(const std::string& srcReg, int offset,
+                             std::vector<std::string>& out,
+                             const std::string& addrScratch) const {
+  if (isInt12(offset)) {
+    out.push_back("\tsw " + srcReg + ", " + std::to_string(offset) + "(sp)");
+    return;
+  }
+
+  emitStackAddress(addrScratch, "sp", offset, out);
+  out.push_back("\tsw " + srcReg + ", 0(" + addrScratch + ")");
+}
+
+void CodeGen::emitAdjustSP(int delta, std::vector<std::string>& out) const {
+  if (delta == 0) return;
+  if (isInt12(delta)) {
+    out.push_back("\taddi sp, sp, " + std::to_string(delta));
+    return;
+  }
+
+  emitLoadImmediate("t6", delta, out);
+  out.push_back("\tadd sp, sp, t6");
+}
+
 CodeGen::StackFrame CodeGen::computeStackFrame(
     const IRFunction& fn, const RegAllocResult& allocResult,
     const LivenessResult& liveness) {
@@ -1093,25 +1157,38 @@ CodeGen::StackFrame CodeGen::computeStackFrame(
   }
   frame.callerSavedRegs.assign(callerSavedSet.begin(), callerSavedSet.end());
 
-  // Spill slots for spilled virtual registers, and for any vreg that failed to
-  // receive a color (allocation miss). This guarantees every vreg we see has a
-  // concrete location (register or stack slot), preventing empty operands in
-  // emitted assembly.
+  // Spill slots for spilled virtual registers, and for any non-parameter vreg
+  // that failed to receive a color. Parameters keep a stable input slot plus a
+  // separate current-value slot so later writes do not clobber the original
+  // incoming argument copy.
   int spillOffset = 0;
+  int paramSlotOffset = 0;
+  for (size_t i = 0; i < fn.params.size(); ++i) {
+    int vreg = fn.params[i];
+    frame.paramIndexByVReg[vreg] = static_cast<int>(i);
+    frame.paramSlots[vreg] = paramSlotOffset;
+    paramSlotOffset += 4;
+    if (allocResult.allocation.find(vreg) == allocResult.allocation.end()) {
+      frame.paramValueSlots[vreg] = paramSlotOffset;
+      paramSlotOffset += 4;
+    }
+  }
   for (int vreg : allocResult.spilledVRegs) {
-    frame.spillSlots[vreg] = spillOffset;
+    if (frame.paramSlots.find(vreg) != frame.paramSlots.end()) continue;
+    frame.spillSlots[vreg] = paramSlotOffset + spillOffset;
     spillOffset += 4;
   }
   for (int vreg : allVRegs) {
+    bool isParam = frame.paramSlots.find(vreg) != frame.paramSlots.end();
     bool hasColor =
         allocResult.allocation.find(vreg) != allocResult.allocation.end();
     bool alreadySpilled = frame.spillSlots.find(vreg) != frame.spillSlots.end();
-    if (!hasColor && !alreadySpilled) {
-      frame.spillSlots[vreg] = spillOffset;
+    if (!isParam && !hasColor && !alreadySpilled) {
+      frame.spillSlots[vreg] = paramSlotOffset + spillOffset;
       spillOffset += 4;
     }
   }
-  frame.spillAreaSize = spillOffset;
+  frame.spillAreaSize = paramSlotOffset + spillOffset;
 
   int offset = 0;
 
@@ -1146,6 +1223,12 @@ CodeGen::StackFrame CodeGen::computeStackFrame(
   for (auto& kv : frame.spillSlots) {
     kv.second += frame.spillAreaOffset;
   }
+  for (auto& kv : frame.paramSlots) {
+    kv.second += frame.spillAreaOffset;
+  }
+  for (auto& kv : frame.paramValueSlots) {
+    kv.second += frame.spillAreaOffset;
+  }
 
   return frame;
 }
@@ -1164,12 +1247,12 @@ void CodeGen::emitPrologue(const IRFunction& fn, const StackFrame& frame,
     return;
   }
 
-  out.push_back("\taddi sp, sp, -" + std::to_string(frame.frameSize));
-  out.push_back("\tsw ra, " + std::to_string(frame.raOffset) + "(sp)");
+  emitAdjustSP(-frame.frameSize, out);
+  emitStackStore("ra", frame.raOffset, out, "t6");
 
   int offset = frame.savedRegsOffset;
   for (const auto& reg : frame.savedRegs) {
-    out.push_back("\tsw " + reg + ", " + std::to_string(offset) + "(sp)");
+    emitStackStore(reg, offset, out, "t6");
     offset += 4;
   }
 
@@ -1185,12 +1268,12 @@ void CodeGen::emitEpilogue(const IRFunction& fn, const StackFrame& frame,
 
   int offset = frame.savedRegsOffset;
   for (const auto& reg : frame.savedRegs) {
-    out.push_back("\tlw " + reg + ", " + std::to_string(offset) + "(sp)");
+    emitStackLoad(reg, offset, out, "t6");
     offset += 4;
   }
 
-  out.push_back("\tlw ra, " + std::to_string(frame.raOffset) + "(sp)");
-  out.push_back("\taddi sp, sp, " + std::to_string(frame.frameSize));
+  emitStackLoad("ra", frame.raOffset, out, "t6");
+  emitAdjustSP(frame.frameSize, out);
   out.push_back("\tret");
 }
 
@@ -1313,66 +1396,121 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
                                std::vector<std::string>& out) {
   const std::vector<std::string> scratchRegs = {"t5", "t6"};
 
-  auto emitLoadImmediate = [&](const std::string& reg, int imm,
-                               std::vector<std::string>& insns) {
-    // Split 32-bit immediate into high 20 bits (for LUI) and low 12 bits (for
-    // ADDI). The low 12 bits are sign-extended, so if bit 11 is set, we add
-    // 0x1000 to hi.
-    int hi = (imm + 0x800) >> 12;
-    int lo = imm - (hi << 12);
-
-    // Mask hi to 20 bits and sign-extend it properly for LUI.
-    hi = hi & 0xFFFFF;
-
-    if (hi != 0) {
-      insns.push_back("\tlui " + reg + ", " + std::to_string(hi));
-      insns.push_back("\taddi " + reg + ", " + reg + ", " + std::to_string(lo));
-    } else {
-      insns.push_back("\taddi " + reg + ", x0, " + std::to_string(lo));
-    }
-  };
-
   auto mangleLabel = [&](const std::string& lbl) {
     return fn.name + "_" + lbl;
   };
 
-  auto loadOperand = [&](const Operand& op, int& scratchIdx,
-                         std::vector<std::string>& insns) -> std::string {
+  auto chooseScratch = [&](const std::vector<std::string>& reservedRegs) {
+    for (const auto& reg : scratchRegs) {
+      if (std::find(reservedRegs.begin(), reservedRegs.end(), reg) ==
+          reservedRegs.end()) {
+        return reg;
+      }
+    }
+    return std::string("t6");
+  };
+
+  auto loadOperandInto = [&](const Operand& op, const std::string& targetReg,
+                             std::vector<std::string>& insns,
+                             const std::vector<std::string>& liveRegs =
+                                 std::vector<std::string>()) -> std::string {
+    auto chooseAddrForTarget = [&](const std::string& valueReg) {
+      if (std::find(liveRegs.begin(), liveRegs.end(), valueReg) ==
+          liveRegs.end()) {
+        return valueReg;
+      }
+      return chooseScratch(liveRegs);
+    };
+
     if (op.isImm()) {
-      std::string reg = scratchRegs[scratchIdx % scratchRegs.size()];
-      scratchIdx++;
-      emitLoadImmediate(reg, op.immValue, insns);
-      return reg;
+      emitLoadImmediate(targetReg, op.immValue, insns);
+      return targetReg;
     }
     if (op.isVReg()) {
       auto it = allocation.find(op.vregId);
       if (it != allocation.end()) {
-        return RISCVRegMap::physicalRegName(it->second);
+        std::string reg = RISCVRegMap::physicalRegName(it->second);
+        if (reg != targetReg) {
+          insns.push_back("\taddi " + targetReg + ", " + reg + ", 0");
+        }
+        return targetReg;
+      }
+      auto valueIt = frame.paramValueSlots.find(op.vregId);
+      if (valueIt != frame.paramValueSlots.end()) {
+        std::string addrReg = chooseAddrForTarget(targetReg);
+        emitStackLoad(targetReg, valueIt->second, insns, addrReg);
+        return targetReg;
+      }
+      auto paramIndexIt = frame.paramIndexByVReg.find(op.vregId);
+      if (paramIndexIt != frame.paramIndexByVReg.end()) {
+        int paramIndex = paramIndexIt->second;
+        if (paramIndex >= 8) {
+          int offset = frame.frameSize + (paramIndex - 8) * 4;
+          std::string addrReg = chooseAddrForTarget(targetReg);
+          emitStackLoad(targetReg, offset, insns, addrReg);
+          return targetReg;
+        }
+      }
+      auto paramIt = frame.paramSlots.find(op.vregId);
+      if (paramIt != frame.paramSlots.end()) {
+        std::string addrReg = chooseAddrForTarget(targetReg);
+        emitStackLoad(targetReg, paramIt->second, insns, addrReg);
+        return targetReg;
       }
       auto spillIt = frame.spillSlots.find(op.vregId);
       if (spillIt != frame.spillSlots.end()) {
-        std::string reg = scratchRegs[scratchIdx % scratchRegs.size()];
-        scratchIdx++;
-        insns.push_back("\tlw " + reg + ", " + std::to_string(spillIt->second) +
-                        "(sp)");
-        return reg;
+        std::string addrReg = chooseAddrForTarget(targetReg);
+        emitStackLoad(targetReg, spillIt->second, insns, addrReg);
+        return targetReg;
       }
-      // No allocation or spill slot: emit a readable virtual register name to
-      // avoid blank operands in the assembly output.
-      return "%v" + std::to_string(op.vregId);
+      return targetReg;
     }
-    // Globals or unknown fall back to name (assume already a register-like
-    // symbol)
-    return op.globalName;
+    insns.push_back("\tla " + targetReg + ", " + op.globalName);
+    return targetReg;
   };
 
-  auto storeSpilledDest = [&](int vreg, const std::string& valueReg,
-                              std::vector<std::string>& insns) {
+  auto loadOperand = [&](const Operand& op, int& scratchIdx,
+                         std::vector<std::string>& insns,
+                         const std::vector<std::string>& reservedRegs =
+                             std::vector<std::string>()) -> std::string {
+    (void)scratchIdx;
+    std::string reg = chooseScratch(reservedRegs);
+    return loadOperandInto(op, reg, insns, reservedRegs);
+  };
+
+  auto storeWithScratch = [&](const std::string& valueReg, int offset,
+                             std::vector<std::string>& insns,
+                             const std::vector<std::string>& liveRegs =
+                                 std::vector<std::string>()) {
+    std::vector<std::string> reserved = liveRegs;
+    reserved.push_back(valueReg);
+    emitStackStore(valueReg, offset, insns, chooseScratch(reserved));
+  };
+
+  auto storeCurrentValue = [&](int vreg, const std::string& valueReg,
+                               std::vector<std::string>& insns,
+                               const std::vector<std::string>& liveRegs =
+                                   std::vector<std::string>()) {
+    auto valueIt = frame.paramValueSlots.find(vreg);
+    if (valueIt != frame.paramValueSlots.end()) {
+      storeWithScratch(valueReg, valueIt->second, insns, liveRegs);
+      return;
+    }
     auto spillIt = frame.spillSlots.find(vreg);
     if (spillIt != frame.spillSlots.end()) {
-      insns.push_back("\tsw " + valueReg + ", " +
-                      std::to_string(spillIt->second) + "(sp)");
+      storeWithScratch(valueReg, spillIt->second, insns, liveRegs);
     }
+  };
+
+  auto storeIncomingParam = [&](int vreg, const std::string& valueReg,
+                                std::vector<std::string>& insns,
+                                const std::vector<std::string>& liveRegs =
+                                    std::vector<std::string>()) {
+    auto paramIt = frame.paramSlots.find(vreg);
+    if (paramIt != frame.paramSlots.end()) {
+      storeWithScratch(valueReg, paramIt->second, insns, liveRegs);
+    }
+    storeCurrentValue(vreg, valueReg, insns, liveRegs);
   };
 
   // Move incoming parameters to their assigned locations.
@@ -1384,12 +1522,9 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
     if (i < 8) {
       srcReg = "a" + std::to_string(i);
     } else {
-      // Stack argument: located above the current frame (sp was decremented).
       int offset = frame.frameSize + static_cast<int>((i - 8) * 4);
-      srcReg = scratchRegs[scratchIdx % scratchRegs.size()];
-      scratchIdx++;
-      insns.push_back("\tlw " + srcReg + ", " + std::to_string(offset) +
-                      "(sp)");
+      srcReg = chooseScratch({});
+      emitStackLoad(srcReg, offset, insns, srcReg);
     }
 
     auto it = allocation.find(vreg);
@@ -1398,7 +1533,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       if (dst != srcReg)
         insns.push_back("\taddi " + dst + ", " + srcReg + ", 0");
     } else {
-      storeSpilledDest(vreg, srcReg, insns);
+      storeIncomingParam(vreg, srcReg, insns, {srcReg});
     }
 
     for (const auto& line : insns) {
@@ -1416,14 +1551,16 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       case InstKind::Binary: {
         auto* b = static_cast<const BinaryInst*>(inst.get());
         std::string lhs = loadOperand(b->lhs, scratchIdx, insns);
-        std::string rhs = loadOperand(b->rhs, scratchIdx, insns);
+        std::string rhs = loadOperand(b->rhs, scratchIdx, insns, {lhs});
 
         auto it = allocation.find(b->dest);
-        std::string destReg =
-            (it != allocation.end())
-                ? RISCVRegMap::physicalRegName(it->second)
-                : scratchRegs[scratchIdx % scratchRegs.size()];
-        if (it == allocation.end()) scratchIdx++;
+        std::string destReg;
+        if (it != allocation.end()) {
+          destReg = RISCVRegMap::physicalRegName(it->second);
+        } else {
+          std::vector<std::string> reservedRegs{lhs, rhs};
+          destReg = chooseScratch(reservedRegs);
+        }
 
         switch (b->op) {
           case BinaryOp::Eq:
@@ -1450,18 +1587,19 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
                             lhs + ", " + rhs);
             break;
         }
-        storeSpilledDest(b->dest, destReg, insns);
+        storeCurrentValue(b->dest, destReg, insns);
         break;
       }
       case InstKind::Unary: {
         auto* u = static_cast<const UnaryInst*>(inst.get());
         std::string opnd = loadOperand(u->operand, scratchIdx, insns);
         auto it = allocation.find(u->dest);
-        std::string destReg =
-            (it != allocation.end())
-                ? RISCVRegMap::physicalRegName(it->second)
-                : scratchRegs[scratchIdx % scratchRegs.size()];
-        if (it == allocation.end()) scratchIdx++;
+        std::string destReg;
+        if (it != allocation.end()) {
+          destReg = RISCVRegMap::physicalRegName(it->second);
+        } else {
+          destReg = chooseScratch({opnd});
+        }
 
         switch (u->op) {
           case UnaryOp::Neg:
@@ -1474,7 +1612,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
             insns.push_back("\taddi " + destReg + ", " + opnd + ", 0");
             break;
         }
-        storeSpilledDest(u->dest, destReg, insns);
+        storeCurrentValue(u->dest, destReg, insns);
         break;
       }
       case InstKind::Copy: {
@@ -1485,7 +1623,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           std::string dst = RISCVRegMap::physicalRegName(it->second);
           insns.push_back("\taddi " + dst + ", " + src + ", 0");
         } else {
-          storeSpilledDest(c->dest, src, insns);
+          storeCurrentValue(c->dest, src, insns);
         }
         break;
       }
@@ -1493,18 +1631,20 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
         auto* l = static_cast<const LoadInst*>(inst.get());
         std::string addr = loadOperand(l->addr, scratchIdx, insns);
         auto it = allocation.find(l->dest);
-        std::string dst = (it != allocation.end())
-                              ? RISCVRegMap::physicalRegName(it->second)
-                              : scratchRegs[scratchIdx % scratchRegs.size()];
-        if (it == allocation.end()) scratchIdx++;
+        std::string dst;
+        if (it != allocation.end()) {
+          dst = RISCVRegMap::physicalRegName(it->second);
+        } else {
+          dst = chooseScratch({addr});
+        }
         insns.push_back("\tlw " + dst + ", 0(" + addr + ")");
-        storeSpilledDest(l->dest, dst, insns);
+        storeCurrentValue(l->dest, dst, insns);
         break;
       }
       case InstKind::Store: {
         auto* s = static_cast<const StoreInst*>(inst.get());
         std::string src = loadOperand(s->src, scratchIdx, insns);
-        std::string addr = loadOperand(s->addr, scratchIdx, insns);
+        std::string addr = loadOperand(s->addr, scratchIdx, insns, {src});
         insns.push_back("\tsw " + src + ", 0(" + addr + ")");
         break;
       }
@@ -1524,7 +1664,6 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       case InstKind::Call: {
         auto* c = static_cast<const CallInst*>(inst.get());
 
-        // Determine the destination register name if this call has a result
         std::string destRegName;
         if (c->hasDest) {
           auto it = allocation.find(c->dest);
@@ -1533,56 +1672,48 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           }
         }
 
-        // Save caller-saved regs that are live across calls.
         for (const auto& reg : frame.callerSavedRegs) {
           auto itSlot = frame.callerSavedSlots.find(reg);
           if (itSlot != frame.callerSavedSlots.end()) {
-            insns.push_back("\tsw " + reg + ", " +
-                            std::to_string(itSlot->second) + "(sp)");
+            storeWithScratch(reg, itSlot->second, insns);
           }
         }
 
-        // Move arguments.
         for (size_t ai = 0; ai < c->args.size(); ++ai) {
+          std::vector<std::string> reservedRegs;
+          if (ai < 8) reservedRegs.push_back("a" + std::to_string(ai));
+          std::string argReg =
+              loadOperand(c->args[ai], scratchIdx, insns, reservedRegs);
           if (ai < 8) {
-            std::string argReg = loadOperand(c->args[ai], scratchIdx, insns);
             std::string target = "a" + std::to_string(ai);
             if (argReg != target) {
               insns.push_back("\taddi " + target + ", " + argReg + ", 0");
             }
           } else {
-            std::string argReg = loadOperand(c->args[ai], scratchIdx, insns);
-            int offset = static_cast<int>((ai - 8) * 4);
-            insns.push_back("\tsw " + argReg + ", " + std::to_string(offset) +
-                            "(sp)");
+            int offset = frame.outgoingArgOffset + static_cast<int>((ai - 8) * 4);
+            storeWithScratch(argReg, offset, insns);
           }
         }
 
         insns.push_back("\tjal ra, " + c->callee);
 
-        // Restore caller-saved regs BEFORE capturing the return value,
-        // but skip the destination register to avoid overwriting the result.
         for (const auto& reg : frame.callerSavedRegs) {
-          // Skip restoring the destination register - we'll write the return
-          // value there
           if (!destRegName.empty() && reg == destRegName) {
             continue;
           }
           auto itSlot = frame.callerSavedSlots.find(reg);
           if (itSlot != frame.callerSavedSlots.end()) {
-            insns.push_back("\tlw " + reg + ", " +
-                            std::to_string(itSlot->second) + "(sp)");
+            emitStackLoad(reg, itSlot->second, insns, reg);
           }
         }
 
-        // Now capture the return value
         if (c->hasDest) {
           auto it = allocation.find(c->dest);
           if (it != allocation.end()) {
             std::string dst = RISCVRegMap::physicalRegName(it->second);
             insns.push_back("\taddi " + dst + ", a0, 0");
           } else {
-            storeSpilledDest(c->dest, "a0", insns);
+            storeCurrentValue(c->dest, "a0", insns, {"a0"});
           }
         }
 
@@ -1614,9 +1745,6 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
     }
   }
 
-  // If the function doesn't end with a return instruction, we need to emit
-  // an epilogue to ensure the function returns properly (e.g., void functions
-  // without explicit return statements).
   bool endsWithReturn = false;
   if (!fn.instructions.empty()) {
     const auto& lastInst = fn.instructions.back();
@@ -1630,6 +1758,17 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
 std::vector<std::string> CodeGen::generate(const IRProgram& program) {
   std::vector<std::string> out;
 
+  if (!program.globals.empty()) {
+    out.push_back(".data");
+    out.push_back("");
+    for (const auto& glob : program.globals) {
+      out.push_back(".globl " + glob.name);
+      out.push_back(glob.name + ":");
+      out.push_back("\t.word " + std::to_string(glob.initialValue));
+      out.push_back("");
+    }
+  }
+
   out.push_back(".text");
   out.push_back("");
 
@@ -1639,6 +1778,25 @@ std::vector<std::string> CodeGen::generate(const IRProgram& program) {
     LivenessResult liveness = AnalyzeLiveness(fn);
     RegAllocResult allocResult = allocator.allocate(fn, liveness);
     StackFrame frame = computeStackFrame(fn, allocResult, liveness);
+    if (fn.name == "func") {
+      fprintf(stderr, "[cg-frame] frameSize=%d spillAreaOffset=%d spillAreaSize=%d maxOutgoingArgs=%d\n",
+              frame.frameSize, frame.spillAreaOffset, frame.spillAreaSize,
+              frame.maxOutgoingArgs);
+      for (int vreg : {209, 617, 628, 633, 644, 1609, 1620}) {
+        auto paramIt = frame.paramSlots.find(vreg);
+        if (paramIt != frame.paramSlots.end()) {
+          fprintf(stderr, "[cg-frame] param v%d stable=%d\n", vreg, paramIt->second);
+        }
+        auto valueIt = frame.paramValueSlots.find(vreg);
+        if (valueIt != frame.paramValueSlots.end()) {
+          fprintf(stderr, "[cg-frame] param v%d current=%d\n", vreg, valueIt->second);
+        }
+        auto spillIt = frame.spillSlots.find(vreg);
+        if (spillIt != frame.spillSlots.end()) {
+          fprintf(stderr, "[cg-frame] spill v%d slot=%d\n", vreg, spillIt->second);
+        }
+      }
+    }
 
     emitPrologue(fn, frame, out);
     emitFunctionBody(fn, allocResult.allocation, frame, liveness, out);
@@ -1646,8 +1804,10 @@ std::vector<std::string> CodeGen::generate(const IRProgram& program) {
     out.push_back("");
   }
 
-  // Apply assembly-level peephole optimizations
-  out = peepholeOptimize(out);
+  // Debug hook: keep raw assembly when SYSC_RAW_ASM is set.
+  if (std::getenv("SYSC_RAW_ASM") == nullptr) {
+    out = peepholeOptimize(out);
+  }
 
   return out;
 }

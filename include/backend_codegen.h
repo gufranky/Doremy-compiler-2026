@@ -32,6 +32,9 @@ class CodeGen {
     std::vector<std::string>
         callerSavedRegs;  // Caller-saved that must be preserved across calls.
     std::unordered_map<int, int> spillSlots;  // vreg -> stack offset.
+    std::unordered_map<int, int> paramSlots;  // param vreg -> stable input slot.
+    std::unordered_map<int, int> paramValueSlots;  // param vreg -> current value slot.
+    std::unordered_map<int, int> paramIndexByVReg;  // param vreg -> original index.
     std::unordered_map<std::string, int> callerSavedSlots;  // reg -> offset.
   };
 
@@ -64,6 +67,20 @@ class CodeGen {
                         const std::unordered_map<int, int>& allocation,
                         const StackFrame& frame, const LivenessResult& liveness,
                         std::vector<std::string>& out);
+
+  bool isInt12(int imm) const;
+  void emitLoadImmediate(const std::string& reg, int imm,
+                         std::vector<std::string>& out) const;
+  void emitStackAddress(const std::string& dstReg,
+                        const std::string& baseReg, int offset,
+                        std::vector<std::string>& out) const;
+  void emitStackLoad(const std::string& dstReg, int offset,
+                     std::vector<std::string>& out,
+                     const std::string& addrScratch) const;
+  void emitStackStore(const std::string& srcReg, int offset,
+                      std::vector<std::string>& out,
+                      const std::string& addrScratch) const;
+  void emitAdjustSP(int delta, std::vector<std::string>& out) const;
 
   std::string binOpMnemonic(ir::BinaryOp op) const;
 };

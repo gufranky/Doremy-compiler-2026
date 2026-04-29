@@ -12,32 +12,34 @@ extern FILE* yyin;
 
 void yyerror(const char* s);
 
-CompUnit* root = nullptr;  // Global root of AST
+CompUnit* root = nullptr;
 %}
 
-/* Union for semantic values */
 %union {
     int num;
     std::string* str;
-    
+
+    ASTNode* astNode;
     CompUnit* compUnit;
     FuncDef* funcDef;
     Param* param;
     std::vector<Param*>* paramList;
-    
+
     Stmt* stmt;
     Block* block;
     std::vector<Stmt*>* stmtList;
-    
+    VarDeclStmt* declStmt;
+    VarDef* varDef;
+    std::vector<VarDef*>* varDefList;
+
     Expr* expr;
     std::vector<Expr*>* exprList;
 }
 
-/* Token declarations */
 %token <num> NUMBER
 %token <str> IDENTIFIER
 
-%token INT VOID
+%token INT VOID FLOAT
 %token IF ELSE WHILE BREAK CONTINUE RETURN
 %token CONST
 %token PLUS MINUS STAR SLASH PERCENT
@@ -46,22 +48,21 @@ CompUnit* root = nullptr;  // Global root of AST
 %token ASSIGN
 %token LPAREN RPAREN LBRACE RBRACE SEMICOLON COMMA
 
-/* Non-terminal types */
 %type <compUnit> CompUnit
-%type <funcDef> FuncDef
-%type <num> ReturnType
+%type <astNode> GlobalItem
 %type <param> Param
 %type <paramList> ParamList ParamListOpt
 
-%type <stmt> Stmt
+%type <stmt> Decl BlockItem Stmt
 %type <block> Block
-%type <stmtList> StmtList
-
-%type <expr> Expr PrimaryExpr UnaryExpr MulExpr AddExpr RelExpr LAndExpr LOrExpr
+%type <stmtList> BlockItemList
+%type <declStmt> VarDecl ConstDecl
+%type <varDef> VarDef ConstDef
+%type <varDefList> VarDefList ConstDefList OptMoreVarDefs
+%type <expr> Expr ConstExpr PrimaryExpr UnaryExpr MulExpr AddExpr RelExpr LAndExpr LOrExpr OptInitExpr
 %type <exprList> ArgList ArgListOpt
 %type <num> UnaryOp
 
-/* Operator precedence and associativity */
 %left OR
 %left AND
 %left EQ NE
@@ -72,40 +73,69 @@ CompUnit* root = nullptr;  // Global root of AST
 
 %%
 
-/* Compilation Unit */
 CompUnit
-    : FuncDef {
+    : GlobalItem {
         $$ = new CompUnit();
-        $$->functions.emplace_back($1);
+        $$->items.emplace_back($1);
         root = $$;
     }
-    | CompUnit FuncDef {
+    | CompUnit GlobalItem {
         $$ = $1;
-        $$->functions.emplace_back($2);
+        $$->items.emplace_back($2);
     }
     ;
 
-/* Function Definition */
-FuncDef
-    : ReturnType IDENTIFIER LPAREN ParamListOpt RPAREN Block {
-        FuncDef::ReturnType rt = ($1 == 0) ? FuncDef::RT_INT : FuncDef::RT_VOID;
-        $$ = new FuncDef(rt, *$2, $6);
+GlobalItem
+    : VOID IDENTIFIER LPAREN ParamListOpt RPAREN Block {
+        FuncDef* func = new FuncDef(Type::Void(), *$2, $6);
         if ($4) {
             for (auto* param : *$4) {
-                $$->params.emplace_back(param);
+                func->params.emplace_back(param);
             }
             delete $4;
         }
         delete $2;
+        $$ = static_cast<ASTNode*>(func);
+    }
+    | INT IDENTIFIER LPAREN ParamListOpt RPAREN Block {
+        FuncDef* func = new FuncDef(Type::Int(), *$2, $6);
+        if ($4) {
+            for (auto* param : *$4) {
+                func->params.emplace_back(param);
+            }
+            delete $4;
+        }
+        delete $2;
+        $$ = static_cast<ASTNode*>(func);
+    }
+    | INT IDENTIFIER OptInitExpr OptMoreVarDefs SEMICOLON {
+        VarDeclStmt* decl = new VarDeclStmt(Type::Int());
+        VarDef* first = $3 ? new VarDef(*$2, $3) : new VarDef(*$2);
+        decl->defs.emplace_back(first);
+        if ($4) {
+            for (auto* def : *$4) {
+                decl->defs.emplace_back(def);
+            }
+            delete $4;
+        }
+        delete $2;
+        $$ = static_cast<ASTNode*>(decl);
+    }
+    | ConstDecl {
+        $$ = static_cast<ASTNode*>($1);
     }
     ;
 
-ReturnType
-    : INT  { $$ = 0; }
-    | VOID { $$ = 1; }
+OptInitExpr
+    : /* empty */ { $$ = nullptr; }
+    | ASSIGN Expr { $$ = $2; }
     ;
 
-/* Parameters */
+OptMoreVarDefs
+    : /* empty */ { $$ = nullptr; }
+    | COMMA VarDefList { $$ = $2; }
+    ;
+
 ParamListOpt
     : /* empty */ { $$ = nullptr; }
     | ParamList { $$ = $1; }
@@ -124,14 +154,79 @@ ParamList
 
 Param
     : INT IDENTIFIER {
-        $$ = new Param(*$2);
+        $$ = new Param(Type::Int(), *$2);
         delete $2;
     }
     ;
 
-/* Block */
+Decl
+    : VarDecl { $$ = $1; }
+    | ConstDecl { $$ = $1; }
+    ;
+
+VarDecl
+    : INT VarDefList SEMICOLON {
+        $$ = new VarDeclStmt(Type::Int());
+        for (auto* def : *$2) {
+            $$->defs.emplace_back(def);
+        }
+        delete $2;
+    }
+    ;
+
+ConstDecl
+    : CONST INT ConstDefList SEMICOLON {
+        $$ = new VarDeclStmt(Type::ConstInt());
+        for (auto* def : *$3) {
+            $$->defs.emplace_back(def);
+        }
+        delete $3;
+    }
+    ;
+
+VarDefList
+    : VarDef {
+        $$ = new std::vector<VarDef*>();
+        $$->push_back($1);
+    }
+    | VarDefList COMMA VarDef {
+        $$ = $1;
+        $$->push_back($3);
+    }
+    ;
+
+ConstDefList
+    : ConstDef {
+        $$ = new std::vector<VarDef*>();
+        $$->push_back($1);
+    }
+    | ConstDefList COMMA ConstDef {
+        $$ = $1;
+        $$->push_back($3);
+    }
+    ;
+
+VarDef
+    : IDENTIFIER {
+        $$ = new VarDef(*$1);
+        delete $1;
+    }
+    | IDENTIFIER ASSIGN Expr {
+        $$ = new VarDef(*$1, $3);
+        delete $1;
+    }
+    ;
+
+ConstDef
+    : IDENTIFIER ASSIGN ConstExpr {
+        $$ = new VarDef(*$1, $3);
+        $$->initIsConst = true;
+        delete $1;
+    }
+    ;
+
 Block
-    : LBRACE StmtList RBRACE {
+    : LBRACE BlockItemList RBRACE {
         $$ = new Block();
         if ($2) {
             for (auto* stmt : *$2) {
@@ -142,9 +237,9 @@ Block
     }
     ;
 
-StmtList
+BlockItemList
     : /* empty */ { $$ = nullptr; }
-    | StmtList Stmt {
+    | BlockItemList BlockItem {
         if ($1 == nullptr) {
             $$ = new std::vector<Stmt*>();
         } else {
@@ -154,7 +249,11 @@ StmtList
     }
     ;
 
-/* Statements */
+BlockItem
+    : Decl { $$ = $1; }
+    | Stmt { $$ = $1; }
+    ;
+
 Stmt
     : Block {
         $$ = $1;
@@ -168,18 +267,6 @@ Stmt
     | IDENTIFIER ASSIGN Expr SEMICOLON {
         $$ = new AssignStmt(*$1, $3);
         delete $1;
-    }
-    | INT IDENTIFIER ASSIGN Expr SEMICOLON {
-        $$ = new VarDeclStmt(*$2, $4);
-        delete $2;
-    }
-    | INT IDENTIFIER SEMICOLON {
-        $$ = new VarDeclStmt(*$2, new NumberExpr(0));
-        delete $2;
-    }
-    | CONST INT IDENTIFIER ASSIGN Expr SEMICOLON {
-        $$ = new VarDeclStmt(*$3, $5);
-        delete $3;
     }
     | IF LPAREN Expr RPAREN Stmt {
         $$ = new IfStmt($3, $5);
@@ -204,7 +291,10 @@ Stmt
     }
     ;
 
-/* Expressions */
+ConstExpr
+    : AddExpr { $$ = $1; }
+    ;
+
 Expr
     : LOrExpr { $$ = $1; }
     ;
@@ -308,7 +398,6 @@ PrimaryExpr
     }
     ;
 
-/* Function Arguments */
 ArgListOpt
     : /* empty */ { $$ = nullptr; }
     | ArgList { $$ = $1; }

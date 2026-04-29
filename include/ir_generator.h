@@ -9,33 +9,38 @@
 #include "ast.h"
 #include "ir.h"
 
-// Translates AST to linear IR (three-address style) with short-circuit logic.
 class IRGenerator {
  public:
-  // Entry: translate a full compilation unit
   ir::IRProgram generate(CompUnit* root);
 
  private:
+  struct ValueBinding {
+    bool isGlobal = false;
+    bool isConst = false;
+    int constValue = 0;
+    int vreg = -1;
+    std::string globalName;
+  };
+
   ir::IRProgram program_;
   ir::IRFunction* current_ = nullptr;
   int labelCounter_ = 0;
-
-  // Scoping for variables -> virtual register id
-  std::vector<std::unordered_map<std::string, int>> scopes_;
-  // Loop break/continue targets: pair<breakLabel, continueLabel>
+  std::vector<std::unordered_map<std::string, ValueBinding>> scopes_;
   std::vector<std::pair<std::string, std::string>> loopStack_;
 
-  // Scope helpers
   void enterScope();
   void exitScope();
-  int lookupVar(const std::string& name) const;
-  int declareVar(const std::string& name, int vreg);
+  ValueBinding* lookupBinding(const std::string& name);
+  const ValueBinding* lookupBinding(const std::string& name) const;
+  ValueBinding& declareLocalValue(const std::string& name, ValueBinding binding);
+  ValueBinding& declareGlobalValue(const std::string& name, ValueBinding binding);
 
   std::string newLabel(const std::string& prefix);
   int newVReg();
 
-  // Generation helpers
+  void emitDecl(VarDeclStmt* decl, bool isGlobal);
   ir::Operand genExpr(Expr* expr);
+  ir::Operand genExpr(Expr* expr, std::vector<std::string>* debugNames);
   ir::Operand genLogical(BinaryExpr* node);
   ir::Operand genNot(UnaryExpr* node);
   void genCond(Expr* expr, const std::string& trueLabel,
@@ -44,4 +49,4 @@ class IRGenerator {
   void genBlock(Block* block);
 };
 
-#endif  // IR_GENERATOR_H
+#endif

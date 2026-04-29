@@ -80,8 +80,11 @@ def format_diff(expected: str, actual: str, max_lines: int) -> str:
 
 def as_wsl_path(path: Path) -> str:
     resolved = path.resolve()
+    posix = resolved.as_posix()
+    if posix.startswith("/mnt/"):
+        return posix
     drive = resolved.drive.rstrip(":").lower()
-    tail = resolved.as_posix().split(":", 1)[1]
+    tail = posix.split(":", 1)[1]
     return f"/mnt/{drive}{tail}"
 
 
