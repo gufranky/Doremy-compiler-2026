@@ -1,13 +1,13 @@
 {
   "mode": "full",
   "total": 140,
-  "compile_passes": 24,
-  "compile_rate": 17.14,
-  "full_passes": 24,
-  "full_rate": 17.14,
+  "compile_passes": 43,
+  "compile_rate": 30.71,
+  "full_passes": 43,
+  "full_rate": 30.71,
   "stage_summary": {
-    "compile": 116
+    "compile": 97
   },
   "exit_code": 1,
-  "updated_from": "94a4fac"
+  "updated_from": "6eca66ce6cf6925e45e9c8d8f754a8275be49d65"
 }
