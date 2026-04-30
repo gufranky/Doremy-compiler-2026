@@ -22,6 +22,17 @@ ID          {LETTER}({LETTER}|{DIGIT})*
 HEXNUMBER   0[xX][0-9a-fA-F]+
 OCTNUMBER   0[0-7]*
 DECNUMBER   [1-9][0-9]*
+DSEQ        [0-9]+
+DOPT        [0-9]*
+HDIGIT      [0-9a-fA-F]
+HDSEQ       {HDIGIT}+
+EXP         [eE][+-]?{DSEQ}
+BEXP        [pP][+-]?{DSEQ}
+FSUFFIX     [fFlL]?
+DECFLT1     ({DOPT}\.{DSEQ}|{DSEQ}\.){EXP}?{FSUFFIX}
+DECFLT2     {DSEQ}{EXP}{FSUFFIX}
+HEXFLT1     0[xX](({HDSEQ}?\.{HDSEQ})|({HDSEQ}\.)){BEXP}{FSUFFIX}
+HEXFLT2     0[xX]{HDSEQ}{BEXP}{FSUFFIX}
 WHITESPACE  [ \t\r\n]+
 
 %x COMMENT
@@ -76,6 +87,11 @@ WHITESPACE  [ \t\r\n]+
 {ID}            {
                     yylval.str = new std::string(yytext);
                     return IDENTIFIER;
+                }
+
+{HEXFLT1}|{HEXFLT2}|{DECFLT1}|{DECFLT2} {
+                    yylval.fnum = static_cast<float>(strtod(yytext, nullptr));
+                    return FLOAT_NUMBER;
                 }
 
 {HEXNUMBER}     {

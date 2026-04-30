@@ -69,8 +69,13 @@ class CodeGen {
                         std::vector<std::string>& out);
 
   bool isInt12(int imm) const;
+  bool isFloatValueType(ir::ValueType type) const;
+  std::string floatCompareMnemonic(ir::BinaryOp op) const;
+  int floatBits(float value) const;
   void emitLoadImmediate(const std::string& reg, int imm,
                          std::vector<std::string>& out) const;
+  void emitLoadFloatImmediate(const std::string& freg, float value,
+                              std::vector<std::string>& out) const;
   void emitStackAddress(const std::string& dstReg,
                         const std::string& baseReg, int offset,
                         std::vector<std::string>& out) const;

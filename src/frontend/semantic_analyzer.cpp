@@ -2,79 +2,161 @@
 
 #include <sstream>
 
+void SemanticAnalyzer::declareBuiltinFunctions() {
+  symbolTable.declareFunction("getint", Type::Int(), {});
+  symbolTable.declareFunction("getch", Type::Int(), {});
+  symbolTable.declareFunction("getfloat", Type::Float(), {});
+
+  symbolTable.declareFunction("putint", Type::Void(), {Type::Int()});
+  symbolTable.declareFunction("putch", Type::Void(), {Type::Int()});
+  symbolTable.declareFunction("putfloat", Type::Void(), {Type::Float()});
+}
+
 bool SemanticAnalyzer::isIntType(const Type& type) const {
   return type.base == BaseType::INT && !type.isArray;
 }
 
+bool SemanticAnalyzer::isFloatType(const Type& type) const {
+  return type.base == BaseType::FLOAT && !type.isArray;
+}
+
+bool SemanticAnalyzer::isNumericType(const Type& type) const {
+  return (isIntType(type) || isFloatType(type));
+}
+
+bool SemanticAnalyzer::canImplicitlyConvert(const Type& from,
+                                            const Type& to) const {
+  if (!isNumericType(from) || !isNumericType(to)) return false;
+  return true;
+}
+
+ScalarValue SemanticAnalyzer::castConstValue(const ScalarValue& value,
+                                             const Type& targetType) const {
+  if (isFloatType(targetType)) {
+    return value.isFloat() ? value : ScalarValue::Float(static_cast<float>(value.intValue));
+  }
+  if (isIntType(targetType)) {
+    return value.isFloat() ? ScalarValue::Int(static_cast<int>(value.floatValue))
+                           : value;
+  }
+  return ScalarValue::Int(0);
+}
+
+bool SemanticAnalyzer::isTruthy(const ScalarValue& value) const {
+  if (value.isFloat()) return value.floatValue != 0.0f;
+  return value.intValue != 0;
+}
+
+Type SemanticAnalyzer::commonNumericType(const Type& lhs, const Type& rhs) const {
+  if (isFloatType(lhs) || isFloatType(rhs)) return Type::Float();
+  return Type::Int();
+}
+
 void SemanticAnalyzer::setExprResult(const Type& type, bool isConst,
-                                     int constValue) {
+                                     ScalarValue constValue) {
   lastExprType = type;
   lastExprIsConst = isConst;
   lastExprConstValue = constValue;
 }
 
-bool SemanticAnalyzer::evalConstExpr(Expr* expr, int* value) {
+bool SemanticAnalyzer::evalConstExpr(Expr* expr, ScalarValue* value) {
   if (auto* num = dynamic_cast<NumberExpr*>(expr)) {
-    *value = num->value;
+    *value = num->scalarValue;
     return true;
   }
   if (auto* id = dynamic_cast<IdentifierExpr*>(expr)) {
     Symbol* sym = symbolTable.lookupValue(id->name);
     if (!sym || !sym->hasConstValue) return false;
-    *value = sym->constValue;
+    *value = sym->typedConstValue;
     return true;
   }
   if (auto* paren = dynamic_cast<ParenExpr*>(expr)) {
     return evalConstExpr(paren->expr.get(), value);
   }
   if (auto* unary = dynamic_cast<UnaryExpr*>(expr)) {
-    int operand = 0;
+    ScalarValue operand;
     if (!evalConstExpr(unary->operand.get(), &operand)) return false;
     switch (unary->op) {
       case UnaryExpr::U_PLUS:
         *value = operand;
         return true;
       case UnaryExpr::U_MINUS:
-        *value = -operand;
+        if (operand.isFloat()) *value = ScalarValue::Float(-operand.floatValue);
+        else *value = ScalarValue::Int(-operand.intValue);
         return true;
       case UnaryExpr::U_NOT:
-        return false;
+        *value = ScalarValue::Int(isTruthy(operand) ? 0 : 1);
+        return true;
     }
   }
   if (auto* binary = dynamic_cast<BinaryExpr*>(expr)) {
-    int lhs = 0;
-    int rhs = 0;
+    ScalarValue lhs;
+    ScalarValue rhs;
     if (!evalConstExpr(binary->left.get(), &lhs) ||
         !evalConstExpr(binary->right.get(), &rhs)) {
       return false;
     }
+
+    bool useFloat = lhs.isFloat() || rhs.isFloat();
+    float lf = lhs.isFloat() ? lhs.floatValue : static_cast<float>(lhs.intValue);
+    float rf = rhs.isFloat() ? rhs.floatValue : static_cast<float>(rhs.intValue);
+    int li = lhs.isFloat() ? static_cast<int>(lhs.floatValue) : lhs.intValue;
+    int ri = rhs.isFloat() ? static_cast<int>(rhs.floatValue) : rhs.intValue;
+
     switch (binary->op) {
       case BinaryExpr::B_ADD:
-        *value = lhs + rhs;
+        *value = useFloat ? ScalarValue::Float(lf + rf)
+                          : ScalarValue::Int(li + ri);
         return true;
       case BinaryExpr::B_SUB:
-        *value = lhs - rhs;
+        *value = useFloat ? ScalarValue::Float(lf - rf)
+                          : ScalarValue::Int(li - ri);
         return true;
       case BinaryExpr::B_MUL:
-        *value = lhs * rhs;
+        *value = useFloat ? ScalarValue::Float(lf * rf)
+                          : ScalarValue::Int(li * ri);
         return true;
       case BinaryExpr::B_DIV:
-        if (rhs == 0) return false;
-        *value = lhs / rhs;
+        if ((useFloat && rf == 0.0f) || (!useFloat && ri == 0)) return false;
+        *value = useFloat ? ScalarValue::Float(lf / rf)
+                          : ScalarValue::Int(li / ri);
         return true;
       case BinaryExpr::B_MOD:
-        if (rhs == 0) return false;
-        *value = lhs % rhs;
+        if (useFloat || ri == 0) return false;
+        *value = ScalarValue::Int(li % ri);
         return true;
-      default:
-        return false;
+      case BinaryExpr::B_LT:
+        *value = ScalarValue::Int(useFloat ? (lf < rf) : (li < ri));
+        return true;
+      case BinaryExpr::B_GT:
+        *value = ScalarValue::Int(useFloat ? (lf > rf) : (li > ri));
+        return true;
+      case BinaryExpr::B_LE:
+        *value = ScalarValue::Int(useFloat ? (lf <= rf) : (li <= ri));
+        return true;
+      case BinaryExpr::B_GE:
+        *value = ScalarValue::Int(useFloat ? (lf >= rf) : (li >= ri));
+        return true;
+      case BinaryExpr::B_EQ:
+        *value = ScalarValue::Int(useFloat ? (lf == rf) : (li == ri));
+        return true;
+      case BinaryExpr::B_NE:
+        *value = ScalarValue::Int(useFloat ? (lf != rf) : (li != ri));
+        return true;
+      case BinaryExpr::B_AND:
+        *value = ScalarValue::Int(isTruthy(lhs) && isTruthy(rhs));
+        return true;
+      case BinaryExpr::B_OR:
+        *value = ScalarValue::Int(isTruthy(lhs) || isTruthy(rhs));
+        return true;
     }
   }
   return false;
 }
 
 void SemanticAnalyzer::visit(NumberExpr* node) {
-  setExprResult(Type::Int(), true, node->value);
+  if (node->isFloatLiteral()) setExprResult(Type::Float(), true, node->scalarValue);
+  else setExprResult(Type::Int(), true, node->scalarValue);
 }
 
 void SemanticAnalyzer::visit(IdentifierExpr* node) {
@@ -84,7 +166,7 @@ void SemanticAnalyzer::visit(IdentifierExpr* node) {
     setExprResult(Type::Invalid());
     return;
   }
-  setExprResult(sym->type.withoutConst(), sym->hasConstValue, sym->constValue);
+  setExprResult(sym->type.withoutConst(), sym->hasConstValue, sym->typedConstValue);
 }
 
 void SemanticAnalyzer::visit(ParenExpr* node) { node->expr->accept(this); }
@@ -107,28 +189,30 @@ void SemanticAnalyzer::visit(FunctionCallExpr* node) {
 
   for (size_t i = 0; i < node->args.size(); ++i) {
     node->args[i]->accept(this);
-    if (!isIntType(lastExprType)) {
-      addError("Function argument must be int expression");
+    if (!isNumericType(lastExprType)) {
+      addError("Function argument must be int or float expression");
+      continue;
     }
     if (i < func->paramTypes.size() &&
-        !func->paramTypes[i].equalsIgnoringConst(lastExprType)) {
+        !canImplicitlyConvert(lastExprType, func->paramTypes[i])) {
       addError("Function argument type mismatch in call to '" + node->funcName + "'");
     }
   }
 
-  setExprResult(func->type.withoutConst(), false, 0);
+  setExprResult(func->type.withoutConst(), false, ScalarValue::Int(0));
 }
 
 void SemanticAnalyzer::visit(UnaryExpr* node) {
   node->operand->accept(this);
-  if (!isIntType(lastExprType)) {
-    addError("Unary operator requires int operand");
+  if (!isNumericType(lastExprType)) {
+    addError("Unary operator requires int or float operand");
     setExprResult(Type::Invalid());
     return;
   }
 
-  int constValue = 0;
+  ScalarValue constValue = ScalarValue::Int(0);
   bool isConst = false;
+  Type resultType = node->op == UnaryExpr::U_NOT ? Type::Int() : lastExprType.withoutConst();
   if (lastExprIsConst) {
     isConst = true;
     switch (node->op) {
@@ -136,82 +220,119 @@ void SemanticAnalyzer::visit(UnaryExpr* node) {
         constValue = lastExprConstValue;
         break;
       case UnaryExpr::U_MINUS:
-        constValue = -lastExprConstValue;
+        if (lastExprConstValue.isFloat()) {
+          constValue = ScalarValue::Float(-lastExprConstValue.floatValue);
+        } else {
+          constValue = ScalarValue::Int(-lastExprConstValue.intValue);
+        }
         break;
       case UnaryExpr::U_NOT:
-        constValue = !lastExprConstValue;
+        constValue = ScalarValue::Int(isTruthy(lastExprConstValue) ? 0 : 1);
         break;
     }
   }
-  setExprResult(Type::Int(), isConst, constValue);
+  setExprResult(resultType, isConst, constValue);
 }
 
 void SemanticAnalyzer::visit(BinaryExpr* node) {
   node->left->accept(this);
   Type lhsType = lastExprType;
   bool lhsConst = lastExprIsConst;
-  int lhsValue = lastExprConstValue;
-  if (!isIntType(lhsType)) {
-    addError("Binary operator requires int operands");
+  ScalarValue lhsValue = lastExprConstValue;
+  if (!isNumericType(lhsType)) {
+    addError("Binary operator requires int or float operands");
   }
 
   node->right->accept(this);
   Type rhsType = lastExprType;
   bool rhsConst = lastExprIsConst;
-  int rhsValue = lastExprConstValue;
-  if (!isIntType(rhsType)) {
-    addError("Binary operator requires int operands");
+  ScalarValue rhsValue = lastExprConstValue;
+  if (!isNumericType(rhsType)) {
+    addError("Binary operator requires int or float operands");
+  }
+
+  if (node->op == BinaryExpr::B_MOD && (!isIntType(lhsType) || !isIntType(rhsType))) {
+    addError("Modulo operator requires int operands");
+  }
+
+  Type resultType = Type::Int();
+  switch (node->op) {
+    case BinaryExpr::B_ADD:
+    case BinaryExpr::B_SUB:
+    case BinaryExpr::B_MUL:
+    case BinaryExpr::B_DIV:
+      resultType = commonNumericType(lhsType, rhsType);
+      break;
+    case BinaryExpr::B_MOD:
+      resultType = Type::Int();
+      break;
+    default:
+      resultType = Type::Int();
+      break;
   }
 
   bool isConst = lhsConst && rhsConst;
-  int constValue = 0;
+  ScalarValue constValue = ScalarValue::Int(0);
   if (isConst) {
+    float lf = lhsValue.isFloat() ? lhsValue.floatValue : static_cast<float>(lhsValue.intValue);
+    float rf = rhsValue.isFloat() ? rhsValue.floatValue : static_cast<float>(rhsValue.intValue);
+    int li = lhsValue.isFloat() ? static_cast<int>(lhsValue.floatValue) : lhsValue.intValue;
+    int ri = rhsValue.isFloat() ? static_cast<int>(rhsValue.floatValue) : rhsValue.intValue;
+
     switch (node->op) {
       case BinaryExpr::B_ADD:
-        constValue = lhsValue + rhsValue;
+        constValue = resultType.isFloatScalar() ? ScalarValue::Float(lf + rf)
+                                                : ScalarValue::Int(li + ri);
         break;
       case BinaryExpr::B_SUB:
-        constValue = lhsValue - rhsValue;
+        constValue = resultType.isFloatScalar() ? ScalarValue::Float(lf - rf)
+                                                : ScalarValue::Int(li - ri);
         break;
       case BinaryExpr::B_MUL:
-        constValue = lhsValue * rhsValue;
+        constValue = resultType.isFloatScalar() ? ScalarValue::Float(lf * rf)
+                                                : ScalarValue::Int(li * ri);
         break;
       case BinaryExpr::B_DIV:
-        if (rhsValue == 0) isConst = false;
-        else constValue = lhsValue / rhsValue;
+        if ((resultType.isFloatScalar() && rf == 0.0f) ||
+            (!resultType.isFloatScalar() && ri == 0)) {
+          isConst = false;
+        } else {
+          constValue = resultType.isFloatScalar() ? ScalarValue::Float(lf / rf)
+                                                  : ScalarValue::Int(li / ri);
+        }
         break;
       case BinaryExpr::B_MOD:
-        if (rhsValue == 0) isConst = false;
-        else constValue = lhsValue % rhsValue;
+        if (ri == 0) isConst = false;
+        else constValue = ScalarValue::Int(li % ri);
         break;
       case BinaryExpr::B_LT:
-        constValue = lhsValue < rhsValue;
+        constValue = ScalarValue::Int((resultType.isFloatScalar() || lhsValue.isFloat() || rhsValue.isFloat()) ? (lf < rf) : (li < ri));
         break;
       case BinaryExpr::B_GT:
-        constValue = lhsValue > rhsValue;
+        constValue = ScalarValue::Int((resultType.isFloatScalar() || lhsValue.isFloat() || rhsValue.isFloat()) ? (lf > rf) : (li > ri));
         break;
       case BinaryExpr::B_LE:
-        constValue = lhsValue <= rhsValue;
+        constValue = ScalarValue::Int((resultType.isFloatScalar() || lhsValue.isFloat() || rhsValue.isFloat()) ? (lf <= rf) : (li <= ri));
         break;
       case BinaryExpr::B_GE:
-        constValue = lhsValue >= rhsValue;
+        constValue = ScalarValue::Int((resultType.isFloatScalar() || lhsValue.isFloat() || rhsValue.isFloat()) ? (lf >= rf) : (li >= ri));
         break;
       case BinaryExpr::B_EQ:
-        constValue = lhsValue == rhsValue;
+        constValue = ScalarValue::Int((lhsValue.isFloat() || rhsValue.isFloat()) ? (lf == rf) : (li == ri));
         break;
       case BinaryExpr::B_NE:
-        constValue = lhsValue != rhsValue;
+        constValue = ScalarValue::Int((lhsValue.isFloat() || rhsValue.isFloat()) ? (lf != rf) : (li != ri));
         break;
       case BinaryExpr::B_AND:
-        constValue = (lhsValue && rhsValue) ? 1 : 0;
+        constValue = ScalarValue::Int(isTruthy(lhsValue) && isTruthy(rhsValue));
         break;
       case BinaryExpr::B_OR:
-        constValue = (lhsValue || rhsValue) ? 1 : 0;
+        constValue = ScalarValue::Int(isTruthy(lhsValue) || isTruthy(rhsValue));
         break;
     }
   }
 
-  setExprResult(Type::Int(), isConst, constValue);
+  setExprResult(resultType, isConst, constValue);
 }
 
 void SemanticAnalyzer::visit(Block* node) {
@@ -245,8 +366,12 @@ void SemanticAnalyzer::visit(AssignStmt* node) {
   }
 
   node->value->accept(this);
-  if (!isIntType(lastExprType)) {
-    addError("Assigned value must be an int expression");
+  if (!sym) {
+    hasReturn = false;
+    return;
+  }
+  if (!isNumericType(lastExprType) || !canImplicitlyConvert(lastExprType, sym->type)) {
+    addError("Assigned value type mismatch for '" + node->varName + "'");
   }
   hasReturn = false;
 }
@@ -255,7 +380,7 @@ void SemanticAnalyzer::visitDeclDefs(VarDeclStmt* node) {
   for (auto& defPtr : node->defs) {
     VarDef* def = defPtr.get();
     bool initIsConst = false;
-    int constValue = 0;
+    ScalarValue constValue = ScalarValue::Int(0);
 
     if (node->declaredType.isConst && !def->hasInit) {
       addError("Const variable '" + def->name + "' must be initialized");
@@ -263,10 +388,15 @@ void SemanticAnalyzer::visitDeclDefs(VarDeclStmt* node) {
 
     if (def->hasInit) {
       def->initExpr->accept(this);
-      if (!isIntType(lastExprType)) {
-        addError("Initializer for '" + def->name + "' must be int expression");
+      if (!isNumericType(lastExprType)) {
+        addError("Initializer for '" + def->name + "' must be int or float expression");
+      } else if (!canImplicitlyConvert(lastExprType, node->declaredType)) {
+        addError("Initializer type mismatch for '" + def->name + "'");
       }
       initIsConst = evalConstExpr(def->initExpr.get(), &constValue);
+      if (initIsConst) {
+        constValue = castConstValue(constValue, node->declaredType);
+      }
       if (node->declaredType.isConst && !initIsConst) {
         addError("Const variable '" + def->name + "' must use a constant expression initializer");
       }
@@ -283,7 +413,9 @@ void SemanticAnalyzer::visitDeclDefs(VarDeclStmt* node) {
     }
 
     def->initIsConst = initIsConst;
-    def->constInitValue = constValue;
+    def->typedConstInitValue = constValue;
+    if (constValue.isInt()) def->constInitValue = constValue.intValue;
+    else def->constInitValue = static_cast<int>(constValue.floatValue);
   }
 }
 
@@ -294,8 +426,8 @@ void SemanticAnalyzer::visit(VarDeclStmt* node) {
 
 void SemanticAnalyzer::visit(IfStmt* node) {
   node->condition->accept(this);
-  if (!isIntType(lastExprType)) {
-    addError("If condition must be int expression");
+  if (!isNumericType(lastExprType)) {
+    addError("If condition must be int or float expression");
   }
 
   bool thenHasReturn = false;
@@ -315,8 +447,8 @@ void SemanticAnalyzer::visit(IfStmt* node) {
 
 void SemanticAnalyzer::visit(WhileStmt* node) {
   node->condition->accept(this);
-  if (!isIntType(lastExprType)) {
-    addError("While condition must be int expression");
+  if (!isNumericType(lastExprType)) {
+    addError("While condition must be int or float expression");
   }
 
   loopDepth++;
@@ -359,8 +491,9 @@ void SemanticAnalyzer::visit(ReturnStmt* node) {
   node->returnValue->accept(this);
   if (currentFunction->returnType.base == BaseType::VOID) {
     addError("Void function '" + currentFunction->name + "' cannot return a value");
-  } else if (!isIntType(lastExprType)) {
-    addError("Non-void function '" + currentFunction->name + "' must return int expression");
+  } else if (!isNumericType(lastExprType) ||
+             !canImplicitlyConvert(lastExprType, currentFunction->returnType)) {
+    addError("Non-void function '" + currentFunction->name + "' has incompatible return expression");
   }
   hasReturn = true;
 }
@@ -371,14 +504,17 @@ void SemanticAnalyzer::visit(FuncDef* node) {
   symbolTable.enterScope();
 
   for (auto& param : node->params) {
-    if (!symbolTable.declareValue(param->name, param->type, true, false, 0)) {
+    if (!symbolTable.declareValue(param->name, param->type, true, false,
+                                  ScalarValue::Int(0))) {
       addError("Parameter '" + param->name + "' already declared");
     }
   }
 
   node->body->accept(this);
 
-  if (node->returnType.base == BaseType::INT && !hasReturn) {
+  if ((node->returnType.base == BaseType::INT ||
+       node->returnType.base == BaseType::FLOAT) &&
+      !hasReturn) {
     addError("Non-void function '" + node->name + "' must return a value on all execution paths");
   }
 

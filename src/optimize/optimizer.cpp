@@ -12,6 +12,57 @@ namespace ir {
 
 namespace {
 
+bool isFloatOperand(const Operand& op) {
+  return op.valueType == ValueType::F32;
+}
+
+bool isFloatInst(const Instruction* inst) {
+  if (auto* bin = dynamic_cast<const BinaryInst*>(inst)) {
+    return bin->operandType == ValueType::F32 || bin->resultType == ValueType::F32;
+  }
+  if (auto* un = dynamic_cast<const UnaryInst*>(inst)) {
+    return un->operandType == ValueType::F32 || un->resultType == ValueType::F32;
+  }
+  if (auto* cp = dynamic_cast<const CopyInst*>(inst)) {
+    return cp->destType == ValueType::F32 || isFloatOperand(cp->src);
+  }
+  if (auto* ld = dynamic_cast<const LoadInst*>(inst)) {
+    return ld->valueType == ValueType::F32 || isFloatOperand(ld->addr);
+  }
+  if (auto* st = dynamic_cast<const StoreInst*>(inst)) {
+    return st->valueType == ValueType::F32 || isFloatOperand(st->src) ||
+           isFloatOperand(st->addr);
+  }
+  if (auto* call = dynamic_cast<const CallInst*>(inst)) {
+    if (call->resultType == ValueType::F32) return true;
+    for (const auto& type : call->argTypes) {
+      if (type == ValueType::F32) return true;
+    }
+    for (const auto& arg : call->args) {
+      if (isFloatOperand(arg)) return true;
+    }
+    return false;
+  }
+  if (auto* ret = dynamic_cast<const ReturnInst*>(inst)) {
+    return ret->hasValue && (ret->valueType == ValueType::F32 || isFloatOperand(ret->value));
+  }
+  if (auto* br = dynamic_cast<const BranchInst*>(inst)) {
+    return isFloatOperand(br->cond);
+  }
+  return false;
+}
+
+bool functionHasFloatIR(const IRFunction& func) {
+  if (func.returnType == ValueType::F32) return true;
+  for (auto type : func.paramTypes) {
+    if (type == ValueType::F32) return true;
+  }
+  for (const auto& inst : func.instructions) {
+    if (inst && isFloatInst(inst.get())) return true;
+  }
+  return false;
+}
+
 bool isCommutative(BinaryOp op) {
   switch (op) {
     case BinaryOp::Add:
@@ -1200,6 +1251,7 @@ bool runOnce(IRFunction& func) {
 }  // namespace
 
 void OptimizeFunction(IRFunction& func) {
+  if (functionHasFloatIR(func)) return;
   for (int i = 0; i < 10; ++i) {
     if (!runOnce(func)) break;
   }
@@ -1301,7 +1353,8 @@ bool simplifyCallsInFunc(IRFunction& func,
       
       // Replace call with constant if function always returns same constant
       if (summary.returnsConstant) {
-        instPtr = std::make_unique<CopyInst>(call->dest, 
+        if (call->resultType == ValueType::F32) continue;
+        instPtr = std::make_unique<CopyInst>(call->dest,
                                               Operand::Imm(summary.constantReturnValue));
         changed = true;
         continue;

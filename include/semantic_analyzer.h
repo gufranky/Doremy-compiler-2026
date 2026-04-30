@@ -17,12 +17,20 @@ class SemanticAnalyzer : public ASTVisitor {
 
   Type lastExprType = Type::Invalid();
   bool lastExprIsConst = false;
-  int lastExprConstValue = 0;
+  ScalarValue lastExprConstValue = ScalarValue::Int(0);
 
   void addError(const std::string& msg) { errors.push_back(msg); }
+  void declareBuiltinFunctions();
   bool isIntType(const Type& type) const;
-  void setExprResult(const Type& type, bool isConst = false, int constValue = 0);
-  bool evalConstExpr(Expr* expr, int* value);
+  bool isFloatType(const Type& type) const;
+  bool isNumericType(const Type& type) const;
+  bool canImplicitlyConvert(const Type& from, const Type& to) const;
+  ScalarValue castConstValue(const ScalarValue& value, const Type& targetType) const;
+  bool isTruthy(const ScalarValue& value) const;
+  Type commonNumericType(const Type& lhs, const Type& rhs) const;
+  void setExprResult(const Type& type, bool isConst = false,
+                     ScalarValue constValue = ScalarValue::Int(0));
+  bool evalConstExpr(Expr* expr, ScalarValue* value);
   void visitDeclDefs(VarDeclStmt* node);
 
  public:
@@ -31,12 +39,13 @@ class SemanticAnalyzer : public ASTVisitor {
   bool analyze(CompUnit* root) {
     errors.clear();
     symbolTable.reset();
+    declareBuiltinFunctions();
     loopDepth = 0;
     currentFunction = nullptr;
     hasReturn = false;
     lastExprType = Type::Invalid();
     lastExprIsConst = false;
-    lastExprConstValue = 0;
+    lastExprConstValue = ScalarValue::Int(0);
 
     root->accept(this);
     if (!symbolTable.hasMainFunction()) {
