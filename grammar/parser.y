@@ -63,7 +63,7 @@ CompUnit* root = nullptr;
 %type <declStmt> VarDecl ConstDecl
 %type <varDef> VarDef ConstDef
 %type <varDefList> VarDefList ConstDefList OptMoreVarDefs
-%type <expr> Expr ConstExpr PrimaryExpr UnaryExpr MulExpr AddExpr RelExpr LAndExpr LOrExpr OptInitExpr
+%type <expr> Expr ConstExpr PrimaryExpr UnaryExpr MulExpr AddExpr RelExpr EqExpr LAndExpr LOrExpr OptInitExpr
 %type <exprList> ArgList ArgListOpt
 %type <num> UnaryOp
 
@@ -328,9 +328,19 @@ LOrExpr
     ;
 
 LAndExpr
-    : RelExpr { $$ = $1; }
-    | LAndExpr AND RelExpr {
+    : EqExpr { $$ = $1; }
+    | LAndExpr AND EqExpr {
         $$ = new BinaryExpr(BinaryExpr::B_AND, $1, $3);
+    }
+    ;
+
+EqExpr
+    : RelExpr { $$ = $1; }
+    | EqExpr EQ RelExpr {
+        $$ = new BinaryExpr(BinaryExpr::B_EQ, $1, $3);
+    }
+    | EqExpr NE RelExpr {
+        $$ = new BinaryExpr(BinaryExpr::B_NE, $1, $3);
     }
     ;
 
@@ -347,12 +357,6 @@ RelExpr
     }
     | RelExpr GE AddExpr {
         $$ = new BinaryExpr(BinaryExpr::B_GE, $1, $3);
-    }
-    | RelExpr EQ AddExpr {
-        $$ = new BinaryExpr(BinaryExpr::B_EQ, $1, $3);
-    }
-    | RelExpr NE AddExpr {
-        $$ = new BinaryExpr(BinaryExpr::B_NE, $1, $3);
     }
     ;
 
