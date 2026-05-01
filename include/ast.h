@@ -15,6 +15,31 @@ class ASTNode {
 
 enum class BaseType { INVALID, INT, VOID, FLOAT };
 
+struct ScalarValue {
+  BaseType base = BaseType::INVALID;
+  int intValue = 0;
+  float floatValue = 0.0f;
+
+  static ScalarValue Int(int value) {
+    ScalarValue v;
+    v.base = BaseType::INT;
+    v.intValue = value;
+    v.floatValue = static_cast<float>(value);
+    return v;
+  }
+
+  static ScalarValue Float(float value) {
+    ScalarValue v;
+    v.base = BaseType::FLOAT;
+    v.intValue = static_cast<int>(value);
+    v.floatValue = value;
+    return v;
+  }
+
+  bool isInt() const { return base == BaseType::INT; }
+  bool isFloat() const { return base == BaseType::FLOAT; }
+};
+
 struct Type {
   BaseType base = BaseType::INVALID;
   bool isConst = false;
@@ -43,10 +68,16 @@ struct Type {
     t.base = BaseType::FLOAT;
     return t;
   }
+  static Type ConstFloat() {
+    Type t = Float();
+    t.isConst = true;
+    return t;
+  }
 
   bool isValid() const { return base != BaseType::INVALID; }
   bool isIntScalar() const { return base == BaseType::INT && !isArray; }
   bool isVoidScalar() const { return base == BaseType::VOID && !isArray; }
+  bool isFloatScalar() const { return base == BaseType::FLOAT && !isArray; }
 
   bool equalsIgnoringConst(const Type& other) const {
     return base == other.base && isArray == other.isArray &&
@@ -69,7 +100,14 @@ class Expr : public ASTNode {
 class NumberExpr : public Expr {
  public:
   int value;
-  explicit NumberExpr(int val) : value(val) {}
+  ScalarValue scalarValue;
+
+  explicit NumberExpr(int val) : value(val), scalarValue(ScalarValue::Int(val)) {}
+  explicit NumberExpr(float val)
+      : value(static_cast<int>(val)), scalarValue(ScalarValue::Float(val)) {}
+
+  bool isIntLiteral() const { return scalarValue.isInt(); }
+  bool isFloatLiteral() const { return scalarValue.isFloat(); }
   void accept(ASTVisitor* visitor) override;
 };
 
@@ -140,6 +178,7 @@ class VarDef {
   bool hasInit = false;
   bool initIsConst = false;
   int constInitValue = 0;
+  ScalarValue typedConstInitValue = ScalarValue::Int(0);
   bool isArray = false;
   std::vector<int> arrayDimensions;
   bool firstDimUnsized = false;

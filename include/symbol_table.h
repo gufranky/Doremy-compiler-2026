@@ -18,6 +18,7 @@ struct Symbol {
   bool isGlobal = false;
   bool hasConstValue = false;
   int constValue = 0;
+  ScalarValue typedConstValue = ScalarValue::Int(0);
   std::vector<Type> paramTypes;
 
   Symbol(const std::string& n, SymbolKind k, const Type& t)
@@ -51,7 +52,7 @@ class SymbolTable {
 
   bool declareValue(const std::string& name, const Type& type,
                     bool isParam = false, bool hasConstValue = false,
-                    int constValue = 0) {
+                    ScalarValue constValue = ScalarValue::Int(0)) {
     if (valueScopes.empty()) return false;
     auto& currentScope = valueScopes.back();
     if (currentScope.find(name) != currentScope.end()) return false;
@@ -64,9 +65,16 @@ class SymbolTable {
     symbol->isParameter = isParam;
     symbol->isGlobal = isGlobalScope();
     symbol->hasConstValue = hasConstValue;
-    symbol->constValue = constValue;
+    symbol->constValue = constValue.intValue;
+    symbol->typedConstValue = constValue;
     currentScope[name] = std::move(symbol);
     return true;
+  }
+
+  bool declareValue(const std::string& name, const Type& type, bool isParam,
+                    bool hasConstValue, int constValue) {
+    return declareValue(name, type, isParam, hasConstValue,
+                        ScalarValue::Int(constValue));
   }
 
   Symbol* lookupValue(const std::string& name) {

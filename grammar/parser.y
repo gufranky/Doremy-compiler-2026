@@ -17,7 +17,9 @@ CompUnit* root = nullptr;
 
 %union {
     int num;
+    float fnum;
     std::string* str;
+    Type* type;
 
     ASTNode* astNode;
     CompUnit* compUnit;
@@ -37,6 +39,7 @@ CompUnit* root = nullptr;
 }
 
 %token <num> NUMBER
+%token <fnum> FLOAT_NUMBER
 %token <str> IDENTIFIER
 
 %token INT VOID FLOAT
@@ -52,6 +55,7 @@ CompUnit* root = nullptr;
 %type <astNode> GlobalItem
 %type <param> Param
 %type <paramList> ParamList ParamListOpt
+%type <type> BType
 
 %type <stmt> Decl BlockItem Stmt
 %type <block> Block
@@ -59,7 +63,7 @@ CompUnit* root = nullptr;
 %type <declStmt> VarDecl ConstDecl
 %type <varDef> VarDef ConstDef
 %type <varDefList> VarDefList ConstDefList OptMoreVarDefs
-%type <expr> Expr ConstExpr PrimaryExpr UnaryExpr MulExpr AddExpr RelExpr LAndExpr LOrExpr OptInitExpr
+%type <expr> Expr ConstExpr PrimaryExpr UnaryExpr MulExpr AddExpr RelExpr EqExpr LAndExpr LOrExpr OptInitExpr
 %type <exprList> ArgList ArgListOpt
 %type <num> UnaryOp
 
@@ -85,6 +89,16 @@ CompUnit
     }
     ;
 
+BType
+    : INT {
+        $$ = new Type(Type::Int());
+    }
+    | FLOAT {
+        $$ = new Type(Type::Float());
+    }
+    ;
+
+
 GlobalItem
     : VOID IDENTIFIER LPAREN ParamListOpt RPAREN Block {
         FuncDef* func = new FuncDef(Type::Void(), *$2, $6);
@@ -97,19 +111,20 @@ GlobalItem
         delete $2;
         $$ = static_cast<ASTNode*>(func);
     }
-    | INT IDENTIFIER LPAREN ParamListOpt RPAREN Block {
-        FuncDef* func = new FuncDef(Type::Int(), *$2, $6);
+    | BType IDENTIFIER LPAREN ParamListOpt RPAREN Block {
+        FuncDef* func = new FuncDef(*$1, *$2, $6);
         if ($4) {
             for (auto* param : *$4) {
                 func->params.emplace_back(param);
             }
             delete $4;
         }
+        delete $1;
         delete $2;
         $$ = static_cast<ASTNode*>(func);
     }
-    | INT IDENTIFIER OptInitExpr OptMoreVarDefs SEMICOLON {
-        VarDeclStmt* decl = new VarDeclStmt(Type::Int());
+    | BType IDENTIFIER OptInitExpr OptMoreVarDefs SEMICOLON {
+        VarDeclStmt* decl = new VarDeclStmt(*$1);
         VarDef* first = $3 ? new VarDef(*$2, $3) : new VarDef(*$2);
         decl->defs.emplace_back(first);
         if ($4) {
@@ -118,6 +133,7 @@ GlobalItem
             }
             delete $4;
         }
+        delete $1;
         delete $2;
         $$ = static_cast<ASTNode*>(decl);
     }
@@ -153,8 +169,9 @@ ParamList
     ;
 
 Param
-    : INT IDENTIFIER {
-        $$ = new Param(Type::Int(), *$2);
+    : BType IDENTIFIER {
+        $$ = new Param(*$1, *$2);
+        delete $1;
         delete $2;
     }
     ;
@@ -165,21 +182,25 @@ Decl
     ;
 
 VarDecl
-    : INT VarDefList SEMICOLON {
-        $$ = new VarDeclStmt(Type::Int());
+    : BType VarDefList SEMICOLON {
+        $$ = new VarDeclStmt(*$1);
         for (auto* def : *$2) {
             $$->defs.emplace_back(def);
         }
+        delete $1;
         delete $2;
     }
     ;
 
 ConstDecl
-    : CONST INT ConstDefList SEMICOLON {
-        $$ = new VarDeclStmt(Type::ConstInt());
+    : CONST BType ConstDefList SEMICOLON {
+        Type constType = *$2;
+        constType.isConst = true;
+        $$ = new VarDeclStmt(constType);
         for (auto* def : *$3) {
             $$->defs.emplace_back(def);
         }
+        delete $2;
         delete $3;
     }
     ;
@@ -307,9 +328,19 @@ LOrExpr
     ;
 
 LAndExpr
-    : RelExpr { $$ = $1; }
-    | LAndExpr AND RelExpr {
+    : EqExpr { $$ = $1; }
+    | LAndExpr AND EqExpr {
         $$ = new BinaryExpr(BinaryExpr::B_AND, $1, $3);
+    }
+    ;
+
+EqExpr
+    : RelExpr { $$ = $1; }
+    | EqExpr EQ RelExpr {
+        $$ = new BinaryExpr(BinaryExpr::B_EQ, $1, $3);
+    }
+    | EqExpr NE RelExpr {
+        $$ = new BinaryExpr(BinaryExpr::B_NE, $1, $3);
     }
     ;
 
@@ -326,12 +357,6 @@ RelExpr
     }
     | RelExpr GE AddExpr {
         $$ = new BinaryExpr(BinaryExpr::B_GE, $1, $3);
-    }
-    | RelExpr EQ AddExpr {
-        $$ = new BinaryExpr(BinaryExpr::B_EQ, $1, $3);
-    }
-    | RelExpr NE AddExpr {
-        $$ = new BinaryExpr(BinaryExpr::B_NE, $1, $3);
     }
     ;
 
@@ -381,6 +406,9 @@ PrimaryExpr
         delete $1;
     }
     | NUMBER {
+        $$ = new NumberExpr($1);
+    }
+    | FLOAT_NUMBER {
         $$ = new NumberExpr($1);
     }
     | LPAREN Expr RPAREN {

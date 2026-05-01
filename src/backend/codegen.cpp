@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstring>
 #include <set>
 #include <sstream>
 
@@ -25,6 +26,40 @@ inline std::string trim(const std::string& s) {
 inline bool isLabelLine(const std::string& line) {
   std::string t = trim(line);
   return !t.empty() && t.back() == ':';
+}
+
+inline bool isFloatAsmLine(const std::string& line) {
+  std::string t = trim(line);
+  return startsWith(t, "fadd.") || startsWith(t, "fsub.") ||
+         startsWith(t, "fmul.") || startsWith(t, "fdiv.") ||
+         startsWith(t, "fneg.") || startsWith(t, "feq.") ||
+         startsWith(t, "flt.") || startsWith(t, "fle.") ||
+         startsWith(t, "fcvt.") || startsWith(t, "fmv.") ||
+         startsWith(t, "flw ") || startsWith(t, "fsw ");
+}
+
+struct ArgLocation {
+  bool useFloatReg = false;
+  bool useIntReg = false;
+  int regIndex = -1;
+  int stackIndex = -1;
+};
+
+inline ArgLocation classifyArgLocation(ValueType type, int& intRegCount,
+                                       int& floatRegCount, int& stackCount) {
+  ArgLocation loc;
+  if (type == ValueType::F32 && floatRegCount < 8) {
+    loc.useFloatReg = true;
+    loc.regIndex = floatRegCount++;
+    return loc;
+  }
+  if (intRegCount < 8) {
+    loc.useIntReg = true;
+    loc.regIndex = intRegCount++;
+    return loc;
+  }
+  loc.stackIndex = stackCount++;
+  return loc;
 }
 
 // Optimize move chains: mv t0, a0; mv t1, t0 -> mv t1, a0
@@ -95,27 +130,35 @@ std::vector<std::string> optimizeMoveChains(const std::vector<std::string>& line
 std::vector<std::string> optimizeLoadStore(const std::vector<std::string>& lines) {
   std::vector<std::string> result;
   result.reserve(lines.size());
-  
+
   for (size_t i = 0; i < lines.size(); ++i) {
     std::string t = trim(lines[i]);
-    
+    if (isFloatAsmLine(t)) {
+      result.push_back(lines[i]);
+      continue;
+    }
+
     // Pattern: sw rX, offset(base) followed by lw rX, offset(base)
     if (startsWith(t, "sw ") && i + 1 < lines.size()) {
       std::string next = trim(lines[i + 1]);
+      if (isFloatAsmLine(next)) {
+        result.push_back(lines[i]);
+        continue;
+      }
       if (startsWith(next, "lw ")) {
         // Extract register and offset from both
         std::string swRest = t.substr(3);
         std::string lwRest = next.substr(3);
-        
+
         size_t swComma = swRest.find(',');
         size_t lwComma = lwRest.find(',');
-        
+
         if (swComma != std::string::npos && lwComma != std::string::npos) {
           std::string swReg = trim(swRest.substr(0, swComma));
           std::string lwReg = trim(lwRest.substr(0, lwComma));
           std::string swOffset = trim(swRest.substr(swComma + 1));
           std::string lwOffset = trim(lwRest.substr(lwComma + 1));
-          
+
           if (swReg == lwReg && swOffset == lwOffset) {
             // Skip the redundant lw
             result.push_back(lines[i]);
@@ -125,10 +168,10 @@ std::vector<std::string> optimizeLoadStore(const std::vector<std::string>& lines
         }
       }
     }
-    
+
     result.push_back(lines[i]);
   }
-  
+
   return result;
 }
 
@@ -136,14 +179,20 @@ std::vector<std::string> optimizeLoadStore(const std::vector<std::string>& lines
 std::vector<std::string> optimizeRedundantOps(const std::vector<std::string>& lines) {
   std::vector<std::string> result;
   result.reserve(lines.size());
-  
+
   // Track known values for simple constant propagation
   std::unordered_map<std::string, int> knownValues;
-  
+
   for (const auto& line : lines) {
     std::string t = trim(line);
     bool skip = false;
-    
+
+    if (isFloatAsmLine(t)) {
+      knownValues.clear();
+      result.push_back(line);
+      continue;
+    }
+
     // Track li instructions
     if (startsWith(t, "addi ") && t.find("x0") != std::string::npos) {
       // addi rd, x0, imm is li rd, imm
@@ -164,7 +213,7 @@ std::vector<std::string> optimizeRedundantOps(const std::vector<std::string>& li
         }
       }
     }
-    
+
     // Check for add with known zero
     if (startsWith(t, "add ")) {
       size_t comma1 = t.find(',');
@@ -175,7 +224,7 @@ std::vector<std::string> optimizeRedundantOps(const std::vector<std::string>& li
           std::string dest = trim(t.substr(4, comma1 - 4));
           std::string src1 = trim(rest.substr(0, comma2));
           std::string src2 = trim(rest.substr(comma2 + 1));
-          
+
           // add dest, src1, src2 where src2 is known 0 and dest == src1
           if (knownValues.count(src2) && knownValues[src2] == 0 && dest == src1) {
             skip = true;
@@ -183,7 +232,7 @@ std::vector<std::string> optimizeRedundantOps(const std::vector<std::string>& li
         }
       }
     }
-    
+
     // Check for mul with known 1
     if (startsWith(t, "mul ")) {
       size_t comma1 = t.find(',');
@@ -194,27 +243,27 @@ std::vector<std::string> optimizeRedundantOps(const std::vector<std::string>& li
           std::string dest = trim(t.substr(4, comma1 - 4));
           std::string src1 = trim(rest.substr(0, comma2));
           std::string src2 = trim(rest.substr(comma2 + 1));
-          
+
           if (knownValues.count(src2) && knownValues[src2] == 1 && dest == src1) {
             skip = true;
           }
         }
       }
     }
-    
-  // Clear known values on control flow, memory traffic, or redefinition.
+
+    // Clear known values on control flow, memory traffic, or redefinition.
     if (isLabelLine(line) || startsWith(t, "j ") || startsWith(t, "jal ") ||
         startsWith(t, "call ") || startsWith(t, "ret") ||
         startsWith(t, "bne ") || startsWith(t, "beq ") ||
         startsWith(t, "lw ") || startsWith(t, "sw ")) {
       knownValues.clear();
     }
-    
+
     if (!skip) {
       result.push_back(line);
     }
   }
-  
+
   return result;
 }
 
@@ -834,10 +883,14 @@ std::vector<std::string> optimizeUnrolledTinyAccum(const std::vector<std::string
 std::vector<std::string> optimizeLiMv(const std::vector<std::string>& lines) {
   std::vector<std::string> result;
   result.reserve(lines.size());
-  
+
   for (size_t i = 0; i < lines.size(); ++i) {
     std::string t = trim(lines[i]);
-    
+    if (isFloatAsmLine(t)) {
+      result.push_back(lines[i]);
+      continue;
+    }
+
     // Look for li t0, imm followed by mv rd, t0
     if (startsWith(t, "li ")) {
       std::string rest = trim(t.substr(3));
@@ -845,17 +898,21 @@ std::vector<std::string> optimizeLiMv(const std::vector<std::string>& lines) {
       if (c != std::string::npos) {
         std::string rd = trim(rest.substr(0, c));
         std::string imm = trim(rest.substr(c + 1));
-        
+
         // Check if rd is a temp and next is mv dest, rd
         if ((rd == "t0" || rd == "t1" || rd == "t5") && i + 1 < lines.size()) {
           std::string next = trim(lines[i + 1]);
+          if (isFloatAsmLine(next)) {
+            result.push_back(lines[i]);
+            continue;
+          }
           if (startsWith(next, "mv ")) {
             std::string mvRest = trim(next.substr(3));
             size_t mc = mvRest.find(',');
             if (mc != std::string::npos) {
               std::string mvDest = trim(mvRest.substr(0, mc));
               std::string mvSrc = trim(mvRest.substr(mc + 1));
-              
+
               if (mvSrc == rd && mvDest != rd) {
                 // Replace with single li mvDest, imm
                 result.push_back("\tli " + mvDest + ", " + imm);
@@ -867,10 +924,10 @@ std::vector<std::string> optimizeLiMv(const std::vector<std::string>& lines) {
         }
       }
     }
-    
+
     result.push_back(lines[i]);
   }
-  
+
   return result;
 }
 
@@ -960,6 +1017,11 @@ std::string CodeGen::renderOperandWithAlloc(
     const Operand& op, const std::unordered_map<int, int>& allocation,
     const StackFrame& frame) const {
   if (op.isImm()) {
+    if (isFloatValueType(op.valueType)) {
+      std::ostringstream os;
+      os << op.immFloatValue << "f";
+      return os.str();
+    }
     return std::to_string(op.immValue);
   }
   if (op.isVReg()) {
@@ -977,6 +1039,36 @@ std::string CodeGen::renderOperandWithAlloc(
 }
 
 bool CodeGen::isInt12(int imm) const { return imm >= -2048 && imm <= 2047; }
+
+bool CodeGen::isFloatValueType(ValueType type) const {
+  return type == ValueType::F32;
+}
+
+std::string CodeGen::floatCompareMnemonic(BinaryOp op) const {
+  switch (op) {
+    case BinaryOp::Lt:
+      return "flt.s";
+    case BinaryOp::Le:
+      return "fle.s";
+    case BinaryOp::Eq:
+      return "feq.s";
+    default:
+      return "";
+  }
+}
+
+int CodeGen::floatBits(float value) const {
+  int bits = 0;
+  static_assert(sizeof(bits) == sizeof(value), "float/int size mismatch");
+  std::memcpy(&bits, &value, sizeof(value));
+  return bits;
+}
+
+void CodeGen::emitLoadFloatImmediate(const std::string& freg, float value,
+                                     std::vector<std::string>& out) const {
+  emitLoadImmediate("t6", floatBits(value), out);
+  out.push_back("\tfmv.w.x " + freg + ", t6");
+}
 
 void CodeGen::emitLoadImmediate(const std::string& reg, int imm,
                                 std::vector<std::string>& out) const {
@@ -1129,17 +1221,23 @@ CodeGen::StackFrame CodeGen::computeStackFrame(
 
   std::sort(frame.savedRegs.begin(), frame.savedRegs.end());
 
-  // Track maximum stack arguments required.
-  int maxArgs = 0;
+  // Track maximum stack arguments required under mixed int/float calling convention.
+  int maxStackArgs = 0;
   for (const auto& inst : fn.instructions) {
-    if (inst->kind == InstKind::Call) {
-      auto* c = static_cast<const CallInst*>(inst.get());
-      if (static_cast<int>(c->args.size()) > maxArgs) {
-        maxArgs = static_cast<int>(c->args.size());
-      }
+    if (inst->kind != InstKind::Call) continue;
+    auto* c = static_cast<const CallInst*>(inst.get());
+    int intRegCount = 0;
+    int floatRegCount = 0;
+    int stackCount = 0;
+    for (size_t i = 0; i < c->args.size(); ++i) {
+      ValueType argType = i < c->argTypes.size() ? c->argTypes[i] : ValueType::I32;
+      classifyArgLocation(argType, intRegCount, floatRegCount, stackCount);
+    }
+    if (stackCount > maxStackArgs) {
+      maxStackArgs = stackCount;
     }
   }
-  frame.maxOutgoingArgs = std::max(0, maxArgs - 8);
+  frame.maxOutgoingArgs = maxStackArgs;
 
   // Caller-saved registers that are live across calls need spill slots.
   std::set<std::string> callerSavedSet;
@@ -1290,6 +1388,41 @@ std::string CodeGen::renderInstructionWithAlloc(
                                 ? RISCVRegMap::physicalRegName(it->second)
                                 : "%v" + std::to_string(b->dest);
 
+      if (isFloatValueType(b->operandType)) {
+        if (isFloatValueType(b->resultType)) {
+          switch (b->op) {
+            case BinaryOp::Add:
+              os << "fadd.s ft?, " << renderOperandWithAlloc(b->lhs, allocation, frame)
+                 << ", " << renderOperandWithAlloc(b->rhs, allocation, frame)
+                 << " -> " << destReg;
+              break;
+            case BinaryOp::Sub:
+              os << "fsub.s ft?, " << renderOperandWithAlloc(b->lhs, allocation, frame)
+                 << ", " << renderOperandWithAlloc(b->rhs, allocation, frame)
+                 << " -> " << destReg;
+              break;
+            case BinaryOp::Mul:
+              os << "fmul.s ft?, " << renderOperandWithAlloc(b->lhs, allocation, frame)
+                 << ", " << renderOperandWithAlloc(b->rhs, allocation, frame)
+                 << " -> " << destReg;
+              break;
+            case BinaryOp::Div:
+              os << "fdiv.s ft?, " << renderOperandWithAlloc(b->lhs, allocation, frame)
+                 << ", " << renderOperandWithAlloc(b->rhs, allocation, frame)
+                 << " -> " << destReg;
+              break;
+            default:
+              os << "fbin(?) " << destReg;
+              break;
+          }
+        } else {
+          os << floatCompareMnemonic(b->op) << " " << destReg << ", "
+             << renderOperandWithAlloc(b->lhs, allocation, frame) << ", "
+             << renderOperandWithAlloc(b->rhs, allocation, frame);
+        }
+        break;
+      }
+
       os << binOpMnemonic(b->op) << " " << destReg << ", "
          << renderOperandWithAlloc(b->lhs, allocation, frame) << ", "
          << renderOperandWithAlloc(b->rhs, allocation, frame);
@@ -1301,6 +1434,24 @@ std::string CodeGen::renderInstructionWithAlloc(
       std::string destReg = (it != allocation.end())
                                 ? RISCVRegMap::physicalRegName(it->second)
                                 : "%v" + std::to_string(u->dest);
+
+      if (isFloatValueType(u->operandType)) {
+        switch (u->op) {
+          case UnaryOp::Neg:
+            os << "fneg.s ft?, " << renderOperandWithAlloc(u->operand, allocation, frame)
+               << " -> " << destReg;
+            break;
+          case UnaryOp::Not:
+            os << "fnot(cond) " << destReg << ", "
+               << renderOperandWithAlloc(u->operand, allocation, frame);
+            break;
+          case UnaryOp::Plus:
+            os << "fmv.s/copy " << destReg << ", "
+               << renderOperandWithAlloc(u->operand, allocation, frame);
+            break;
+        }
+        break;
+      }
 
       switch (u->op) {
         case UnaryOp::Neg:
@@ -1325,14 +1476,22 @@ std::string CodeGen::renderInstructionWithAlloc(
                                 ? RISCVRegMap::physicalRegName(it->second)
                                 : "%v" + std::to_string(c->dest);
 
-      os << "mv " << destReg << ", "
-         << renderOperandWithAlloc(c->src, allocation, frame);
+      if (isFloatValueType(c->destType) && !isFloatValueType(c->src.valueType)) {
+        os << "fcvt.s.w " << destReg << ", "
+           << renderOperandWithAlloc(c->src, allocation, frame);
+      } else if (!isFloatValueType(c->destType) && isFloatValueType(c->src.valueType)) {
+        os << "fcvt.w.s " << destReg << ", "
+           << renderOperandWithAlloc(c->src, allocation, frame);
+      } else {
+        os << "mv " << destReg << ", "
+           << renderOperandWithAlloc(c->src, allocation, frame);
+      }
       break;
     }
     case InstKind::Branch: {
       auto* br = static_cast<const BranchInst*>(inst);
-      os << "bne " << renderOperandWithAlloc(br->cond, allocation, frame)
-         << ", x0, " << br->trueLabel << "\n    j " << br->falseLabel;
+      os << "branch " << renderOperandWithAlloc(br->cond, allocation, frame)
+         << " ? " << br->trueLabel << " : " << br->falseLabel;
       break;
     }
     case InstKind::Jump: {
@@ -1342,26 +1501,27 @@ std::string CodeGen::renderInstructionWithAlloc(
     }
     case InstKind::Call: {
       auto* c = static_cast<const CallInst*>(inst);
-      os << "# args=" << c->args.size() << "\n    call " << c->callee;
       if (c->hasDest) {
         auto it = allocation.find(c->dest);
         std::string destReg = (it != allocation.end())
                                   ? RISCVRegMap::physicalRegName(it->second)
                                   : "%v" + std::to_string(c->dest);
-        os << "\n    mv " << destReg << ", a0";
+        os << destReg << " = ";
       }
+      os << "call " << c->callee << "(";
+      for (size_t i = 0; i < c->args.size(); ++i) {
+        if (i) os << ", ";
+        os << renderOperandWithAlloc(c->args[i], allocation, frame);
+      }
+      os << ")";
       break;
     }
     case InstKind::Return: {
       auto* r = static_cast<const ReturnInst*>(inst);
       if (r->hasValue) {
-        if (r->value.isImm()) {
-          os << "li t0, " << std::to_string(r->value.immValue)
-             << "\n    mv a0, t0";
-        } else {
-          os << "mv a0, "
-             << renderOperandWithAlloc(r->value, allocation, frame);
-        }
+        os << "return " << renderOperandWithAlloc(r->value, allocation, frame);
+      } else {
+        os << "return";
       }
       break;
     }
@@ -1394,6 +1554,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
                                const StackFrame& frame,
                                const LivenessResult& liveness,
                                std::vector<std::string>& out) {
+  (void)liveness;
   const std::vector<std::string> scratchRegs = {"t5", "t6"};
 
   auto mangleLabel = [&](const std::string& lbl) {
@@ -1478,10 +1639,24 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
     return loadOperandInto(op, reg, insns, reservedRegs);
   };
 
+  auto loadFloatOperand = [&](const Operand& op, const std::string& targetFReg,
+                              std::vector<std::string>& insns,
+                              const std::vector<std::string>& reservedRegs =
+                                  std::vector<std::string>()) -> std::string {
+    if (op.isImm() && isFloatValueType(op.valueType)) {
+      emitLoadFloatImmediate(targetFReg, op.immFloatValue, insns);
+      return targetFReg;
+    }
+    std::string intReg = chooseScratch(reservedRegs);
+    loadOperandInto(op, intReg, insns, reservedRegs);
+    insns.push_back("\tfmv.w.x " + targetFReg + ", " + intReg);
+    return targetFReg;
+  };
+
   auto storeWithScratch = [&](const std::string& valueReg, int offset,
-                             std::vector<std::string>& insns,
-                             const std::vector<std::string>& liveRegs =
-                                 std::vector<std::string>()) {
+                              std::vector<std::string>& insns,
+                              const std::vector<std::string>& liveRegs =
+                                  std::vector<std::string>()) {
     std::vector<std::string> reserved = liveRegs;
     reserved.push_back(valueReg);
     emitStackStore(valueReg, offset, insns, chooseScratch(reserved));
@@ -1513,27 +1688,88 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
     storeCurrentValue(vreg, valueReg, insns, liveRegs);
   };
 
+  auto storeFloatResult = [&](int vreg, const std::string& srcFReg,
+                              std::vector<std::string>& insns) {
+    auto it = allocation.find(vreg);
+    if (it != allocation.end()) {
+      std::string dst = RISCVRegMap::physicalRegName(it->second);
+      insns.push_back("\tfmv.x.w " + dst + ", " + srcFReg);
+    } else {
+      std::string tmp = chooseScratch({});
+      insns.push_back("\tfmv.x.w " + tmp + ", " + srcFReg);
+      storeCurrentValue(vreg, tmp, insns, {tmp});
+    }
+  };
+
+  auto emitFloatCompare = [&](BinaryOp op, const std::string& destReg,
+                              const std::string& lhsF, const std::string& rhsF,
+                              std::vector<std::string>& insns) {
+    switch (op) {
+      case BinaryOp::Lt:
+        insns.push_back("\tflt.s " + destReg + ", " + lhsF + ", " + rhsF);
+        break;
+      case BinaryOp::Gt:
+        insns.push_back("\tflt.s " + destReg + ", " + rhsF + ", " + lhsF);
+        break;
+      case BinaryOp::Le:
+        insns.push_back("\tfle.s " + destReg + ", " + lhsF + ", " + rhsF);
+        break;
+      case BinaryOp::Ge:
+        insns.push_back("\tfle.s " + destReg + ", " + rhsF + ", " + lhsF);
+        break;
+      case BinaryOp::Eq:
+        insns.push_back("\tfeq.s " + destReg + ", " + lhsF + ", " + rhsF);
+        break;
+      case BinaryOp::Ne:
+        insns.push_back("\tfeq.s " + destReg + ", " + lhsF + ", " + rhsF);
+        insns.push_back("\txori " + destReg + ", " + destReg + ", 1");
+        break;
+      default:
+        break;
+    }
+  };
+
   // Move incoming parameters to their assigned locations.
+  int incomingIntRegCount = 0;
+  int incomingFloatRegCount = 0;
+  int incomingStackCount = 0;
   for (size_t i = 0; i < fn.params.size(); ++i) {
     int vreg = fn.params[i];
     int scratchIdx = 0;
     std::vector<std::string> insns;
-    std::string srcReg;
-    if (i < 8) {
-      srcReg = "a" + std::to_string(i);
-    } else {
-      int offset = frame.frameSize + static_cast<int>((i - 8) * 4);
-      srcReg = chooseScratch({});
-      emitStackLoad(srcReg, offset, insns, srcReg);
-    }
+    ValueType paramType = i < fn.paramTypes.size() ? fn.paramTypes[i] : ValueType::I32;
+    ArgLocation loc = classifyArgLocation(paramType, incomingIntRegCount,
+                                          incomingFloatRegCount, incomingStackCount);
 
-    auto it = allocation.find(vreg);
-    if (it != allocation.end()) {
-      std::string dst = RISCVRegMap::physicalRegName(it->second);
-      if (dst != srcReg)
-        insns.push_back("\taddi " + dst + ", " + srcReg + ", 0");
+    if (loc.useFloatReg) {
+      auto it = allocation.find(vreg);
+      if (it != allocation.end()) {
+        std::string dst = RISCVRegMap::physicalRegName(it->second);
+        insns.push_back("\tfmv.x.w " + dst + ", fa" + std::to_string(loc.regIndex));
+      } else {
+        std::string tmp = chooseScratch({});
+        insns.push_back("\tfmv.x.w " + tmp + ", fa" + std::to_string(loc.regIndex));
+        storeIncomingParam(vreg, tmp, insns, {tmp});
+      }
     } else {
-      storeIncomingParam(vreg, srcReg, insns, {srcReg});
+      std::string srcReg;
+      if (loc.useIntReg) {
+        srcReg = "a" + std::to_string(loc.regIndex);
+      } else {
+        int offset = frame.frameSize + loc.stackIndex * 4;
+        srcReg = chooseScratch({});
+        emitStackLoad(srcReg, offset, insns, srcReg);
+      }
+
+      auto it = allocation.find(vreg);
+      if (it != allocation.end()) {
+        std::string dst = RISCVRegMap::physicalRegName(it->second);
+        if (dst != srcReg) {
+          insns.push_back("\taddi " + dst + ", " + srcReg + ", 0");
+        }
+      } else {
+        storeIncomingParam(vreg, srcReg, insns, {srcReg});
+      }
     }
 
     for (const auto& line : insns) {
@@ -1550,6 +1786,38 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
     switch (inst->kind) {
       case InstKind::Binary: {
         auto* b = static_cast<const BinaryInst*>(inst.get());
+        if (isFloatValueType(b->operandType)) {
+          std::string lhsF = loadFloatOperand(b->lhs, "ft0", insns);
+          std::string rhsF = loadFloatOperand(b->rhs, "ft1", insns, {"t6"});
+          if (isFloatValueType(b->resultType)) {
+            switch (b->op) {
+              case BinaryOp::Add:
+                insns.push_back("\tfadd.s ft2, " + lhsF + ", " + rhsF);
+                break;
+              case BinaryOp::Sub:
+                insns.push_back("\tfsub.s ft2, " + lhsF + ", " + rhsF);
+                break;
+              case BinaryOp::Mul:
+                insns.push_back("\tfmul.s ft2, " + lhsF + ", " + rhsF);
+                break;
+              case BinaryOp::Div:
+                insns.push_back("\tfdiv.s ft2, " + lhsF + ", " + rhsF);
+                break;
+              default:
+                break;
+            }
+            storeFloatResult(b->dest, "ft2", insns);
+          } else {
+            auto it = allocation.find(b->dest);
+            std::string destReg =
+                it != allocation.end() ? RISCVRegMap::physicalRegName(it->second)
+                                       : chooseScratch({});
+            emitFloatCompare(b->op, destReg, lhsF, rhsF, insns);
+            storeCurrentValue(b->dest, destReg, insns, {destReg});
+          }
+          break;
+        }
+
         std::string lhs = loadOperand(b->lhs, scratchIdx, insns);
         std::string rhs = loadOperand(b->rhs, scratchIdx, insns, {lhs});
 
@@ -1592,6 +1860,37 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       }
       case InstKind::Unary: {
         auto* u = static_cast<const UnaryInst*>(inst.get());
+        if (isFloatValueType(u->operandType)) {
+          if (u->op == UnaryOp::Plus) {
+            std::string src = loadOperand(u->operand, scratchIdx, insns);
+            auto it = allocation.find(u->dest);
+            if (it != allocation.end()) {
+              std::string dst = RISCVRegMap::physicalRegName(it->second);
+              if (dst != src) {
+                insns.push_back("\taddi " + dst + ", " + src + ", 0");
+              }
+            } else {
+              storeCurrentValue(u->dest, src, insns, {src});
+            }
+            break;
+          }
+
+          std::string opndF = loadFloatOperand(u->operand, "ft0", insns);
+          if (u->op == UnaryOp::Neg) {
+            insns.push_back("\tfneg.s ft1, " + opndF);
+            storeFloatResult(u->dest, "ft1", insns);
+          } else {
+            insns.push_back("\tfmv.w.x ft1, x0");
+            auto it = allocation.find(u->dest);
+            std::string destReg =
+                it != allocation.end() ? RISCVRegMap::physicalRegName(it->second)
+                                       : chooseScratch({});
+            insns.push_back("\tfeq.s " + destReg + ", " + opndF + ", ft1");
+            storeCurrentValue(u->dest, destReg, insns, {destReg});
+          }
+          break;
+        }
+
         std::string opnd = loadOperand(u->operand, scratchIdx, insns);
         auto it = allocation.find(u->dest);
         std::string destReg;
@@ -1617,13 +1916,30 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       }
       case InstKind::Copy: {
         auto* c = static_cast<const CopyInst*>(inst.get());
+        if (isFloatValueType(c->destType) && !isFloatValueType(c->src.valueType)) {
+          std::string src = loadOperand(c->src, scratchIdx, insns);
+          insns.push_back("\tfcvt.s.w ft0, " + src);
+          storeFloatResult(c->dest, "ft0", insns);
+          break;
+        }
+        if (!isFloatValueType(c->destType) && isFloatValueType(c->src.valueType)) {
+          std::string srcF = loadFloatOperand(c->src, "ft0", insns);
+          auto it = allocation.find(c->dest);
+          std::string dst =
+              it != allocation.end() ? RISCVRegMap::physicalRegName(it->second)
+                                     : chooseScratch({});
+          insns.push_back("\tfcvt.w.s " + dst + ", " + srcF + ", rtz");
+          storeCurrentValue(c->dest, dst, insns, {dst});
+          break;
+        }
+
         std::string src = loadOperand(c->src, scratchIdx, insns);
         auto it = allocation.find(c->dest);
         if (it != allocation.end()) {
           std::string dst = RISCVRegMap::physicalRegName(it->second);
           insns.push_back("\taddi " + dst + ", " + src + ", 0");
         } else {
-          storeCurrentValue(c->dest, src, insns);
+          storeCurrentValue(c->dest, src, insns, {src});
         }
         break;
       }
@@ -1650,9 +1966,16 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       }
       case InstKind::Branch: {
         auto* br = static_cast<const BranchInst*>(inst.get());
-        std::string cond = loadOperand(br->cond, scratchIdx, insns);
-        insns.push_back("\tbne " + cond + ", x0, " +
-                        mangleLabel(br->trueLabel));
+        if (isFloatValueType(br->cond.valueType)) {
+          std::string condF = loadFloatOperand(br->cond, "ft0", insns);
+          insns.push_back("\tfmv.w.x ft1, x0");
+          insns.push_back("\tfeq.s t0, " + condF + ", ft1");
+          insns.push_back("\tbeq t0, x0, " + mangleLabel(br->trueLabel));
+        } else {
+          std::string cond = loadOperand(br->cond, scratchIdx, insns);
+          insns.push_back("\tbne " + cond + ", x0, " +
+                          mangleLabel(br->trueLabel));
+        }
         insns.push_back("\tjal x0, " + mangleLabel(br->falseLabel));
         break;
       }
@@ -1679,18 +2002,29 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           }
         }
 
+        int outgoingIntRegCount = 0;
+        int outgoingFloatRegCount = 0;
+        int outgoingStackCount = 0;
         for (size_t ai = 0; ai < c->args.size(); ++ai) {
+          ValueType argType = ai < c->argTypes.size() ? c->argTypes[ai] : ValueType::I32;
+          ArgLocation loc = classifyArgLocation(argType, outgoingIntRegCount,
+                                                outgoingFloatRegCount, outgoingStackCount);
+          if (loc.useFloatReg) {
+            loadFloatOperand(c->args[ai], "fa" + std::to_string(loc.regIndex), insns);
+            continue;
+          }
+
           std::vector<std::string> reservedRegs;
-          if (ai < 8) reservedRegs.push_back("a" + std::to_string(ai));
+          if (loc.useIntReg) reservedRegs.push_back("a" + std::to_string(loc.regIndex));
           std::string argReg =
               loadOperand(c->args[ai], scratchIdx, insns, reservedRegs);
-          if (ai < 8) {
-            std::string target = "a" + std::to_string(ai);
+          if (loc.useIntReg) {
+            std::string target = "a" + std::to_string(loc.regIndex);
             if (argReg != target) {
               insns.push_back("\taddi " + target + ", " + argReg + ", 0");
             }
           } else {
-            int offset = frame.outgoingArgOffset + static_cast<int>((ai - 8) * 4);
+            int offset = frame.outgoingArgOffset + loc.stackIndex * 4;
             storeWithScratch(argReg, offset, insns);
           }
         }
@@ -1708,12 +2042,24 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
         }
 
         if (c->hasDest) {
-          auto it = allocation.find(c->dest);
-          if (it != allocation.end()) {
-            std::string dst = RISCVRegMap::physicalRegName(it->second);
-            insns.push_back("\taddi " + dst + ", a0, 0");
+          if (isFloatValueType(c->resultType)) {
+            auto it = allocation.find(c->dest);
+            if (it != allocation.end()) {
+              std::string dst = RISCVRegMap::physicalRegName(it->second);
+              insns.push_back("\tfmv.x.w " + dst + ", fa0");
+            } else {
+              std::string tmp = chooseScratch({});
+              insns.push_back("\tfmv.x.w " + tmp + ", fa0");
+              storeCurrentValue(c->dest, tmp, insns, {tmp});
+            }
           } else {
-            storeCurrentValue(c->dest, "a0", insns, {"a0"});
+            auto it = allocation.find(c->dest);
+            if (it != allocation.end()) {
+              std::string dst = RISCVRegMap::physicalRegName(it->second);
+              insns.push_back("\taddi " + dst + ", a0, 0");
+            } else {
+              storeCurrentValue(c->dest, "a0", insns, {"a0"});
+            }
           }
         }
 
@@ -1722,9 +2068,13 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       case InstKind::Return: {
         auto* r = static_cast<const ReturnInst*>(inst.get());
         if (r->hasValue) {
-          std::string valReg = loadOperand(r->value, scratchIdx, insns);
-          if (valReg != "a0") {
-            insns.push_back("\taddi a0, " + valReg + ", 0");
+          if (isFloatValueType(r->valueType)) {
+            loadFloatOperand(r->value, "fa0", insns);
+          } else {
+            std::string valReg = loadOperand(r->value, scratchIdx, insns);
+            if (valReg != "a0") {
+              insns.push_back("\taddi a0, " + valReg + ", 0");
+            }
           }
         }
         for (const auto& line : insns) {
@@ -1764,7 +2114,11 @@ std::vector<std::string> CodeGen::generate(const IRProgram& program) {
     for (const auto& glob : program.globals) {
       out.push_back(".globl " + glob.name);
       out.push_back(glob.name + ":");
-      out.push_back("\t.word " + std::to_string(glob.initialValue));
+      if (glob.valueType == ValueType::F32) {
+        out.push_back("\t.word " + std::to_string(floatBits(glob.typedInitialValue.floatValue)));
+      } else {
+        out.push_back("\t.word " + std::to_string(glob.initialValue));
+      }
       out.push_back("");
     }
   }
@@ -1778,25 +2132,6 @@ std::vector<std::string> CodeGen::generate(const IRProgram& program) {
     LivenessResult liveness = AnalyzeLiveness(fn);
     RegAllocResult allocResult = allocator.allocate(fn, liveness);
     StackFrame frame = computeStackFrame(fn, allocResult, liveness);
-    if (fn.name == "func") {
-      fprintf(stderr, "[cg-frame] frameSize=%d spillAreaOffset=%d spillAreaSize=%d maxOutgoingArgs=%d\n",
-              frame.frameSize, frame.spillAreaOffset, frame.spillAreaSize,
-              frame.maxOutgoingArgs);
-      for (int vreg : {209, 617, 628, 633, 644, 1609, 1620}) {
-        auto paramIt = frame.paramSlots.find(vreg);
-        if (paramIt != frame.paramSlots.end()) {
-          fprintf(stderr, "[cg-frame] param v%d stable=%d\n", vreg, paramIt->second);
-        }
-        auto valueIt = frame.paramValueSlots.find(vreg);
-        if (valueIt != frame.paramValueSlots.end()) {
-          fprintf(stderr, "[cg-frame] param v%d current=%d\n", vreg, valueIt->second);
-        }
-        auto spillIt = frame.spillSlots.find(vreg);
-        if (spillIt != frame.spillSlots.end()) {
-          fprintf(stderr, "[cg-frame] spill v%d slot=%d\n", vreg, spillIt->second);
-        }
-      }
-    }
 
     emitPrologue(fn, frame, out);
     emitFunctionBody(fn, allocResult.allocation, frame, liveness, out);

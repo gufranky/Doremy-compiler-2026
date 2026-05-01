@@ -144,12 +144,15 @@ def resolve_runtime_files(repo_root: Path, explicit: list[str]) -> list[Path]:
             raise FileNotFoundError(f"运行时文件不存在: {', '.join(missing)}")
         return files
 
-    found: list[Path] = []
-    for candidate in DEFAULT_RUNTIME_CANDIDATES:
-        path = repo_root / candidate
-        if path.exists():
-            found.append(path)
-    return found
+    archive = repo_root / "libsysy_riscv.a"
+    if archive.exists():
+        return [archive]
+
+    source = repo_root / "sylib.c"
+    if source.exists():
+        return [source]
+
+    return []
 
 
 def build_toolchain(args: argparse.Namespace, config: RunnerConfig) -> Toolchain:
