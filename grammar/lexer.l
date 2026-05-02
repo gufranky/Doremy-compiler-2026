@@ -81,6 +81,8 @@ WHITESPACE  [ \t\r\n]+
 ")"             { return RPAREN; }
 "{"             { return LBRACE; }
 "}"             { return RBRACE; }
+"["             { return LBRACKET; }
+"]"             { return RBRACKET; }
 ";"             { return SEMICOLON; }
 ","             { return COMMA; }
 

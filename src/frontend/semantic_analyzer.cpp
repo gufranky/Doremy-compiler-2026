@@ -10,6 +10,20 @@ void SemanticAnalyzer::declareBuiltinFunctions() {
   symbolTable.declareFunction("putint", Type::Void(), {Type::Int()});
   symbolTable.declareFunction("putch", Type::Void(), {Type::Int()});
   symbolTable.declareFunction("putfloat", Type::Void(), {Type::Float()});
+
+  // 数组相关内置函数
+  Type intArrayParam = Type::Int();
+  intArrayParam.isArray = true;
+  intArrayParam.firstDimUnsized = true;
+
+  Type floatArrayParam = Type::Float();
+  floatArrayParam.isArray = true;
+  floatArrayParam.firstDimUnsized = true;
+
+  symbolTable.declareFunction("getarray", Type::Int(), {intArrayParam});
+  symbolTable.declareFunction("getfarray", Type::Int(), {floatArrayParam});
+  symbolTable.declareFunction("putarray", Type::Void(), {Type::Int(), intArrayParam});
+  symbolTable.declareFunction("putfarray", Type::Void(), {Type::Int(), floatArrayParam});
 }
 
 bool SemanticAnalyzer::isIntType(const Type& type) const {
@@ -24,10 +38,34 @@ bool SemanticAnalyzer::isNumericType(const Type& type) const {
   return (isIntType(type) || isFloatType(type));
 }
 
+// 检查是否为数值类型或数值数组
+bool SemanticAnalyzer::isNumericOrArrayBase(const Type& type) const {
+  return type.base == BaseType::INT || type.base == BaseType::FLOAT;
+}
+
 bool SemanticAnalyzer::canImplicitlyConvert(const Type& from,
                                             const Type& to) const {
+  // 数组类型：需要类型匹配（int[] 匹配 int[]，float[] 匹配 float[]）
+  // 维度不需要完全匹配（因为数组参数会退化为指针）
+  if (from.isArray && to.isArray) {
+    return from.base == to.base;
+  }
+  // 标量类型：可以隐式转换
   if (!isNumericType(from) || !isNumericType(to)) return false;
   return true;
+}
+
+// 检查参数类型是否兼容（用于函数调用）
+bool SemanticAnalyzer::isParamCompatible(const Type& argType, const Type& paramType) const {
+  // 如果参数是数组类型
+  if (paramType.isArray) {
+    // 实参也必须是数组类型，且基础类型相同
+    if (!argType.isArray) return false;
+    return argType.base == paramType.base;
+  }
+  // 参数是标量类型
+  if (argType.isArray) return false;  // 不能把数组传给标量参数
+  return isNumericType(argType) && isNumericType(paramType);
 }
 
 ScalarValue SemanticAnalyzer::castConstValue(const ScalarValue& value,
@@ -166,7 +204,10 @@ void SemanticAnalyzer::visit(IdentifierExpr* node) {
     setExprResult(Type::Invalid());
     return;
   }
-  setExprResult(sym->type.withoutConst(), sym->hasConstValue, sym->typedConstValue);
+
+  // 如果是数组类型，保持数组信息
+  Type resultType = sym->type.withoutConst();
+  setExprResult(resultType, sym->hasConstValue, sym->typedConstValue);
 }
 
 void SemanticAnalyzer::visit(ParenExpr* node) { node->expr->accept(this); }
@@ -189,13 +230,20 @@ void SemanticAnalyzer::visit(FunctionCallExpr* node) {
 
   for (size_t i = 0; i < node->args.size(); ++i) {
     node->args[i]->accept(this);
-    if (!isNumericType(lastExprType)) {
-      addError("Function argument must be int or float expression");
-      continue;
-    }
-    if (i < func->paramTypes.size() &&
-        !canImplicitlyConvert(lastExprType, func->paramTypes[i])) {
-      addError("Function argument type mismatch in call to '" + node->funcName + "'");
+    // 检查参数类型是否兼容
+    if (i < func->paramTypes.size()) {
+      if (!isParamCompatible(lastExprType, func->paramTypes[i])) {
+        if (lastExprType.isArray && !func->paramTypes[i].isArray) {
+          addError("Cannot pass array to scalar parameter");
+        } else if (!lastExprType.isArray && func->paramTypes[i].isArray) {
+          addError("Cannot pass scalar to array parameter");
+        } else if (lastExprType.isArray && func->paramTypes[i].isArray &&
+                   lastExprType.base != func->paramTypes[i].base) {
+          addError("Array element type mismatch in function call");
+        } else if (!isNumericType(lastExprType) && !lastExprType.isArray) {
+          addError("Function argument must be int, float, or array");
+        }
+      }
     }
   }
 
@@ -358,21 +406,29 @@ void SemanticAnalyzer::visit(ExprStmt* node) {
 }
 
 void SemanticAnalyzer::visit(AssignStmt* node) {
-  Symbol* sym = symbolTable.lookupValue(node->varName);
-  if (!sym) {
-    addError("Variable '" + node->varName + "' used before declaration");
-  } else if (sym->kind == SymbolKind::CONSTANT) {
-    addError("Cannot assign to const variable '" + node->varName + "'");
-  }
+  LValueInfo lvalInfo = analyzeLValue(node->lvalue.get());
 
-  node->value->accept(this);
-  if (!sym) {
+  if (!lvalInfo.isValid) {
+    // 错误已在 analyzeLValue 中报告
+    node->value->accept(this);
     hasReturn = false;
     return;
   }
-  if (!isNumericType(lastExprType) || !canImplicitlyConvert(lastExprType, sym->type)) {
-    addError("Assigned value type mismatch for '" + node->varName + "'");
+
+  if (lvalInfo.isConst) {
+    addError("Cannot assign to const variable '" + lvalInfo.name + "'");
   }
+
+  node->value->accept(this);
+
+  // 检查赋值类型兼容性
+  Type targetType = lvalInfo.type;
+  if (!isNumericType(lastExprType)) {
+    addError("Assigned value must be int or float expression");
+  } else if (!canImplicitlyConvert(lastExprType, targetType)) {
+    addError("Assigned value type mismatch for '" + lvalInfo.name + "'");
+  }
+
   hasReturn = false;
 }
 
@@ -381,23 +437,50 @@ void SemanticAnalyzer::visitDeclDefs(VarDeclStmt* node) {
     VarDef* def = defPtr.get();
     bool initIsConst = false;
     ScalarValue constValue = ScalarValue::Int(0);
+    std::vector<ScalarValue> constArrayValues;
 
-    if (node->declaredType.isConst && !def->hasInit) {
+    // 处理数组维度
+    Type varType = node->declaredType;
+    if (def->isArray) {
+      if (!validateArrayDimensions(def)) {
+        continue;
+      }
+      varType.isArray = true;
+      varType.arrayDimensions = def->arrayDimensions;
+    }
+
+    if (varType.isConst && !def->hasInit) {
       addError("Const variable '" + def->name + "' must be initialized");
     }
 
     if (def->hasInit) {
-      def->initExpr->accept(this);
-      if (!isNumericType(lastExprType)) {
-        addError("Initializer for '" + def->name + "' must be int or float expression");
-      } else if (!canImplicitlyConvert(lastExprType, node->declaredType)) {
-        addError("Initializer type mismatch for '" + def->name + "'");
+      if (def->hasInitList) {
+        // 数组初始化列表
+        if (!varType.isArray) {
+          addError("Init list can only be used for array initialization for '" + def->name + "'");
+        } else {
+          if (validateInitList(def->initList.get(), varType, &constArrayValues)) {
+            initIsConst = true;
+            // 存储扁平化的初始化值
+            def->typedConstInitValue = constArrayValues.empty() ?
+                ScalarValue::Int(0) : constArrayValues[0];
+          }
+        }
+      } else if (def->initExpr) {
+        // 标量初始化
+        def->initExpr->accept(this);
+        if (!isNumericType(lastExprType)) {
+          addError("Initializer for '" + def->name + "' must be int or float expression");
+        } else if (!canImplicitlyConvert(lastExprType, varType)) {
+          addError("Initializer type mismatch for '" + def->name + "'");
+        }
+        initIsConst = evalConstExpr(def->initExpr.get(), &constValue);
+        if (initIsConst) {
+          constValue = castConstValue(constValue, varType);
+        }
       }
-      initIsConst = evalConstExpr(def->initExpr.get(), &constValue);
-      if (initIsConst) {
-        constValue = castConstValue(constValue, node->declaredType);
-      }
-      if (node->declaredType.isConst && !initIsConst) {
+
+      if (varType.isConst && !initIsConst) {
         addError("Const variable '" + def->name + "' must use a constant expression initializer");
       }
       if (symbolTable.isGlobalScope() && !initIsConst) {
@@ -405,17 +488,19 @@ void SemanticAnalyzer::visitDeclDefs(VarDeclStmt* node) {
       }
     }
 
-    if (!symbolTable.declareValue(def->name, node->declaredType, false,
-                                  node->declaredType.isConst && initIsConst,
+    if (!symbolTable.declareValue(def->name, varType, false,
+                                  varType.isConst && initIsConst,
                                   constValue)) {
       addError("Identifier '" + def->name + "' already declared in this scope");
       continue;
     }
 
     def->initIsConst = initIsConst;
-    def->typedConstInitValue = constValue;
-    if (constValue.isInt()) def->constInitValue = constValue.intValue;
-    else def->constInitValue = static_cast<int>(constValue.floatValue);
+    if (!def->hasInitList) {
+      def->typedConstInitValue = constValue;
+      if (constValue.isInt()) def->constInitValue = constValue.intValue;
+      else def->constInitValue = static_cast<int>(constValue.floatValue);
+    }
   }
 }
 
@@ -538,6 +623,231 @@ void SemanticAnalyzer::visit(CompUnit* node) {
         continue;
       }
       func->accept(this);
+    }
+  }
+}
+
+// ==================== 数组相关实现 ====================
+
+void SemanticAnalyzer::visit(ArrayAccessExpr* node) {
+  // 递归分析数组部分
+  node->array->accept(this);
+  Type arrayType = lastExprType;
+
+  if (!arrayType.isArray) {
+    addError("Array subscript requires array type");
+    setExprResult(Type::Invalid());
+    return;
+  }
+
+  // 检查索引类型
+  node->index->accept(this);
+  if (!isIntType(lastExprType)) {
+    addError("Array index must be integer");
+  }
+
+  // 计算结果类型（减少一个维度）
+  Type resultType;
+  resultType.base = arrayType.base;
+  resultType.isConst = arrayType.isConst;
+
+  if (arrayType.arrayDimensions.size() > 1) {
+    resultType.isArray = true;
+    resultType.arrayDimensions = std::vector<int>(
+        arrayType.arrayDimensions.begin() + 1, arrayType.arrayDimensions.end());
+    resultType.firstDimUnsized = false;
+  } else {
+    resultType.isArray = false;
+  }
+
+  setExprResult(resultType, false, ScalarValue::Int(0));
+}
+
+void SemanticAnalyzer::visit(InitList* node) {
+  // InitList 本身不设置表达式结果，由父节点处理
+  // 这里只是遍历元素
+  for (auto& elem : node->elements) {
+    if (auto* expr = dynamic_cast<Expr*>(elem.get())) {
+      expr->accept(this);
+    } else if (auto* subList = dynamic_cast<InitList*>(elem.get())) {
+      subList->accept(this);
+    }
+  }
+}
+
+LValueInfo SemanticAnalyzer::analyzeLValue(Expr* expr) {
+  LValueInfo info;
+
+  if (auto* id = dynamic_cast<IdentifierExpr*>(expr)) {
+    info.name = id->name;
+    info.symbol = symbolTable.lookupValue(id->name);
+
+    if (!info.symbol) {
+      addError("Variable '" + id->name + "' used before declaration");
+      return info;
+    }
+
+    info.type = info.symbol->type;
+    info.isValid = true;
+    info.isConst = (info.symbol->kind == SymbolKind::CONSTANT);
+    return info;
+  }
+
+  if (auto* arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
+    LValueInfo baseInfo = analyzeLValue(arr->array.get());
+
+    if (!baseInfo.isValid) {
+      return info;
+    }
+
+    if (!baseInfo.type.isArray) {
+      addError("Array subscript requires array type");
+      return info;
+    }
+
+    // 检查索引类型
+    arr->index->accept(this);
+    if (!isIntType(lastExprType)) {
+      addError("Array index must be integer");
+    }
+
+    info.name = baseInfo.name;
+    info.symbol = baseInfo.symbol;
+
+    // 减少一个维度
+    Type resultType;
+    resultType.base = baseInfo.type.base;
+    resultType.isConst = baseInfo.type.isConst;
+
+    if (baseInfo.type.arrayDimensions.size() > 1) {
+      resultType.isArray = true;
+      resultType.arrayDimensions = std::vector<int>(
+          baseInfo.type.arrayDimensions.begin() + 1,
+          baseInfo.type.arrayDimensions.end());
+    } else {
+      resultType.isArray = false;
+    }
+
+    info.type = resultType;
+    info.isValid = true;
+    info.isConst = baseInfo.isConst;
+    info.indices = baseInfo.indices;
+    info.indices.push_back(arr->index.get());
+
+    return info;
+  }
+
+  addError("Invalid left-value expression");
+  return info;
+}
+
+bool SemanticAnalyzer::validateArrayDimensions(VarDef* def) {
+  if (!def->isArray) return true;
+
+  def->arrayDimensions.clear();
+
+  for (auto& dimExpr : def->arrayDimExprs) {
+    ScalarValue dimValue;
+    if (!evalConstExpr(dimExpr.get(), &dimValue)) {
+      addError("Array dimension must be constant expression for '" + def->name + "'");
+      return false;
+    }
+
+    int dim = dimValue.isFloat() ? static_cast<int>(dimValue.floatValue) : dimValue.intValue;
+    if (dim < 0) {
+      addError("Array dimension must be non-negative for '" + def->name + "'");
+      return false;
+    }
+
+    def->arrayDimensions.push_back(dim);
+  }
+
+  return true;
+}
+
+bool SemanticAnalyzer::validateInitList(InitList* initList, const Type& arrayType,
+                                        std::vector<ScalarValue>* flattenedValues) {
+  if (!arrayType.isArray) {
+    addError("Init list can only be used for array initialization");
+    return false;
+  }
+
+  int totalSize = 1;
+  for (int dim : arrayType.arrayDimensions) {
+    totalSize *= dim;
+  }
+
+  flattenedValues->clear();
+  flattenedValues->reserve(totalSize);
+
+  int index = 0;
+  flattenInitList(initList, arrayType, *flattenedValues, index, totalSize);
+
+  // 填充剩余元素为 0
+  Type elemType;
+  elemType.base = arrayType.base;
+  while (flattenedValues->size() < static_cast<size_t>(totalSize)) {
+    if (elemType.base == BaseType::FLOAT) {
+      flattenedValues->push_back(ScalarValue::Float(0.0f));
+    } else {
+      flattenedValues->push_back(ScalarValue::Int(0));
+    }
+  }
+
+  return true;
+}
+
+void SemanticAnalyzer::flattenInitList(InitList* initList, const Type& elemType,
+                                       std::vector<ScalarValue>& result, int& index, int totalSize) {
+  if (index >= totalSize) return;
+
+  if (initList->isScalar) {
+    // 单个表达式
+    if (!initList->elements.empty()) {
+      if (auto* expr = dynamic_cast<Expr*>(initList->elements[0].get())) {
+        expr->accept(this);
+        ScalarValue value;
+        if (evalConstExpr(expr, &value)) {
+          // 类型转换
+          if (elemType.base == BaseType::FLOAT && !value.isFloat()) {
+            value = ScalarValue::Float(static_cast<float>(value.intValue));
+          } else if (elemType.base == BaseType::INT && value.isFloat()) {
+            value = ScalarValue::Int(static_cast<int>(value.floatValue));
+          }
+          result.push_back(value);
+          index++;
+        } else {
+          // 非常量初始化，暂时填 0
+          result.push_back(elemType.base == BaseType::FLOAT ?
+                          ScalarValue::Float(0.0f) : ScalarValue::Int(0));
+          index++;
+        }
+      }
+    }
+    return;
+  }
+
+  // 列表形式
+  for (auto& elem : initList->elements) {
+    if (index >= totalSize) break;
+
+    if (auto* subList = dynamic_cast<InitList*>(elem.get())) {
+      flattenInitList(subList, elemType, result, index, totalSize);
+    } else if (auto* expr = dynamic_cast<Expr*>(elem.get())) {
+      ScalarValue value;
+      if (evalConstExpr(expr, &value)) {
+        if (elemType.base == BaseType::FLOAT && !value.isFloat()) {
+          value = ScalarValue::Float(static_cast<float>(value.intValue));
+        } else if (elemType.base == BaseType::INT && value.isFloat()) {
+          value = ScalarValue::Int(static_cast<int>(value.floatValue));
+        }
+        result.push_back(value);
+        index++;
+      } else {
+        result.push_back(elemType.base == BaseType::FLOAT ?
+                        ScalarValue::Float(0.0f) : ScalarValue::Int(0));
+        index++;
+      }
     }
   }
 }

@@ -15,18 +15,37 @@ extern CompUnit* root;
 
 int main(int argc, char** argv) {
   bool enableOpt = false;
+  std::string inputFile;
+
   for (int i = 1; i < argc; ++i) {
     std::string arg(argv[i]);
-    if (arg == "-opt") enableOpt = true;
+    if (arg == "-opt") {
+      enableOpt = true;
+    } else if (arg[0] != '-') {
+      inputFile = arg;
+    }
   }
 
-  // Read from stdin by default
-  yyin = stdin;
+  // Read from stdin by default, or from file if specified
+  if (!inputFile.empty()) {
+    yyin = fopen(inputFile.c_str(), "r");
+    if (!yyin) {
+      std::cerr << "Error: Cannot open file " << inputFile << "\n";
+      return 1;
+    }
+  } else {
+    yyin = stdin;
+  }
 
   // Parse the input
   if (yyparse() != 0) {
     std::cerr << "Parsing failed!\n";
+    if (yyin != stdin) fclose(yyin);
     return 1;
+  }
+
+  if (yyin != stdin) {
+    fclose(yyin);
   }
 
   if (!root) {

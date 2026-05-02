@@ -50,4 +50,24 @@ Operand Operand::Global(std::string name, ValueType type) {
   return op;
 }
 
+Operand Operand::StackPtr() {
+  Operand op;
+  op.kind = Kind::StackPointer;
+  op.valueType = ValueType::I32;
+  op.immValue = 0;
+  op.immFloatValue = 0.0f;
+  op.vregId = -1;
+  return op;
+}
+
+Operand Operand::LocalVarAddr(int offset) {
+  Operand op;
+  op.kind = Kind::LocalVarAddress;
+  op.valueType = ValueType::I32;
+  op.immValue = offset;
+  op.immFloatValue = 0.0f;
+  op.vregId = -1;
+  return op;
+}
+
 }  // namespace ir

@@ -1035,6 +1035,9 @@ std::string CodeGen::renderOperandWithAlloc(
     }
     return "%v" + std::to_string(op.vregId);
   }
+  if (op.isStackPtr()) {
+    return "sp";
+  }
   return op.globalName;
 }
 
@@ -1314,6 +1317,9 @@ CodeGen::StackFrame CodeGen::computeStackFrame(
   offset += static_cast<int>(frame.savedRegs.size()) * 4;
 
   frame.localVarOffset = offset;
+
+  // 为局部数组分配额外的栈空间
+  offset += fn.localArraySize;
 
   frame.frameSize = ((offset + 15) / 16) * 16;
 
@@ -1624,6 +1630,16 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
         emitStackLoad(targetReg, spillIt->second, insns, addrReg);
         return targetReg;
       }
+      return targetReg;
+    }
+    if (op.isStackPtr()) {
+      insns.push_back("\taddi " + targetReg + ", sp, 0");
+      return targetReg;
+    }
+    if (op.isLocalVarAddr()) {
+      // 局部数组地址：sp + localVarOffset + offset
+      int totalOffset = frame.localVarOffset + op.immValue;
+      emitStackAddress(targetReg, "sp", totalOffset, insns);
       return targetReg;
     }
     insns.push_back("\tla " + targetReg + ", " + op.globalName);
@@ -2108,7 +2124,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
 std::vector<std::string> CodeGen::generate(const IRProgram& program) {
   std::vector<std::string> out;
 
-  if (!program.globals.empty()) {
+  if (!program.globals.empty() || !program.globalArrays.empty()) {
     out.push_back(".data");
     out.push_back("");
     for (const auto& glob : program.globals) {
@@ -2118,6 +2134,33 @@ std::vector<std::string> CodeGen::generate(const IRProgram& program) {
         out.push_back("\t.word " + std::to_string(floatBits(glob.typedInitialValue.floatValue)));
       } else {
         out.push_back("\t.word " + std::to_string(glob.initialValue));
+      }
+      out.push_back("");
+    }
+    // 输出全局数组
+    for (const auto& arr : program.globalArrays) {
+      out.push_back(".globl " + arr.name);
+      out.push_back(arr.name + ":");
+      int totalSize = 1;
+      for (int dim : arr.dimensions) {
+        totalSize *= dim;
+      }
+      if (arr.initialValues.empty()) {
+        // 零初始化
+        out.push_back("\t.zero " + std::to_string(totalSize * 4));
+      } else {
+        // 逐元素输出
+        for (const auto& val : arr.initialValues) {
+          if (arr.elementType == ValueType::F32) {
+            out.push_back("\t.word " + std::to_string(floatBits(val.floatValue)));
+          } else {
+            out.push_back("\t.word " + std::to_string(val.intValue));
+          }
+        }
+        // 如果初始化值不够，补零
+        for (size_t i = arr.initialValues.size(); i < static_cast<size_t>(totalSize); ++i) {
+          out.push_back("\t.word 0");
+        }
       }
       out.push_back("");
     }

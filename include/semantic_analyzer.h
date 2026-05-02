@@ -7,6 +7,19 @@
 #include "ast.h"
 #include "symbol_table.h"
 
+// 前向声明
+class SemanticAnalyzer;
+
+// 辅助结构：左值分析结果
+struct LValueInfo {
+  std::string name;           // 变量名
+  Symbol* symbol = nullptr;   // 符号信息
+  Type type;                  // 类型（已减少维度）
+  bool isValid = false;       // 是否有效
+  bool isConst = false;       // 是否常量
+  std::vector<Expr*> indices; // 索引表达式列表
+};
+
 class SemanticAnalyzer : public ASTVisitor {
  private:
   SymbolTable symbolTable;
@@ -24,7 +37,9 @@ class SemanticAnalyzer : public ASTVisitor {
   bool isIntType(const Type& type) const;
   bool isFloatType(const Type& type) const;
   bool isNumericType(const Type& type) const;
+  bool isNumericOrArrayBase(const Type& type) const;
   bool canImplicitlyConvert(const Type& from, const Type& to) const;
+  bool isParamCompatible(const Type& argType, const Type& paramType) const;
   ScalarValue castConstValue(const ScalarValue& value, const Type& targetType) const;
   bool isTruthy(const ScalarValue& value) const;
   Type commonNumericType(const Type& lhs, const Type& rhs) const;
@@ -32,6 +47,14 @@ class SemanticAnalyzer : public ASTVisitor {
                      ScalarValue constValue = ScalarValue::Int(0));
   bool evalConstExpr(Expr* expr, ScalarValue* value);
   void visitDeclDefs(VarDeclStmt* node);
+
+  // 数组相关辅助方法
+  LValueInfo analyzeLValue(Expr* expr);
+  bool validateArrayDimensions(VarDef* def);
+  bool validateInitList(InitList* initList, const Type& arrayType,
+                        std::vector<ScalarValue>* flattenedValues);
+  void flattenInitList(InitList* initList, const Type& elemType,
+                       std::vector<ScalarValue>& result, int& index, int totalSize);
 
  public:
   SemanticAnalyzer() = default;
@@ -62,6 +85,8 @@ class SemanticAnalyzer : public ASTVisitor {
   void visit(FunctionCallExpr* node) override;
   void visit(UnaryExpr* node) override;
   void visit(BinaryExpr* node) override;
+  void visit(ArrayAccessExpr* node) override;
+  void visit(InitList* node) override;
 
   void visit(Block* node) override;
   void visit(EmptyStmt* node) override;
