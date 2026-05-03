@@ -785,7 +785,7 @@ std::vector<std::string> optimizeUnusedLabels(const std::vector<std::string>& li
       lab = t.substr(0, t.size() - 1);
       
       // Keep function labels and referenced labels
-      bool isAuto = (!lab.empty() && lab[0] == 'L') || 
+      bool isAuto = (!lab.empty() && lab[0] == 'L' && lab.size() > 1 && std::isdigit(lab[1])) ||
                     (lab.find("_B") != std::string::npos) ||
                     (lab.find("_while") != std::string::npos) ||
                     (lab.find("_if") != std::string::npos);
