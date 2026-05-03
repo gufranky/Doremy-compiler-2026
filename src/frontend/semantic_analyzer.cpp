@@ -589,6 +589,16 @@ void SemanticAnalyzer::visit(FuncDef* node) {
   symbolTable.enterScope();
 
   for (auto& param : node->params) {
+    // Evaluate array dimension expressions for array parameters (if not already done)
+    if (param->type.isArray && param->type.arrayDimensions.empty()) {
+      for (auto& dimExpr : param->arrayDimExprs) {
+        ScalarValue dimValue;
+        if (evalConstExpr(dimExpr.get(), &dimValue)) {
+          int dim = dimValue.isFloat() ? static_cast<int>(dimValue.floatValue) : dimValue.intValue;
+          param->type.arrayDimensions.push_back(dim);
+        }
+      }
+    }
     if (!symbolTable.declareValue(param->name, param->type, true, false,
                                   ScalarValue::Int(0))) {
       addError("Parameter '" + param->name + "' already declared");
@@ -614,6 +624,18 @@ void SemanticAnalyzer::visit(CompUnit* node) {
       continue;
     }
     if (auto* func = dynamic_cast<FuncDef*>(item.get())) {
+      // Evaluate array dimension expressions for parameters before collecting types
+      for (auto& param : func->params) {
+        if (param->type.isArray && param->type.arrayDimensions.empty()) {
+          for (auto& dimExpr : param->arrayDimExprs) {
+            ScalarValue dimValue;
+            if (evalConstExpr(dimExpr.get(), &dimValue)) {
+              int dim = dimValue.isFloat() ? static_cast<int>(dimValue.floatValue) : dimValue.intValue;
+              param->type.arrayDimensions.push_back(dim);
+            }
+          }
+        }
+      }
       std::vector<Type> paramTypes;
       for (auto& param : func->params) {
         paramTypes.push_back(param->type);
@@ -651,10 +673,21 @@ void SemanticAnalyzer::visit(ArrayAccessExpr* node) {
   resultType.base = arrayType.base;
   resultType.isConst = arrayType.isConst;
 
-  if (arrayType.arrayDimensions.size() > 1) {
+  // Total dimensions = arrayDimensions.size() + (firstDimUnsized ? 1 : 0)
+  // After indexing, remaining = total - 1
+  int totalDims = static_cast<int>(arrayType.arrayDimensions.size()) + (arrayType.firstDimUnsized ? 1 : 0);
+  int remaining = totalDims - 1;
+
+  if (remaining > 0) {
     resultType.isArray = true;
-    resultType.arrayDimensions = std::vector<int>(
-        arrayType.arrayDimensions.begin() + 1, arrayType.arrayDimensions.end());
+    if (arrayType.firstDimUnsized) {
+      // Consumed the unsized dim; explicit dims remain as-is
+      resultType.arrayDimensions = arrayType.arrayDimensions;
+    } else {
+      // Drop the first explicit dimension
+      resultType.arrayDimensions = std::vector<int>(
+          arrayType.arrayDimensions.begin() + 1, arrayType.arrayDimensions.end());
+    }
     resultType.firstDimUnsized = false;
   } else {
     resultType.isArray = false;
@@ -719,13 +752,22 @@ LValueInfo SemanticAnalyzer::analyzeLValue(Expr* expr) {
     resultType.base = baseInfo.type.base;
     resultType.isConst = baseInfo.type.isConst;
 
-    if (baseInfo.type.arrayDimensions.size() > 1) {
-      resultType.isArray = true;
-      resultType.arrayDimensions = std::vector<int>(
-          baseInfo.type.arrayDimensions.begin() + 1,
-          baseInfo.type.arrayDimensions.end());
-    } else {
-      resultType.isArray = false;
+    {
+      int totalDims = static_cast<int>(baseInfo.type.arrayDimensions.size()) + (baseInfo.type.firstDimUnsized ? 1 : 0);
+      int remaining = totalDims - 1;
+      if (remaining > 0) {
+        resultType.isArray = true;
+        if (baseInfo.type.firstDimUnsized) {
+          resultType.arrayDimensions = baseInfo.type.arrayDimensions;
+        } else {
+          resultType.arrayDimensions = std::vector<int>(
+              baseInfo.type.arrayDimensions.begin() + 1,
+              baseInfo.type.arrayDimensions.end());
+        }
+        resultType.firstDimUnsized = false;
+      } else {
+        resultType.isArray = false;
+      }
     }
 
     info.type = resultType;

@@ -962,7 +962,12 @@ IRGenerator::ExprResult IRGenerator::genLValueExpr(Expr* expr) {
     // 计算偏移量
     // offset = index * (元素大小 * 后续维度的乘积)
     int elementCount = 1;
-    if (baseResult.type.arrayDimensions.size() > 1) {
+    if (baseResult.type.firstDimUnsized) {
+      // firstDimUnsized: all explicit dims are "after" the consumed unsized dim
+      for (int dim : baseResult.type.arrayDimensions) {
+        elementCount *= dim;
+      }
+    } else if (baseResult.type.arrayDimensions.size() > 1) {
       for (size_t i = 1; i < baseResult.type.arrayDimensions.size(); ++i) {
         elementCount *= baseResult.type.arrayDimensions[i];
       }
@@ -1000,13 +1005,22 @@ IRGenerator::ExprResult IRGenerator::genLValueExpr(Expr* expr) {
     resultType.base = baseResult.type.base;
     resultType.isConst = baseResult.type.isConst;
 
-    if (baseResult.type.arrayDimensions.size() > 1) {
-      resultType.isArray = true;
-      resultType.arrayDimensions = std::vector<int>(
-          baseResult.type.arrayDimensions.begin() + 1,
-          baseResult.type.arrayDimensions.end());
-    } else {
-      resultType.isArray = false;
+    {
+      int totalDims = static_cast<int>(baseResult.type.arrayDimensions.size()) + (baseResult.type.firstDimUnsized ? 1 : 0);
+      int remaining = totalDims - 1;
+      if (remaining > 0) {
+        resultType.isArray = true;
+        if (baseResult.type.firstDimUnsized) {
+          resultType.arrayDimensions = baseResult.type.arrayDimensions;
+        } else {
+          resultType.arrayDimensions = std::vector<int>(
+              baseResult.type.arrayDimensions.begin() + 1,
+              baseResult.type.arrayDimensions.end());
+        }
+        resultType.firstDimUnsized = false;
+      } else {
+        resultType.isArray = false;
+      }
     }
 
     result.type = resultType;

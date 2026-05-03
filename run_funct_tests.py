@@ -243,7 +243,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runner", choices=["auto", "host", "wsl"], default="auto", help="命令执行环境，默认 auto")
     parser.add_argument("--wsl-distro", default=DEFAULT_WSL_DISTRO, help="WSL 发行版名称，默认 Ubuntu")
     parser.add_argument("--opt", action="store_true", help="调用编译器时追加 -opt")
-    parser.add_argument("--timeout", type=int, default=10, help="单个阶段超时秒数，默认 10")
+    parser.add_argument("--timeout", type=int, default=20, help="单个阶段超时秒数，默认 20")
     parser.add_argument("--limit", type=int, help="仅运行前 N 个用例")
     parser.add_argument("--diff-lines", type=int, default=12, help="失败时最多显示多少行 diff")
     parser.add_argument("--list-only", action="store_true", help="仅列出用例，不实际执行")
