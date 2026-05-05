@@ -27,6 +27,8 @@ class SemanticAnalyzer : public ASTVisitor {
   int loopDepth = 0;
   FuncDef* currentFunction = nullptr;
   bool hasReturn = false;
+  bool hasBreak = false;
+  bool hasFallthrough = false;
 
   Type lastExprType = Type::Invalid();
   bool lastExprIsConst = false;
@@ -66,6 +68,8 @@ class SemanticAnalyzer : public ASTVisitor {
     loopDepth = 0;
     currentFunction = nullptr;
     hasReturn = false;
+    hasBreak = false;
+    hasFallthrough = false;
     lastExprType = Type::Invalid();
     lastExprIsConst = false;
     lastExprConstValue = ScalarValue::Int(0);

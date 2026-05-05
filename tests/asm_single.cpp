@@ -7,12 +7,11 @@
 #include "backend_codegen.h"
 #include "ir_generator.h"
 #include "optimizer.h"
+#include "parse_driver.h"
 #include "semantic_analyzer.h"
 
 using namespace ir;
 
-extern FILE* yyin;
-extern int yyparse();
 extern CompUnit* root;
 
 int main(int argc, char** argv) {
@@ -21,13 +20,8 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::string testcase = argv[1];
-  yyin = fopen(testcase.c_str(), "r");
-  if (!yyin) {
-    std::cerr << "failed to open " << testcase << "\n";
-    return 1;
-  }
-  int parseRet = yyparse();
-  if (parseRet != 0 || !root) {
+  bool parsed = frontend::parse_from_file(testcase);
+  if (!parsed || !root) {
     std::cerr << "parse failed\n";
     return 1;
   }
@@ -41,8 +35,6 @@ int main(int argc, char** argv) {
 
   delete root;
   root = nullptr;
-  fclose(yyin);
-  yyin = nullptr;
 
   OptimizeProgram(prog);
 

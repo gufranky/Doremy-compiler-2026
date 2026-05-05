@@ -391,14 +391,12 @@ bool commonSubexpr(IRFunction& func) {
 
       auto it = table.find(key);
       if (it != table.end()) {
-        // Reuse existing value
         changed |=
             replaceWithCopy(instPtr, bin->dest, Operand::VReg(it->second));
       } else {
         table.emplace(key, bin->dest);
       }
 
-      // Defining a dest kills expressions that depended on that dest
       for (auto t = table.begin(); t != table.end();) {
         if (usesReg(t->first, bin->dest)) {
           t = table.erase(t);
@@ -800,7 +798,6 @@ bool blockGVN(IRFunction& func) {
         vnRep[vn] = op;
         return vn;
       }
-      // VReg
       auto it = regToVN.find(op.vregId);
       if (it != regToVN.end()) return it->second;
       int vn = newVN();

@@ -1899,6 +1899,33 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
             insns.push_back("\tslt " + destReg + ", " + lhs + ", " + rhs);
             insns.push_back("\txori " + destReg + ", " + destReg + ", 1");
             break;
+          case BinaryOp::Add:
+            if (b->rhs.isImm() && isInt12(b->rhs.immValue)) {
+              insns.push_back("\taddi " + destReg + ", " + lhs + ", " +
+                              std::to_string(b->rhs.immValue));
+            } else if (b->lhs.isImm() && isInt12(b->lhs.immValue)) {
+              insns.push_back("\taddi " + destReg + ", " + rhs + ", " +
+                              std::to_string(b->lhs.immValue));
+            } else {
+              insns.push_back("\tadd " + destReg + ", " + lhs + ", " + rhs);
+            }
+            break;
+          case BinaryOp::Mul:
+            if (b->rhs.isImm() && b->rhs.immValue > 0 &&
+                (b->rhs.immValue & (b->rhs.immValue - 1)) == 0) {
+              std::string shiftOp = b->operandType == ValueType::I32 ? "slliw" : "slli";
+              insns.push_back("\t" + shiftOp + " " + destReg + ", " + lhs + ", " +
+                              std::to_string(__builtin_ctz(b->rhs.immValue)));
+            } else if (b->lhs.isImm() && b->lhs.immValue > 0 &&
+                       (b->lhs.immValue & (b->lhs.immValue - 1)) == 0) {
+              std::string shiftOp = b->operandType == ValueType::I32 ? "slliw" : "slli";
+              insns.push_back("\t" + shiftOp + " " + destReg + ", " + rhs + ", " +
+                              std::to_string(__builtin_ctz(b->lhs.immValue)));
+            } else {
+              insns.push_back("\t" + binOpMnemonic(b->op, b->operandType) + " " + destReg + ", " +
+                              lhs + ", " + rhs);
+            }
+            break;
           default:
             insns.push_back("\t" + binOpMnemonic(b->op, b->operandType) + " " + destReg + ", " +
                             lhs + ", " + rhs);

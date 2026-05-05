@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <filesystem>
@@ -8,19 +9,16 @@
 #include "ast.h"
 #include "backend_codegen.h"
 #include "ir_generator.h"
+#include "parse_driver.h"
 #include "semantic_analyzer.h"
 
 using namespace ir;
 
-extern FILE* yyin;
-extern int yyparse();
 extern CompUnit* root;
 
 static IRProgram buildProgramFromFile(const std::string& path) {
-  yyin = fopen(path.c_str(), "r");
-  assert(yyin && "failed to open testcase");
-  int parseRet = yyparse();
-  assert(parseRet == 0 && root);
+  bool parsed = frontend::parse_from_file(path);
+  assert(parsed && root);
 
   SemanticAnalyzer sema;
   bool ok = sema.analyze(root);
@@ -30,8 +28,6 @@ static IRProgram buildProgramFromFile(const std::string& path) {
   IRProgram prog = gen.generate(root);
   delete root;
   root = nullptr;
-  fclose(yyin);
-  yyin = nullptr;
   return prog;
 }
 
