@@ -142,6 +142,24 @@ class UnaryExpr : public Expr {
   void accept(ASTVisitor* visitor) override;
 };
 
+class ArrayAccessExpr : public Expr {
+ public:
+  std::unique_ptr<Expr> array;  // 可以是 IdentifierExpr 或嵌套的 ArrayAccessExpr
+  std::unique_ptr<Expr> index;  // 索引表达式
+
+  ArrayAccessExpr(Expr* arr, Expr* idx) : array(arr), index(idx) {}
+  void accept(ASTVisitor* visitor) override;
+};
+
+class InitList : public ASTNode {
+ public:
+  std::vector<std::unique_ptr<ASTNode>> elements;  // 可以是 Expr 或 InitList
+  bool isScalar = false;  // 标记是否为单一表达式（非列表）
+
+  InitList() = default;
+  void accept(ASTVisitor* visitor) override;
+};
+
 class BinaryExpr : public Expr {
  public:
   enum OpType {
@@ -174,18 +192,23 @@ class Stmt : public ASTNode {
 class VarDef {
  public:
   std::string name;
-  std::unique_ptr<Expr> initExpr;
+  std::unique_ptr<Expr> initExpr;        // 标量初始化
+  std::unique_ptr<InitList> initList;    // 数组初始化列表
   bool hasInit = false;
+  bool hasInitList = false;              // 区分标量初始化和列表初始化
   bool initIsConst = false;
   int constInitValue = 0;
   ScalarValue typedConstInitValue = ScalarValue::Int(0);
   bool isArray = false;
   std::vector<int> arrayDimensions;
+  std::vector<std::unique_ptr<Expr>> arrayDimExprs;  // 维度表达式（语义分析前）
   bool firstDimUnsized = false;
 
   explicit VarDef(const std::string& n) : name(n) {}
   VarDef(const std::string& n, Expr* init)
       : name(n), initExpr(init), hasInit(true) {}
+  VarDef(const std::string& n, InitList* init)
+      : name(n), initList(init), hasInit(true), hasInitList(true) {}
 };
 
 class Block : public Stmt {
@@ -208,9 +231,10 @@ class ExprStmt : public Stmt {
 
 class AssignStmt : public Stmt {
  public:
-  std::string varName;
+  std::unique_ptr<Expr> lvalue;    // 通用左值表达式（可以是 IdentifierExpr 或 ArrayAccessExpr）
   std::unique_ptr<Expr> value;
-  AssignStmt(const std::string& name, Expr* val) : varName(name), value(val) {}
+
+  AssignStmt(Expr* lv, Expr* val) : lvalue(lv), value(val) {}
   void accept(ASTVisitor* visitor) override;
 };
 
@@ -262,6 +286,7 @@ class Param {
  public:
   Type type;
   std::string name;
+  std::vector<std::unique_ptr<Expr>> arrayDimExprs;  // 数组参数的维度表达式
 
   Param(Type t, const std::string& n) : type(std::move(t)), name(n) {}
 };
@@ -294,6 +319,8 @@ class ASTVisitor {
   virtual void visit(FunctionCallExpr* node) = 0;
   virtual void visit(UnaryExpr* node) = 0;
   virtual void visit(BinaryExpr* node) = 0;
+  virtual void visit(ArrayAccessExpr* node) = 0;
+  virtual void visit(InitList* node) = 0;
 
   virtual void visit(Block* node) = 0;
   virtual void visit(EmptyStmt* node) = 0;

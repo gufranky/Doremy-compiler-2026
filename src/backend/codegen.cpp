@@ -785,7 +785,7 @@ std::vector<std::string> optimizeUnusedLabels(const std::vector<std::string>& li
       lab = t.substr(0, t.size() - 1);
       
       // Keep function labels and referenced labels
-      bool isAuto = (!lab.empty() && lab[0] == 'L') || 
+      bool isAuto = (!lab.empty() && lab[0] == 'L' && lab.size() > 1 && std::isdigit(lab[1])) ||
                     (lab.find("_B") != std::string::npos) ||
                     (lab.find("_while") != std::string::npos) ||
                     (lab.find("_if") != std::string::npos);
@@ -981,18 +981,20 @@ std::vector<std::string> peepholeOptimize(const std::vector<std::string>& asmLin
 
 }  // namespace
 
-std::string CodeGen::binOpMnemonic(BinaryOp op) const {
+std::string CodeGen::binOpMnemonic(BinaryOp op, ValueType type) const {
+  bool isW = (type == ValueType::I32);
+  std::string w = isW ? "w" : "";
   switch (op) {
     case BinaryOp::Add:
       return "add";
     case BinaryOp::Sub:
       return "sub";
     case BinaryOp::Mul:
-      return "mul";
+      return "mul" + w;
     case BinaryOp::Div:
-      return "div";
+      return "div" + w;
     case BinaryOp::Mod:
-      return "rem";
+      return "rem" + w;
     case BinaryOp::And:
       return "and";
     case BinaryOp::Or:
@@ -1034,6 +1036,9 @@ std::string CodeGen::renderOperandWithAlloc(
       return std::to_string(spillIt->second) + "(sp)";
     }
     return "%v" + std::to_string(op.vregId);
+  }
+  if (op.isStackPtr()) {
+    return "sp";
   }
   return op.globalName;
 }
@@ -1118,6 +1123,28 @@ void CodeGen::emitStackStore(const std::string& srcReg, int offset,
 
   emitStackAddress(addrScratch, "sp", offset, out);
   out.push_back("\tsw " + srcReg + ", 0(" + addrScratch + ")");
+}
+
+void CodeGen::emitStackLoad64(const std::string& dstReg, int offset,
+                              std::vector<std::string>& out,
+                              const std::string& addrScratch) const {
+  if (isInt12(offset)) {
+    out.push_back("\tld " + dstReg + ", " + std::to_string(offset) + "(sp)");
+    return;
+  }
+  emitStackAddress(addrScratch, "sp", offset, out);
+  out.push_back("\tld " + dstReg + ", 0(" + addrScratch + ")");
+}
+
+void CodeGen::emitStackStore64(const std::string& srcReg, int offset,
+                               std::vector<std::string>& out,
+                               const std::string& addrScratch) const {
+  if (isInt12(offset)) {
+    out.push_back("\tsd " + srcReg + ", " + std::to_string(offset) + "(sp)");
+    return;
+  }
+  emitStackAddress(addrScratch, "sp", offset, out);
+  out.push_back("\tsd " + srcReg + ", 0(" + addrScratch + ")");
 }
 
 void CodeGen::emitAdjustSP(int delta, std::vector<std::string>& out) const {
@@ -1265,16 +1292,16 @@ CodeGen::StackFrame CodeGen::computeStackFrame(
     int vreg = fn.params[i];
     frame.paramIndexByVReg[vreg] = static_cast<int>(i);
     frame.paramSlots[vreg] = paramSlotOffset;
-    paramSlotOffset += 4;
+    paramSlotOffset += 8;  // 8 bytes per param slot (64-bit register)
     if (allocResult.allocation.find(vreg) == allocResult.allocation.end()) {
       frame.paramValueSlots[vreg] = paramSlotOffset;
-      paramSlotOffset += 4;
+      paramSlotOffset += 8;  // 8 bytes per param value slot
     }
   }
   for (int vreg : allocResult.spilledVRegs) {
     if (frame.paramSlots.find(vreg) != frame.paramSlots.end()) continue;
     frame.spillSlots[vreg] = paramSlotOffset + spillOffset;
-    spillOffset += 4;
+    spillOffset += 8;  // 8 bytes per spill slot (64-bit)
   }
   for (int vreg : allVRegs) {
     bool isParam = frame.paramSlots.find(vreg) != frame.paramSlots.end();
@@ -1283,7 +1310,7 @@ CodeGen::StackFrame CodeGen::computeStackFrame(
     bool alreadySpilled = frame.spillSlots.find(vreg) != frame.spillSlots.end();
     if (!isParam && !hasColor && !alreadySpilled) {
       frame.spillSlots[vreg] = paramSlotOffset + spillOffset;
-      spillOffset += 4;
+      spillOffset += 8;  // 8 bytes per spill slot (64-bit)
     }
   }
   frame.spillAreaSize = paramSlotOffset + spillOffset;
@@ -1293,7 +1320,7 @@ CodeGen::StackFrame CodeGen::computeStackFrame(
   // Outgoing stack arguments area MUST be at the bottom (lowest addresses)
   // of the frame, so callee can find them at sp + calleeFrameSize.
   frame.outgoingArgOffset = offset;
-  offset += frame.maxOutgoingArgs * 4;
+  offset += frame.maxOutgoingArgs * 8;  // 8 bytes per stack arg (lp64d ABI)
 
   // Spill area (for vregs spilled by allocator).
   frame.spillAreaOffset = offset;
@@ -1303,17 +1330,20 @@ CodeGen::StackFrame CodeGen::computeStackFrame(
   frame.callerSavedOffset = offset;
   for (const auto& reg : frame.callerSavedRegs) {
     frame.callerSavedSlots[reg] = offset;
-    offset += 4;
+    offset += 8;  // 8 bytes for 64-bit registers
   }
 
   // Save area for ra and callee-saved.
   frame.raOffset = offset;
-  offset += 4;
+  offset += 8;  // 8 bytes for 64-bit ra
 
   frame.savedRegsOffset = offset;
-  offset += static_cast<int>(frame.savedRegs.size()) * 4;
+  offset += static_cast<int>(frame.savedRegs.size()) * 8;  // 8 bytes per register
 
   frame.localVarOffset = offset;
+
+  // 为局部数组分配额外的栈空间
+  offset += fn.localArraySize;
 
   frame.frameSize = ((offset + 15) / 16) * 16;
 
@@ -1346,12 +1376,12 @@ void CodeGen::emitPrologue(const IRFunction& fn, const StackFrame& frame,
   }
 
   emitAdjustSP(-frame.frameSize, out);
-  emitStackStore("ra", frame.raOffset, out, "t6");
+  emitStackStore64("ra", frame.raOffset, out, "t6");
 
   int offset = frame.savedRegsOffset;
   for (const auto& reg : frame.savedRegs) {
-    emitStackStore(reg, offset, out, "t6");
-    offset += 4;
+    emitStackStore64(reg, offset, out, "t6");
+    offset += 8;
   }
 
   out.push_back(entryLabel + ":");
@@ -1366,11 +1396,11 @@ void CodeGen::emitEpilogue(const IRFunction& fn, const StackFrame& frame,
 
   int offset = frame.savedRegsOffset;
   for (const auto& reg : frame.savedRegs) {
-    emitStackLoad(reg, offset, out, "t6");
-    offset += 4;
+    emitStackLoad64(reg, offset, out, "t6");
+    offset += 8;
   }
 
-  emitStackLoad("ra", frame.raOffset, out, "t6");
+  emitStackLoad64("ra", frame.raOffset, out, "t6");
   emitAdjustSP(frame.frameSize, out);
   out.push_back("\tret");
 }
@@ -1423,7 +1453,7 @@ std::string CodeGen::renderInstructionWithAlloc(
         break;
       }
 
-      os << binOpMnemonic(b->op) << " " << destReg << ", "
+      os << binOpMnemonic(b->op, b->operandType) << " " << destReg << ", "
          << renderOperandWithAlloc(b->lhs, allocation, frame) << ", "
          << renderOperandWithAlloc(b->rhs, allocation, frame);
       break;
@@ -1599,31 +1629,41 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       auto valueIt = frame.paramValueSlots.find(op.vregId);
       if (valueIt != frame.paramValueSlots.end()) {
         std::string addrReg = chooseAddrForTarget(targetReg);
-        emitStackLoad(targetReg, valueIt->second, insns, addrReg);
+        emitStackLoad64(targetReg, valueIt->second, insns, addrReg);
         return targetReg;
       }
       auto paramIndexIt = frame.paramIndexByVReg.find(op.vregId);
       if (paramIndexIt != frame.paramIndexByVReg.end()) {
         int paramIndex = paramIndexIt->second;
         if (paramIndex >= 8) {
-          int offset = frame.frameSize + (paramIndex - 8) * 4;
+          int offset = frame.frameSize + (paramIndex - 8) * 8;
           std::string addrReg = chooseAddrForTarget(targetReg);
-          emitStackLoad(targetReg, offset, insns, addrReg);
+          emitStackLoad64(targetReg, offset, insns, addrReg);
           return targetReg;
         }
       }
       auto paramIt = frame.paramSlots.find(op.vregId);
       if (paramIt != frame.paramSlots.end()) {
         std::string addrReg = chooseAddrForTarget(targetReg);
-        emitStackLoad(targetReg, paramIt->second, insns, addrReg);
+        emitStackLoad64(targetReg, paramIt->second, insns, addrReg);
         return targetReg;
       }
       auto spillIt = frame.spillSlots.find(op.vregId);
       if (spillIt != frame.spillSlots.end()) {
         std::string addrReg = chooseAddrForTarget(targetReg);
-        emitStackLoad(targetReg, spillIt->second, insns, addrReg);
+        emitStackLoad64(targetReg, spillIt->second, insns, addrReg);
         return targetReg;
       }
+      return targetReg;
+    }
+    if (op.isStackPtr()) {
+      insns.push_back("\taddi " + targetReg + ", sp, 0");
+      return targetReg;
+    }
+    if (op.isLocalVarAddr()) {
+      // 局部数组地址：sp + localVarOffset + offset
+      int totalOffset = frame.localVarOffset + op.immValue;
+      emitStackAddress(targetReg, "sp", totalOffset, insns);
       return targetReg;
     }
     insns.push_back("\tla " + targetReg + ", " + op.globalName);
@@ -1662,18 +1702,27 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
     emitStackStore(valueReg, offset, insns, chooseScratch(reserved));
   };
 
+  auto storeWithScratch64 = [&](const std::string& valueReg, int offset,
+                                std::vector<std::string>& insns,
+                                const std::vector<std::string>& liveRegs =
+                                    std::vector<std::string>()) {
+    std::vector<std::string> reserved = liveRegs;
+    reserved.push_back(valueReg);
+    emitStackStore64(valueReg, offset, insns, chooseScratch(reserved));
+  };
+
   auto storeCurrentValue = [&](int vreg, const std::string& valueReg,
                                std::vector<std::string>& insns,
                                const std::vector<std::string>& liveRegs =
                                    std::vector<std::string>()) {
     auto valueIt = frame.paramValueSlots.find(vreg);
     if (valueIt != frame.paramValueSlots.end()) {
-      storeWithScratch(valueReg, valueIt->second, insns, liveRegs);
+      storeWithScratch64(valueReg, valueIt->second, insns, liveRegs);
       return;
     }
     auto spillIt = frame.spillSlots.find(vreg);
     if (spillIt != frame.spillSlots.end()) {
-      storeWithScratch(valueReg, spillIt->second, insns, liveRegs);
+      storeWithScratch64(valueReg, spillIt->second, insns, liveRegs);
     }
   };
 
@@ -1683,7 +1732,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
                                     std::vector<std::string>()) {
     auto paramIt = frame.paramSlots.find(vreg);
     if (paramIt != frame.paramSlots.end()) {
-      storeWithScratch(valueReg, paramIt->second, insns, liveRegs);
+      storeWithScratch64(valueReg, paramIt->second, insns, liveRegs);
     }
     storeCurrentValue(vreg, valueReg, insns, liveRegs);
   };
@@ -1756,9 +1805,9 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       if (loc.useIntReg) {
         srcReg = "a" + std::to_string(loc.regIndex);
       } else {
-        int offset = frame.frameSize + loc.stackIndex * 4;
+        int offset = frame.frameSize + loc.stackIndex * 8;
         srcReg = chooseScratch({});
-        emitStackLoad(srcReg, offset, insns, srcReg);
+        emitStackLoad64(srcReg, offset, insns, srcReg);
       }
 
       auto it = allocation.find(vreg);
@@ -1851,7 +1900,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
             insns.push_back("\txori " + destReg + ", " + destReg + ", 1");
             break;
           default:
-            insns.push_back("\t" + binOpMnemonic(b->op) + " " + destReg + ", " +
+            insns.push_back("\t" + binOpMnemonic(b->op, b->operandType) + " " + destReg + ", " +
                             lhs + ", " + rhs);
             break;
         }
@@ -1998,7 +2047,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
         for (const auto& reg : frame.callerSavedRegs) {
           auto itSlot = frame.callerSavedSlots.find(reg);
           if (itSlot != frame.callerSavedSlots.end()) {
-            storeWithScratch(reg, itSlot->second, insns);
+            storeWithScratch64(reg, itSlot->second, insns);
           }
         }
 
@@ -2024,8 +2073,8 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
               insns.push_back("\taddi " + target + ", " + argReg + ", 0");
             }
           } else {
-            int offset = frame.outgoingArgOffset + loc.stackIndex * 4;
-            storeWithScratch(argReg, offset, insns);
+            int offset = frame.outgoingArgOffset + loc.stackIndex * 8;
+            storeWithScratch64(argReg, offset, insns);
           }
         }
 
@@ -2037,7 +2086,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           }
           auto itSlot = frame.callerSavedSlots.find(reg);
           if (itSlot != frame.callerSavedSlots.end()) {
-            emitStackLoad(reg, itSlot->second, insns, reg);
+            emitStackLoad64(reg, itSlot->second, insns, reg);
           }
         }
 
@@ -2108,7 +2157,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
 std::vector<std::string> CodeGen::generate(const IRProgram& program) {
   std::vector<std::string> out;
 
-  if (!program.globals.empty()) {
+  if (!program.globals.empty() || !program.globalArrays.empty()) {
     out.push_back(".data");
     out.push_back("");
     for (const auto& glob : program.globals) {
@@ -2118,6 +2167,33 @@ std::vector<std::string> CodeGen::generate(const IRProgram& program) {
         out.push_back("\t.word " + std::to_string(floatBits(glob.typedInitialValue.floatValue)));
       } else {
         out.push_back("\t.word " + std::to_string(glob.initialValue));
+      }
+      out.push_back("");
+    }
+    // 输出全局数组
+    for (const auto& arr : program.globalArrays) {
+      out.push_back(".globl " + arr.name);
+      out.push_back(arr.name + ":");
+      int totalSize = 1;
+      for (int dim : arr.dimensions) {
+        totalSize *= dim;
+      }
+      if (arr.initialValues.empty()) {
+        // 零初始化
+        out.push_back("\t.zero " + std::to_string(totalSize * 4));
+      } else {
+        // 逐元素输出
+        for (const auto& val : arr.initialValues) {
+          if (arr.elementType == ValueType::F32) {
+            out.push_back("\t.word " + std::to_string(floatBits(val.floatValue)));
+          } else {
+            out.push_back("\t.word " + std::to_string(val.intValue));
+          }
+        }
+        // 如果初始化值不够，补零
+        for (size_t i = arr.initialValues.size(); i < static_cast<size_t>(totalSize); ++i) {
+          out.push_back("\t.word 0");
+        }
       }
       out.push_back("");
     }

@@ -85,9 +85,15 @@ class CodeGen {
   void emitStackStore(const std::string& srcReg, int offset,
                       std::vector<std::string>& out,
                       const std::string& addrScratch) const;
+  void emitStackLoad64(const std::string& dstReg, int offset,
+                       std::vector<std::string>& out,
+                       const std::string& addrScratch) const;
+  void emitStackStore64(const std::string& srcReg, int offset,
+                        std::vector<std::string>& out,
+                        const std::string& addrScratch) const;
   void emitAdjustSP(int delta, std::vector<std::string>& out) const;
 
-  std::string binOpMnemonic(ir::BinaryOp op) const;
+  std::string binOpMnemonic(ir::BinaryOp op, ir::ValueType type) const;
 };
 
 #endif  // BACKEND_CODEGEN_H

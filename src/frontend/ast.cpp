@@ -18,6 +18,12 @@ void UnaryExpr::accept(ASTVisitor* visitor) { visitor->visit(this); }
 // BinaryExpr
 void BinaryExpr::accept(ASTVisitor* visitor) { visitor->visit(this); }
 
+// ArrayAccessExpr
+void ArrayAccessExpr::accept(ASTVisitor* visitor) { visitor->visit(this); }
+
+// InitList
+void InitList::accept(ASTVisitor* visitor) { visitor->visit(this); }
+
 // Block
 void Block::accept(ASTVisitor* visitor) { visitor->visit(this); }
 

@@ -13,7 +13,7 @@ namespace ir {
 enum class ValueType { I32, F32 };
 
 struct Operand {
-  enum class Kind { Immediate, VirtualRegister, GlobalVariable };
+  enum class Kind { Immediate, VirtualRegister, GlobalVariable, StackPointer, LocalVarAddress };
 
   Kind kind = Kind::Immediate;
   ValueType valueType = ValueType::I32;
@@ -27,10 +27,14 @@ struct Operand {
   static Operand Imm(const ScalarValue& value);
   static Operand VReg(int id, ValueType type = ValueType::I32);
   static Operand Global(std::string name, ValueType type = ValueType::I32);
+  static Operand StackPtr();
+  static Operand LocalVarAddr(int offset);
 
   bool isImm() const { return kind == Kind::Immediate; }
   bool isVReg() const { return kind == Kind::VirtualRegister; }
   bool isGlobal() const { return kind == Kind::GlobalVariable; }
+  bool isStackPtr() const { return kind == Kind::StackPointer; }
+  bool isLocalVarAddr() const { return kind == Kind::LocalVarAddress; }
   bool isIntImm() const { return isImm() && valueType == ValueType::I32; }
   bool isFloatImm() const { return isImm() && valueType == ValueType::F32; }
 
@@ -256,6 +260,7 @@ struct IRFunction {
   std::vector<int> params;
   std::vector<ValueType> paramTypes;
   ValueType returnType = ValueType::I32;
+  int localArraySize = 0;  // 局部数组所需的总栈空间
 
   explicit IRFunction(std::string name) : name(std::move(name)) {}
 
@@ -299,8 +304,26 @@ struct GlobalVar {
         isConst(isConstValue) {}
 };
 
+struct GlobalArray {
+  std::string name;
+  std::vector<int> dimensions;
+  ValueType elementType = ValueType::I32;
+  std::vector<ScalarValue> initialValues;  // 扁平化的初始值
+  bool isConst = false;
+
+  GlobalArray() = default;
+  GlobalArray(std::string n, std::vector<int> dims, ValueType elemType,
+              std::vector<ScalarValue> initVals, bool isConstVal)
+      : name(std::move(n)),
+        dimensions(std::move(dims)),
+        elementType(elemType),
+        initialValues(std::move(initVals)),
+        isConst(isConstVal) {}
+};
+
 struct IRProgram {
   std::vector<GlobalVar> globals;
+  std::vector<GlobalArray> globalArrays;
   std::vector<IRFunction> functions;
 
   IRProgram() = default;

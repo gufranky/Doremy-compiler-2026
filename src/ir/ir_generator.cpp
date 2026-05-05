@@ -1,6 +1,7 @@
 #include "ir_generator.h"
 
 #include <cassert>
+#include <iostream>
 #include <utility>
 
 using namespace ir;
@@ -81,19 +82,29 @@ IRProgram IRGenerator::generate(CompUnit* root) {
     current_ = &program_.functions.back();
     current_->returnType = toIRValueType(func->returnType);
     loopStack_.clear();
+    stackOffset_ = 0;  // 重置栈偏移
     enterScope();
 
     for (auto& paramPtr : func->params) {
       int reg = newVReg();
       ValueBinding binding;
       binding.type = paramPtr->type;
-      binding.vreg = reg;
+      binding.isArray = paramPtr->type.isArray;
+      binding.isArrayParam = paramPtr->type.isArray;  // 标记数组参数
+      binding.arrayDimensions = paramPtr->type.arrayDimensions;
+      if (paramPtr->type.isArray) {
+        // 数组参数：vreg 存储数组首地址
+        binding.vreg = reg;
+      } else {
+        binding.vreg = reg;
+      }
       declareLocalValue(paramPtr->name, binding);
       current_->params.push_back(reg);
       current_->paramTypes.push_back(toIRValueType(paramPtr->type));
     }
 
     genBlock(func->body.get());
+    current_->localArraySize = stackOffset_;  // 保存局部数组所需的栈空间（正数）
     exitScope();
     current_ = nullptr;
   }
@@ -214,6 +225,112 @@ IRGenerator::ExprResult IRGenerator::castExprResult(const ExprResult& result,
 void IRGenerator::emitDecl(VarDeclStmt* decl, bool isGlobal) {
   for (auto& defPtr : decl->defs) {
     VarDef* def = defPtr.get();
+
+    // 处理数组声明
+    if (def->isArray) {
+      // 使用语义分析器计算好的维度来计算数组大小
+      int arraySize = 1;
+      for (int dim : def->arrayDimensions) {
+        arraySize *= dim;
+      }
+
+      if (isGlobal) {
+        // 全局数组
+        ValueBinding binding;
+        binding.isGlobal = true;
+        binding.isConst = decl->declaredType.isConst;
+        binding.type = decl->declaredType;
+        binding.type.isArray = true;
+        binding.isArray = true;
+        binding.globalName = def->name;
+        // 使用语义分析器计算好的维度
+        binding.arrayDimensions = def->arrayDimensions;
+        binding.type.arrayDimensions = binding.arrayDimensions;
+        declareGlobalValue(def->name, binding);
+
+        // 收集初始化值
+        std::vector<ScalarValue> initValues;
+        if (def->hasInitList && def->initList) {
+          // 从初始化列表收集值，使用维度信息
+          flattenInitListWithDims(def->initList.get(), initValues, binding.arrayDimensions);
+        }
+        // 如果初始化值不够，用0填充
+        while (initValues.size() < static_cast<size_t>(arraySize)) {
+          initValues.push_back(ScalarValue::Int(0));
+        }
+
+        // 添加全局数组
+        program_.globalArrays.emplace_back(
+            def->name,
+            binding.arrayDimensions,
+            isFloatType(decl->declaredType) ? ValueType::F32 : ValueType::I32,
+            std::move(initValues),
+            decl->declaredType.isConst);
+      } else {
+        // 局部数组：在栈上分配空间
+        int totalBytes = arraySize * 4;  // 假设每个元素4字节
+
+        ValueBinding binding;
+        binding.isConst = decl->declaredType.isConst;
+        binding.type = decl->declaredType;
+        binding.type.isArray = true;
+        binding.isArray = true;
+        // 记录数组在局部变量区内的偏移（从0开始）
+        binding.stackOffset = stackOffset_;  // 当前累计偏移
+        // 使用语义分析器计算好的维度
+        binding.arrayDimensions = def->arrayDimensions;
+        binding.type.arrayDimensions = binding.arrayDimensions;
+        binding.vreg = newVReg();  // 用于存储数组基地址
+        declareLocalValue(def->name, binding);
+
+        // 生成局部数组初始化代码
+        // 首先将整个数组初始化为 0
+        for (int i = 0; i < arraySize; ++i) {
+          int offset = binding.stackOffset + i * 4;
+          Operand addrOp = Operand::LocalVarAddr(offset);
+          int valReg = newVReg();
+          current_->append<CopyInst>(ValueType::I32, valReg, Operand::Imm(0));
+          current_->append<StoreInst>(Operand::VReg(valReg, ValueType::I32), addrOp);
+        }
+
+        // 然后存储初始化列表中的值
+        if (def->hasInitList && def->initList) {
+          std::vector<InitElement> initElements;
+          collectInitElements(def->initList.get(), initElements, binding.arrayDimensions);
+
+          // 逐个元素存储初始值
+          for (size_t i = 0; i < initElements.size() && i < static_cast<size_t>(arraySize); ++i) {
+            // 计算地址
+            int offset = binding.stackOffset + static_cast<int>(i) * 4;
+            Operand addrOp = Operand::LocalVarAddr(offset);
+
+            // 存储值
+            if (initElements[i].isConst) {
+              if (initElements[i].constValue.isFloat()) {
+                // float 类型
+                int valReg = newVReg();
+                current_->append<CopyInst>(ValueType::F32, valReg, Operand::Imm(initElements[i].constValue));
+                current_->append<StoreInst>(Operand::VReg(valReg, ValueType::F32), addrOp);
+              } else if (initElements[i].constValue.intValue != 0) {
+                // 非 0 的 int 值才需要存储（0 已经在上面初始化过了）
+                int valReg = newVReg();
+                current_->append<CopyInst>(ValueType::I32, valReg, Operand::Imm(initElements[i].constValue.intValue));
+                current_->append<StoreInst>(Operand::VReg(valReg, ValueType::I32), addrOp);
+              }
+            } else if (initElements[i].expr) {
+              // 非常量表达式，在运行时计算
+              ExprResult exprResult = genExprResult(initElements[i].expr);
+              current_->append<StoreInst>(toIRValueType(exprResult.type), exprResult.operand, addrOp);
+            }
+          }
+        }
+
+        stackOffset_ += totalBytes;  // 累计栈空间
+      }
+      continue;
+    }
+
+    // 标量变量处理
     if (isGlobal) {
       ScalarValue initValue =
           def->hasInit && def->initIsConst ? def->typedConstInitValue
@@ -241,7 +358,7 @@ void IRGenerator::emitDecl(VarDeclStmt* decl, bool isGlobal) {
     }
     binding.vreg = newVReg();
     auto& slot = declareLocalValue(def->name, binding);
-    if (def->hasInit) {
+    if (def->hasInit && def->initExpr) {
       ExprResult init = castExprResult(genExprResult(def->initExpr.get()),
                                        decl->declaredType.withoutConst());
       current_->append<CopyInst>(toIRValueType(slot.type), slot.vreg, init.operand);
@@ -273,6 +390,30 @@ IRGenerator::ExprResult IRGenerator::genExprResult(
       return ExprResult{Type::Int(), Operand::Imm(0)};
     }
     if (debugNames) debugNames->push_back(id->name);
+
+    // 如果是数组，返回数组地址（用于函数参数传递等）
+    if (binding->isArray) {
+      ExprResult result;
+      result.type = binding->type.withoutConst();
+      result.isArrayAccess = true;  // 标记这是数组地址
+      if (binding->isGlobal) {
+        // 全局数组：直接使用全局变量名作为地址
+        result.operand = Operand::Global(binding->globalName, ValueType::I32);
+        result.addrOperand = Operand::Global(binding->globalName, ValueType::I32);
+      } else if (binding->isArrayParam) {
+        // 数组参数：vreg 存储传入的数组地址
+        result.operand = Operand::VReg(binding->vreg, ValueType::I32);
+        result.addrOperand = Operand::VReg(binding->vreg, ValueType::I32);
+      } else {
+        // 局部数组：计算栈地址
+        int addrReg = newVReg();
+        current_->append<CopyInst>(ValueType::I32, addrReg, Operand::LocalVarAddr(binding->stackOffset));
+        result.operand = Operand::VReg(addrReg, ValueType::I32);
+        result.addrOperand = Operand::LocalVarAddr(binding->stackOffset);
+      }
+      return result;
+    }
+
     if (binding->isConst && !binding->isGlobal) {
       return ExprResult{binding->type.withoutConst(), Operand::Imm(binding->constValue)};
     }
@@ -293,6 +434,9 @@ IRGenerator::ExprResult IRGenerator::genExprResult(
   if (auto* paren = dynamic_cast<ParenExpr*>(expr)) {
     return genExprResult(paren->expr.get(), debugNames);
   }
+  if (auto* arrAccess = dynamic_cast<ArrayAccessExpr*>(expr)) {
+    return genArrayAccess(arrAccess);
+  }
   if (auto* call = dynamic_cast<FunctionCallExpr*>(expr)) {
     std::vector<Operand> args;
     std::vector<ValueType> argTypes;
@@ -302,11 +446,25 @@ IRGenerator::ExprResult IRGenerator::genExprResult(
 
     for (size_t i = 0; i < call->args.size(); ++i) {
       ExprResult arg = genExprResult(call->args[i].get());
+
+      // 检查是否需要传递数组地址
+      bool paramIsArray = false;
       if (sigIt != functions_.end() && i < sigIt->second.paramTypes.size()) {
-        arg = castExprResult(arg, sigIt->second.paramTypes[i].withoutConst());
+        paramIsArray = sigIt->second.paramTypes[i].isArray;
       }
-      args.emplace_back(arg.operand);
-      argTypes.push_back(toIRValueType(arg.type));
+
+      if (arg.isArrayAccess && paramIsArray) {
+        // 传递数组地址
+        args.emplace_back(arg.addrOperand);
+        argTypes.push_back(ValueType::I32);  // 数组地址是 int 类型
+      } else {
+        // 标量参数：使用加载后的值
+        if (sigIt != functions_.end() && i < sigIt->second.paramTypes.size()) {
+          arg = castExprResult(arg, sigIt->second.paramTypes[i].withoutConst());
+        }
+        args.emplace_back(arg.operand);
+        argTypes.push_back(toIRValueType(arg.type));
+      }
     }
     int dest = newVReg();
     ValueType irResultType = toIRValueType(resultType);
@@ -428,20 +586,25 @@ void IRGenerator::genStmt(Stmt* stmt) {
     return;
   }
   if (auto* assign = dynamic_cast<AssignStmt*>(stmt)) {
-    ValueBinding* binding = lookupBinding(assign->varName);
-    if (!binding) return;
+    // 使用左值表达式处理
+    ExprResult lvalResult = genLValueExpr(assign->lvalue.get());
+    if (!lvalResult.type.isValid()) return;
+
     ExprResult val = castExprResult(genExprResult(assign->value.get()),
-                                    binding->type.withoutConst());
-    if (binding->isGlobal) {
-      current_->append<StoreInst>(toIRValueType(binding->type), val.operand,
-                                  Operand::Global(binding->globalName,
-                                                  toIRValueType(binding->type)));
+                                    lvalResult.type.withoutConst());
+
+    if (lvalResult.isArrayAccess) {
+      // 数组元素赋值：存储到计算出的地址
+      current_->append<StoreInst>(toIRValueType(lvalResult.type), val.operand,
+                                  lvalResult.addrOperand);
+    } else if (lvalResult.operand.isGlobal()) {
+      // 全局变量赋值
+      current_->append<StoreInst>(toIRValueType(lvalResult.type), val.operand,
+                                  lvalResult.operand);
     } else {
-      current_->append<CopyInst>(toIRValueType(binding->type), binding->vreg,
-                                 val.operand);
-      if (binding->isConst && val.operand.isImm()) {
-        binding->constValue = val.operand.scalarValue();
-      }
+      // 局部变量赋值
+      int vreg = lvalResult.operand.vregId;
+      current_->append<CopyInst>(toIRValueType(lvalResult.type), vreg, val.operand);
     }
     return;
   }
@@ -502,4 +665,368 @@ void IRGenerator::genBlock(Block* block) {
     genStmt(stmt.get());
   }
   exitScope();
+}
+
+// ==================== 数组相关实现 ====================
+
+int IRGenerator::calcArraySize(const std::vector<int>& dimensions) const {
+  int size = 1;
+  for (int dim : dimensions) {
+    size *= dim;
+  }
+  return size;
+}
+
+void IRGenerator::flattenInitList(InitList* initList,
+                                   std::vector<ScalarValue>& result,
+                                   int totalSize) {
+  if (!initList) return;
+
+  if (initList->isScalar) {
+    // 单个表达式
+    if (!initList->elements.empty() && initList->elements[0]) {
+      if (auto* expr = dynamic_cast<Expr*>(initList->elements[0].get())) {
+        result.push_back(evalConstExpr(expr));
+      }
+    }
+    return;
+  }
+
+  // 列表形式 - 递归展开
+  for (auto& elem : initList->elements) {
+    if (!elem) continue;
+    if (result.size() >= static_cast<size_t>(totalSize)) break;
+
+    if (auto* subList = dynamic_cast<InitList*>(elem.get())) {
+      flattenInitList(subList, result, totalSize);
+    } else if (auto* expr = dynamic_cast<Expr*>(elem.get())) {
+      result.push_back(evalConstExpr(expr));
+    }
+  }
+}
+
+ScalarValue IRGenerator::evalConstExpr(Expr* expr) {
+  if (!expr) return ScalarValue::Int(0);
+  if (auto* num = dynamic_cast<NumberExpr*>(expr)) {
+    return num->scalarValue;
+  }
+  // 对于非常量表达式，返回默认值
+  return ScalarValue::Int(0);
+}
+
+void IRGenerator::collectInitElements(InitList* initList,
+                                       std::vector<InitElement>& result,
+                                       const std::vector<int>& dimensions) {
+  if (!initList || dimensions.empty()) return;
+
+  int totalSize = calcArraySize(dimensions);
+
+  if (initList->isScalar) {
+    // 单个表达式
+    InitElement elem;
+    if (!initList->elements.empty() && initList->elements[0]) {
+      if (auto* expr = dynamic_cast<Expr*>(initList->elements[0].get())) {
+        if (auto* num = dynamic_cast<NumberExpr*>(expr)) {
+          elem.isConst = true;
+          elem.constValue = num->scalarValue;
+        } else {
+          elem.isConst = false;
+          elem.expr = expr;
+        }
+      }
+    }
+    result.push_back(elem);
+    return;
+  }
+
+  // 列表形式
+  int subArraySize = 1;
+  if (dimensions.size() > 1) {
+    for (size_t i = 1; i < dimensions.size(); ++i) {
+      subArraySize *= dimensions[i];
+    }
+  } else {
+    subArraySize = 1;
+  }
+
+  size_t startSize = result.size();
+  size_t maxEndSize = startSize + totalSize;
+
+  for (size_t elemIdx = 0; elemIdx < initList->elements.size(); ++elemIdx) {
+    auto& elem = initList->elements[elemIdx];
+    if (result.size() >= maxEndSize) break;
+
+    if (!elem) {
+      result.push_back(InitElement{true, ScalarValue::Int(0), nullptr});
+    } else if (auto* subList = dynamic_cast<InitList*>(elem.get())) {
+      if (subList->isScalar) {
+        // 标量子列表
+        InitElement initElem;
+        if (!subList->elements.empty() && subList->elements[0]) {
+          if (auto* expr = dynamic_cast<Expr*>(subList->elements[0].get())) {
+            if (auto* num = dynamic_cast<NumberExpr*>(expr)) {
+              initElem.isConst = true;
+              initElem.constValue = num->scalarValue;
+            } else {
+              initElem.isConst = false;
+              initElem.expr = expr;
+            }
+          }
+        }
+        result.push_back(initElem);
+      } else {
+        // 非标量子列表
+        if (dimensions.size() > 1) {
+          std::vector<int> subDims(dimensions.begin() + 1, dimensions.end());
+          size_t prevSize = result.size();
+          collectInitElements(subList, result, subDims);
+          // 补 0
+          int filled = static_cast<int>(result.size() - prevSize);
+          for (int j = filled; j < subArraySize && result.size() < maxEndSize; ++j) {
+            result.push_back(InitElement{true, ScalarValue::Int(0), nullptr});
+          }
+        } else {
+          collectInitElements(subList, result, {1});
+        }
+      }
+    } else if (auto* expr = dynamic_cast<Expr*>(elem.get())) {
+      InitElement initElem;
+      if (auto* num = dynamic_cast<NumberExpr*>(expr)) {
+        initElem.isConst = true;
+        initElem.constValue = num->scalarValue;
+      } else {
+        initElem.isConst = false;
+        initElem.expr = expr;
+      }
+      result.push_back(initElem);
+    }
+  }
+}
+
+void IRGenerator::flattenInitListWithDims(InitList* initList,
+                                          std::vector<ScalarValue>& result,
+                                          const std::vector<int>& dimensions) {
+  if (!initList || dimensions.empty()) return;
+
+  int totalSize = calcArraySize(dimensions);
+
+  if (initList->isScalar) {
+    // 单个表达式（包装在InitList中），只填充一个值
+    if (!initList->elements.empty() && initList->elements[0]) {
+      if (auto* expr = dynamic_cast<Expr*>(initList->elements[0].get())) {
+        result.push_back(evalConstExpr(expr));
+      } else {
+        result.push_back(ScalarValue::Int(0));
+      }
+    } else {
+      result.push_back(ScalarValue::Int(0));
+    }
+    return;
+  }
+
+  // 列表形式 - 按行优先顺序处理
+  // 计算子数组大小（如果有多维）
+  int subArraySize = 1;
+  if (dimensions.size() > 1) {
+    for (size_t i = 1; i < dimensions.size(); ++i) {
+      subArraySize *= dimensions[i];
+    }
+  } else {
+    // 一维数组，子数组大小就是维度本身（但实际不会有子数组）
+    subArraySize = 1;
+  }
+
+  // 记录当前层级的起始位置，用于限制填充
+  size_t startSize = result.size();
+  size_t maxEndSize = startSize + totalSize;
+
+  for (size_t elemIdx = 0; elemIdx < initList->elements.size(); ++elemIdx) {
+    auto& elem = initList->elements[elemIdx];
+    if (result.size() >= maxEndSize) break;
+
+    if (!elem) {
+      result.push_back(ScalarValue::Int(0));
+    } else if (auto* subList = dynamic_cast<InitList*>(elem.get())) {
+      if (subList->isScalar) {
+        // 标量子列表：只填充一个值
+        if (!subList->elements.empty() && subList->elements[0]) {
+          if (auto* expr = dynamic_cast<Expr*>(subList->elements[0].get())) {
+            result.push_back(evalConstExpr(expr));
+          } else {
+            result.push_back(ScalarValue::Int(0));
+          }
+        } else {
+          result.push_back(ScalarValue::Int(0));
+        }
+      } else {
+        // 非标量子列表（真正的嵌套列表）：对应一个完整的子数组
+        if (dimensions.size() > 1) {
+          std::vector<int> subDims(dimensions.begin() + 1, dimensions.end());
+          size_t prevSize = result.size();
+          flattenInitListWithDims(subList, result, subDims);
+          // 如果子列表填充不足，补 0
+          int filled = static_cast<int>(result.size() - prevSize);
+          for (int j = filled; j < subArraySize && result.size() < maxEndSize; ++j) {
+            result.push_back(ScalarValue::Int(0));
+          }
+        } else {
+          // 一维数组遇到非标量子列表，递归展开
+          flattenInitListWithDims(subList, result, {1});
+        }
+      }
+    } else if (auto* expr = dynamic_cast<Expr*>(elem.get())) {
+      // 标量表达式：直接添加
+      result.push_back(evalConstExpr(expr));
+    }
+  }
+}
+
+IRGenerator::ExprResult IRGenerator::genArrayAccess(ArrayAccessExpr* node) {
+  // 获取左值表达式（计算地址）
+  ExprResult lvalResult = genLValueExpr(node);
+
+  if (!lvalResult.type.isValid()) {
+    return ExprResult{Type::Int(), Operand::Imm(0)};
+  }
+
+  // 如果结果是标量（不是数组），需要加载值
+  if (!lvalResult.type.isArray) {
+    ExprResult result;
+    result.type = lvalResult.type;
+    result.isArrayAccess = true;
+    result.addrOperand = lvalResult.addrOperand;
+
+    // 从地址加载值
+    int dest = newVReg();
+    current_->append<LoadInst>(toIRValueType(result.type), dest,
+                               lvalResult.addrOperand);
+    result.operand = Operand::VReg(dest, toIRValueType(result.type));
+    return result;
+  }
+
+  // 如果还是数组，返回地址
+  return lvalResult;
+}
+
+IRGenerator::ExprResult IRGenerator::genLValueExpr(Expr* expr) {
+  if (auto* id = dynamic_cast<IdentifierExpr*>(expr)) {
+    ValueBinding* binding = lookupBinding(id->name);
+    if (!binding) {
+      return ExprResult{Type::Invalid(), Operand::Imm(0)};
+    }
+
+    ExprResult result;
+    result.type = binding->type.withoutConst();
+
+    if (binding->isArray) {
+      // 数组：返回基地址
+      result.isArrayAccess = true;
+      if (binding->isGlobal) {
+        // 全局数组
+        result.addrOperand = Operand::Global(binding->globalName, ValueType::I32);
+      } else if (binding->isArrayParam) {
+        // 数组参数：vreg 存储传入的数组地址
+        result.addrOperand = Operand::VReg(binding->vreg, ValueType::I32);
+      } else {
+        // 局部数组：地址 = StackPtr + localVarOffset + offset
+        result.addrOperand = Operand::LocalVarAddr(binding->stackOffset);
+      }
+      result.operand = result.addrOperand;
+    } else {
+      // 标量变量
+      if (binding->isGlobal) {
+        result.operand = Operand::Global(binding->globalName, toIRValueType(binding->type));
+      } else {
+        result.operand = Operand::VReg(binding->vreg, toIRValueType(binding->type));
+      }
+    }
+    return result;
+  }
+
+  if (auto* arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
+    // 递归处理数组访问
+    ExprResult baseResult = genLValueExpr(arr->array.get());
+
+    if (!baseResult.type.isValid()) {
+      return ExprResult{Type::Invalid(), Operand::Imm(0)};
+    }
+
+    if (!baseResult.type.isArray) {
+      // 错误：对非数组进行下标访问
+      return ExprResult{Type::Invalid(), Operand::Imm(0)};
+    }
+
+    // 计算索引表达式
+    ExprResult indexResult = genExprResult(arr->index.get());
+
+    // 计算偏移量
+    // offset = index * (元素大小 * 后续维度的乘积)
+    int elementCount = 1;
+    if (baseResult.type.firstDimUnsized) {
+      // firstDimUnsized: all explicit dims are "after" the consumed unsized dim
+      for (int dim : baseResult.type.arrayDimensions) {
+        elementCount *= dim;
+      }
+    } else if (baseResult.type.arrayDimensions.size() > 1) {
+      for (size_t i = 1; i < baseResult.type.arrayDimensions.size(); ++i) {
+        elementCount *= baseResult.type.arrayDimensions[i];
+      }
+    }
+
+    // 计算地址: addr = base + index * elementCount * 4
+    int offsetReg = newVReg();
+    if (elementCount == 1) {
+      // offset = index * 4
+      current_->append<BinaryInst>(BinaryOp::Mul, ValueType::I32, ValueType::I32,
+                                   offsetReg, indexResult.operand, Operand::Imm(4));
+    } else {
+      // offset = index * elementCount * 4
+      int tempReg = newVReg();
+      current_->append<BinaryInst>(BinaryOp::Mul, ValueType::I32, ValueType::I32,
+                                   tempReg, indexResult.operand,
+                                   Operand::Imm(elementCount));
+      current_->append<BinaryInst>(BinaryOp::Mul, ValueType::I32, ValueType::I32,
+                                   offsetReg, Operand::VReg(tempReg, ValueType::I32),
+                                   Operand::Imm(4));
+    }
+
+    // 计算最终地址
+    int addrReg = newVReg();
+    current_->append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32,
+                                 addrReg, baseResult.addrOperand,
+                                 Operand::VReg(offsetReg, ValueType::I32));
+
+    // 构造结果类型（减少一个维度）
+    ExprResult result;
+    result.isArrayAccess = true;
+    result.addrOperand = Operand::VReg(addrReg, ValueType::I32);
+
+    Type resultType;
+    resultType.base = baseResult.type.base;
+    resultType.isConst = baseResult.type.isConst;
+
+    {
+      int totalDims = static_cast<int>(baseResult.type.arrayDimensions.size()) + (baseResult.type.firstDimUnsized ? 1 : 0);
+      int remaining = totalDims - 1;
+      if (remaining > 0) {
+        resultType.isArray = true;
+        if (baseResult.type.firstDimUnsized) {
+          resultType.arrayDimensions = baseResult.type.arrayDimensions;
+        } else {
+          resultType.arrayDimensions = std::vector<int>(
+              baseResult.type.arrayDimensions.begin() + 1,
+              baseResult.type.arrayDimensions.end());
+        }
+        resultType.firstDimUnsized = false;
+      } else {
+        resultType.isArray = false;
+      }
+    }
+
+    result.type = resultType;
+    result.operand = result.addrOperand;
+    return result;
+  }
+
+  return ExprResult{Type::Invalid(), Operand::Imm(0)};
 }

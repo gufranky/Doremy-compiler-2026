@@ -36,6 +36,8 @@ CompUnit* root = nullptr;
 
     Expr* expr;
     std::vector<Expr*>* exprList;
+    std::vector<Expr*>* dimList;
+    InitList* initList;
 }
 
 %token <num> NUMBER
@@ -49,7 +51,7 @@ CompUnit* root = nullptr;
 %token LT GT LE GE EQ NE
 %token AND OR NOT
 %token ASSIGN
-%token LPAREN RPAREN LBRACE RBRACE SEMICOLON COMMA
+%token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET SEMICOLON COMMA
 
 %type <compUnit> CompUnit
 %type <astNode> GlobalItem
@@ -63,8 +65,10 @@ CompUnit* root = nullptr;
 %type <declStmt> VarDecl ConstDecl
 %type <varDef> VarDef ConstDef
 %type <varDefList> VarDefList ConstDefList OptMoreVarDefs
-%type <expr> Expr ConstExpr PrimaryExpr UnaryExpr MulExpr AddExpr RelExpr EqExpr LAndExpr LOrExpr OptInitExpr
-%type <exprList> ArgList ArgListOpt
+%type <expr> Expr ConstExpr PrimaryExpr UnaryExpr MulExpr AddExpr RelExpr EqExpr LAndExpr LOrExpr LVal
+%type <exprList> ArgList ArgListOpt ArrayDimsExpr
+%type <dimList> ArrayDims
+%type <initList> InitVal ConstInitVal InitValList ConstInitValList OptInitVal
 %type <num> UnaryOp
 
 %left OR
@@ -123,15 +127,33 @@ GlobalItem
         delete $2;
         $$ = static_cast<ASTNode*>(func);
     }
-    | BType IDENTIFIER OptInitExpr OptMoreVarDefs SEMICOLON {
+    | BType IDENTIFIER ArrayDims OptInitVal OptMoreVarDefs SEMICOLON {
         VarDeclStmt* decl = new VarDeclStmt(*$1);
-        VarDef* first = $3 ? new VarDef(*$2, $3) : new VarDef(*$2);
-        decl->defs.emplace_back(first);
+        VarDef* first = new VarDef(*$2);
+        first->isArray = ($3 != nullptr && !$3->empty());
+        if ($3) {
+            for (auto* dim : *$3) {
+                first->arrayDimExprs.emplace_back(dim);
+            }
+            delete $3;
+        }
         if ($4) {
-            for (auto* def : *$4) {
+            first->hasInit = true;
+            first->hasInitList = !($4->isScalar);
+            if ($4->isScalar && $4->elements.size() == 1) {
+                // 标量初始化：提取表达式
+                first->initExpr.reset(dynamic_cast<Expr*>($4->elements[0].release()));
+            } else {
+                // 数组初始化列表
+                first->initList.reset($4);
+            }
+        }
+        decl->defs.emplace_back(first);
+        if ($5) {
+            for (auto* def : *$5) {
                 decl->defs.emplace_back(def);
             }
-            delete $4;
+            delete $5;
         }
         delete $1;
         delete $2;
@@ -142,9 +164,21 @@ GlobalItem
     }
     ;
 
-OptInitExpr
+OptInitVal
     : /* empty */ { $$ = nullptr; }
-    | ASSIGN Expr { $$ = $2; }
+    | ASSIGN InitVal { $$ = $2; }
+    ;
+
+ArrayDims
+    : /* empty */ { $$ = nullptr; }
+    | ArrayDims LBRACKET ConstExpr RBRACKET {
+        if ($1 == nullptr) {
+            $$ = new std::vector<Expr*>();
+        } else {
+            $$ = $1;
+        }
+        $$->push_back($3);
+    }
     ;
 
 OptMoreVarDefs
@@ -173,6 +207,37 @@ Param
         $$ = new Param(*$1, *$2);
         delete $1;
         delete $2;
+    }
+    | BType IDENTIFIER LBRACKET RBRACKET {
+        $$ = new Param(*$1, *$2);
+        $$->type.isArray = true;
+        $$->type.firstDimUnsized = true;
+        delete $1;
+        delete $2;
+    }
+    | BType IDENTIFIER LBRACKET RBRACKET ArrayDimsExpr {
+        $$ = new Param(*$1, *$2);
+        $$->type.isArray = true;
+        $$->type.firstDimUnsized = true;
+        if ($5) {
+            for (auto* dim : *$5) {
+                $$->arrayDimExprs.emplace_back(dim);
+            }
+            delete $5;
+        }
+        delete $1;
+        delete $2;
+    }
+    ;
+
+ArrayDimsExpr
+    : LBRACKET Expr RBRACKET {
+        $$ = new std::vector<Expr*>();
+        $$->push_back($2);
+    }
+    | ArrayDimsExpr LBRACKET Expr RBRACKET {
+        $$ = $1;
+        $$->push_back($3);
     }
     ;
 
@@ -228,21 +293,112 @@ ConstDefList
     ;
 
 VarDef
-    : IDENTIFIER {
+    : IDENTIFIER ArrayDims {
         $$ = new VarDef(*$1);
+        $$->isArray = ($2 != nullptr && !$2->empty());
+        if ($2) {
+            for (auto* dim : *$2) {
+                $$->arrayDimExprs.emplace_back(dim);
+            }
+            delete $2;
+        }
         delete $1;
     }
-    | IDENTIFIER ASSIGN Expr {
-        $$ = new VarDef(*$1, $3);
+    | IDENTIFIER ArrayDims ASSIGN InitVal {
+        if ($4->isScalar && $4->elements.size() == 1) {
+            // 标量初始化：提取表达式
+            $$ = new VarDef(*$1, dynamic_cast<Expr*>($4->elements[0].release()));
+        } else {
+            // 数组初始化列表
+            $$ = new VarDef(*$1, $4);
+        }
+        $$->isArray = ($2 != nullptr && !$2->empty());
+        $$->hasInit = true;
+        $$->hasInitList = !($4->isScalar);
+        if ($2) {
+            for (auto* dim : *$2) {
+                $$->arrayDimExprs.emplace_back(dim);
+            }
+            delete $2;
+        }
         delete $1;
     }
     ;
 
 ConstDef
-    : IDENTIFIER ASSIGN ConstExpr {
-        $$ = new VarDef(*$1, $3);
+    : IDENTIFIER ArrayDims ASSIGN ConstInitVal {
+        if ($4->isScalar && $4->elements.size() == 1) {
+            // 标量初始化：提取表达式
+            $$ = new VarDef(*$1, dynamic_cast<Expr*>($4->elements[0].release()));
+        } else {
+            // 数组初始化列表
+            $$ = new VarDef(*$1, $4);
+        }
+        $$->isArray = ($2 != nullptr && !$2->empty());
         $$->initIsConst = true;
+        $$->hasInit = true;
+        $$->hasInitList = !($4->isScalar);
+        if ($2) {
+            for (auto* dim : *$2) {
+                $$->arrayDimExprs.emplace_back(dim);
+            }
+            delete $2;
+        }
         delete $1;
+    }
+    ;
+
+InitVal
+    : Expr {
+        $$ = new InitList();
+        $$->isScalar = true;
+        $$->elements.emplace_back($1);
+    }
+    | LBRACE RBRACE {
+        $$ = new InitList();
+        $$->isScalar = false;
+    }
+    | LBRACE InitValList RBRACE {
+        $$ = $2;
+    }
+    ;
+
+InitValList
+    : InitVal {
+        $$ = new InitList();
+        $$->isScalar = false;
+        $$->elements.emplace_back($1);
+    }
+    | InitValList COMMA InitVal {
+        $$ = $1;
+        $$->elements.emplace_back($3);
+    }
+    ;
+
+ConstInitVal
+    : ConstExpr {
+        $$ = new InitList();
+        $$->isScalar = true;
+        $$->elements.emplace_back($1);
+    }
+    | LBRACE RBRACE {
+        $$ = new InitList();
+        $$->isScalar = false;
+    }
+    | LBRACE ConstInitValList RBRACE {
+        $$ = $2;
+    }
+    ;
+
+ConstInitValList
+    : ConstInitVal {
+        $$ = new InitList();
+        $$->isScalar = false;
+        $$->elements.emplace_back($1);
+    }
+    | ConstInitValList COMMA ConstInitVal {
+        $$ = $1;
+        $$->elements.emplace_back($3);
     }
     ;
 
@@ -285,9 +441,8 @@ Stmt
     | Expr SEMICOLON {
         $$ = new ExprStmt($1);
     }
-    | IDENTIFIER ASSIGN Expr SEMICOLON {
-        $$ = new AssignStmt(*$1, $3);
-        delete $1;
+    | LVal ASSIGN Expr SEMICOLON {
+        $$ = new AssignStmt($1, $3);
     }
     | IF LPAREN Expr RPAREN Stmt {
         $$ = new IfStmt($3, $5);
@@ -309,6 +464,16 @@ Stmt
     }
     | RETURN SEMICOLON {
         $$ = new ReturnStmt(nullptr);
+    }
+    ;
+
+LVal
+    : IDENTIFIER {
+        $$ = new IdentifierExpr(*$1);
+        delete $1;
+    }
+    | LVal LBRACKET Expr RBRACKET {
+        $$ = new ArrayAccessExpr($1, $3);
     }
     ;
 
@@ -401,9 +566,8 @@ UnaryOp
     ;
 
 PrimaryExpr
-    : IDENTIFIER {
-        $$ = new IdentifierExpr(*$1);
-        delete $1;
+    : LVal {
+        $$ = $1;
     }
     | NUMBER {
         $$ = new NumberExpr($1);

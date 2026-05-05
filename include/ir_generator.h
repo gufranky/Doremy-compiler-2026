@@ -21,11 +21,19 @@ class IRGenerator {
     ScalarValue constValue = ScalarValue::Int(0);
     int vreg = -1;
     std::string globalName;
+    // 数组相关
+    bool isArray = false;
+    bool isArrayParam = false;  // 标记是否为数组参数
+    std::vector<int> arrayDimensions;
+    int stackOffset = 0;  // 局部数组在栈上的偏移
   };
 
   struct ExprResult {
     Type type = Type::Invalid();
     ir::Operand operand = ir::Operand::Imm(0);
+    // 数组访问结果可能需要地址
+    bool isArrayAccess = false;
+    ir::Operand addrOperand = ir::Operand::Imm(0);
   };
 
   struct FunctionSignature {
@@ -36,6 +44,7 @@ class IRGenerator {
   ir::IRProgram program_;
   ir::IRFunction* current_ = nullptr;
   int labelCounter_ = 0;
+  int stackOffset_ = 0;  // 当前栈偏移
   std::vector<std::unordered_map<std::string, ValueBinding>> scopes_;
   std::vector<std::pair<std::string, std::string>> loopStack_;
   std::unordered_map<std::string, FunctionSignature> functions_;
@@ -72,6 +81,25 @@ class IRGenerator {
                const std::string& falseLabel);
   void genStmt(Stmt* stmt);
   void genBlock(Block* block);
+
+  // 数组相关方法
+  ExprResult genArrayAccess(ArrayAccessExpr* node);
+  ExprResult genLValueExpr(Expr* expr);
+  int calcArraySize(const std::vector<int>& dimensions) const;
+  ir::Operand genArrayAddress(Expr* lvalue);
+  void flattenInitList(InitList* initList, std::vector<ScalarValue>& result,
+                        int totalSize);
+  void flattenInitListWithDims(InitList* initList, std::vector<ScalarValue>& result,
+                                const std::vector<int>& dimensions);
+  // 新增：收集初始化表达式（支持非常量表达式）
+  struct InitElement {
+    bool isConst = true;
+    ScalarValue constValue = ScalarValue::Int(0);
+    Expr* expr = nullptr;  // 非常量表达式
+  };
+  void collectInitElements(InitList* initList, std::vector<InitElement>& result,
+                           const std::vector<int>& dimensions);
+  ScalarValue evalConstExpr(Expr* expr);
 };
 
 #endif
