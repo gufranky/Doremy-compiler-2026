@@ -1,6 +1,7 @@
 #include "ir_generator.h"
 
 #include <cassert>
+#include <functional>
 #include <iostream>
 #include <utility>
 
@@ -233,6 +234,7 @@ void IRGenerator::emitDecl(VarDeclStmt* decl, bool isGlobal) {
       for (int dim : def->arrayDimensions) {
         arraySize *= dim;
       }
+      bool zeroInitialized = isZeroInitializedArray(def);
 
       if (isGlobal) {
         // 全局数组
@@ -250,13 +252,13 @@ void IRGenerator::emitDecl(VarDeclStmt* decl, bool isGlobal) {
 
         // 收集初始化值
         std::vector<ScalarValue> initValues;
-        if (def->hasInitList && def->initList) {
+        if (!zeroInitialized && def->hasInitList && def->initList) {
           // 从初始化列表收集值，使用维度信息
           flattenInitListWithDims(def->initList.get(), initValues, binding.arrayDimensions);
-        }
-        // 如果初始化值不够，用0填充
-        while (initValues.size() < static_cast<size_t>(arraySize)) {
-          initValues.push_back(ScalarValue::Int(0));
+          // 如果初始化值不够，用0填充
+          while (initValues.size() < static_cast<size_t>(arraySize)) {
+            initValues.push_back(ScalarValue::Int(0));
+          }
         }
 
         // 添加全局数组
@@ -284,17 +286,49 @@ void IRGenerator::emitDecl(VarDeclStmt* decl, bool isGlobal) {
         declareLocalValue(def->name, binding);
 
         // 生成局部数组初始化代码
-        // 首先将整个数组初始化为 0
-        for (int i = 0; i < arraySize; ++i) {
-          int offset = binding.stackOffset + i * 4;
-          Operand addrOp = Operand::LocalVarAddr(offset);
-          int valReg = newVReg();
-          current_->append<CopyInst>(ValueType::I32, valReg, Operand::Imm(0));
-          current_->append<StoreInst>(Operand::VReg(valReg, ValueType::I32), addrOp);
+        if (zeroInitialized) {
+          int idxReg = newVReg();
+          int limitReg = newVReg();
+          int addrReg = newVReg();
+          int valueReg = newVReg();
+          int condReg = newVReg();
+          std::string loopLabel = newLabel("arr_zero_loop");
+          std::string bodyLabel = newLabel("arr_zero_body");
+          std::string endLabel = newLabel("arr_zero_end");
+
+          current_->append<CopyInst>(ValueType::I32, idxReg, Operand::Imm(0));
+          current_->append<CopyInst>(ValueType::I32, limitReg, Operand::Imm(totalBytes));
+          current_->append<CopyInst>(ValueType::I32, valueReg, Operand::Imm(0));
+          current_->append<LabelInst>(loopLabel);
+          current_->append<BinaryInst>(BinaryOp::Lt, ValueType::I32, ValueType::I32,
+                                       condReg, Operand::VReg(idxReg, ValueType::I32),
+                                       Operand::VReg(limitReg, ValueType::I32));
+          current_->append<BranchInst>(Operand::VReg(condReg, ValueType::I32), bodyLabel,
+                                       endLabel);
+          current_->append<LabelInst>(bodyLabel);
+          current_->append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32,
+                                       addrReg, Operand::LocalVarAddr(binding.stackOffset),
+                                       Operand::VReg(idxReg, ValueType::I32));
+          current_->append<StoreInst>(Operand::VReg(valueReg, ValueType::I32),
+                                      Operand::VReg(addrReg, ValueType::I32));
+          current_->append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32,
+                                       idxReg, Operand::VReg(idxReg, ValueType::I32),
+                                       Operand::Imm(4));
+          current_->append<JumpInst>(loopLabel);
+          current_->append<LabelInst>(endLabel);
+        } else {
+          // 首先将整个数组初始化为 0
+          for (int i = 0; i < arraySize; ++i) {
+            int offset = binding.stackOffset + i * 4;
+            Operand addrOp = Operand::LocalVarAddr(offset);
+            int valReg = newVReg();
+            current_->append<CopyInst>(ValueType::I32, valReg, Operand::Imm(0));
+            current_->append<StoreInst>(Operand::VReg(valReg, ValueType::I32), addrOp);
+          }
         }
 
         // 然后存储初始化列表中的值
-        if (def->hasInitList && def->initList) {
+        if (!zeroInitialized && def->hasInitList && def->initList) {
           std::vector<InitElement> initElements;
           collectInitElements(def->initList.get(), initElements, binding.arrayDimensions);
 
@@ -391,23 +425,20 @@ IRGenerator::ExprResult IRGenerator::genExprResult(
     }
     if (debugNames) debugNames->push_back(id->name);
 
-    // 如果是数组，返回数组地址（用于函数参数传递等）
     if (binding->isArray) {
       ExprResult result;
       result.type = binding->type.withoutConst();
-      result.isArrayAccess = true;  // 标记这是数组地址
+      result.isArrayAccess = true;
       if (binding->isGlobal) {
-        // 全局数组：直接使用全局变量名作为地址
         result.operand = Operand::Global(binding->globalName, ValueType::I32);
         result.addrOperand = Operand::Global(binding->globalName, ValueType::I32);
       } else if (binding->isArrayParam) {
-        // 数组参数：vreg 存储传入的数组地址
         result.operand = Operand::VReg(binding->vreg, ValueType::I32);
         result.addrOperand = Operand::VReg(binding->vreg, ValueType::I32);
       } else {
-        // 局部数组：计算栈地址
         int addrReg = newVReg();
-        current_->append<CopyInst>(ValueType::I32, addrReg, Operand::LocalVarAddr(binding->stackOffset));
+        current_->append<CopyInst>(ValueType::I32, addrReg,
+                                   Operand::LocalVarAddr(binding->stackOffset));
         result.operand = Operand::VReg(addrReg, ValueType::I32);
         result.addrOperand = Operand::LocalVarAddr(binding->stackOffset);
       }
@@ -447,18 +478,15 @@ IRGenerator::ExprResult IRGenerator::genExprResult(
     for (size_t i = 0; i < call->args.size(); ++i) {
       ExprResult arg = genExprResult(call->args[i].get());
 
-      // 检查是否需要传递数组地址
       bool paramIsArray = false;
       if (sigIt != functions_.end() && i < sigIt->second.paramTypes.size()) {
         paramIsArray = sigIt->second.paramTypes[i].isArray;
       }
 
       if (arg.isArrayAccess && paramIsArray) {
-        // 传递数组地址
         args.emplace_back(arg.addrOperand);
-        argTypes.push_back(ValueType::I32);  // 数组地址是 int 类型
+        argTypes.push_back(ValueType::I32);
       } else {
-        // 标量参数：使用加载后的值
         if (sigIt != functions_.end() && i < sigIt->second.paramTypes.size()) {
           arg = castExprResult(arg, sigIt->second.paramTypes[i].withoutConst());
         }
@@ -586,7 +614,6 @@ void IRGenerator::genStmt(Stmt* stmt) {
     return;
   }
   if (auto* assign = dynamic_cast<AssignStmt*>(stmt)) {
-    // 使用左值表达式处理
     ExprResult lvalResult = genLValueExpr(assign->lvalue.get());
     if (!lvalResult.type.isValid()) return;
 
@@ -594,15 +621,12 @@ void IRGenerator::genStmt(Stmt* stmt) {
                                     lvalResult.type.withoutConst());
 
     if (lvalResult.isArrayAccess) {
-      // 数组元素赋值：存储到计算出的地址
       current_->append<StoreInst>(toIRValueType(lvalResult.type), val.operand,
                                   lvalResult.addrOperand);
     } else if (lvalResult.operand.isGlobal()) {
-      // 全局变量赋值
       current_->append<StoreInst>(toIRValueType(lvalResult.type), val.operand,
                                   lvalResult.operand);
     } else {
-      // 局部变量赋值
       int vreg = lvalResult.operand.vregId;
       current_->append<CopyInst>(toIRValueType(lvalResult.type), vreg, val.operand);
     }
@@ -667,9 +691,44 @@ void IRGenerator::genBlock(Block* block) {
   exitScope();
 }
 
-// ==================== 数组相关实现 ====================
+bool IRGenerator::isZeroInitializedArray(VarDef* def) const {
+  if (!def || !def->hasInit) {
+    return true;
+  }
+  if (!def->hasInitList || !def->initList) {
+    return false;
+  }
+  std::function<bool(const InitList*)> isZeroList = [&](const InitList* list) -> bool {
+    if (!list) return true;
+    if (list->elements.empty()) return true;
+    if (list->isScalar) {
+      if (list->elements.empty() || !list->elements[0]) return true;
+      auto* expr = dynamic_cast<Expr*>(list->elements[0].get());
+      auto* num = expr ? dynamic_cast<NumberExpr*>(expr) : nullptr;
+      if (!num) return false;
+      return num->scalarValue.isFloat() ? num->scalarValue.floatValue == 0.0f
+                                        : num->scalarValue.intValue == 0;
+    }
+    for (const auto& elem : list->elements) {
+      if (!elem) continue;
+      if (auto* sub = dynamic_cast<InitList*>(elem.get())) {
+        if (!isZeroList(sub)) return false;
+        continue;
+      }
+      auto* expr = dynamic_cast<Expr*>(elem.get());
+      auto* num = expr ? dynamic_cast<NumberExpr*>(expr) : nullptr;
+      if (!num) return false;
+      bool isZero = num->scalarValue.isFloat() ? num->scalarValue.floatValue == 0.0f
+                                               : num->scalarValue.intValue == 0;
+      if (!isZero) return false;
+    }
+    return true;
+  };
+  return isZeroList(def->initList.get());
+}
 
 int IRGenerator::calcArraySize(const std::vector<int>& dimensions) const {
+
   int size = 1;
   for (int dim : dimensions) {
     size *= dim;
@@ -710,7 +769,24 @@ ScalarValue IRGenerator::evalConstExpr(Expr* expr) {
   if (auto* num = dynamic_cast<NumberExpr*>(expr)) {
     return num->scalarValue;
   }
-  // 对于非常量表达式，返回默认值
+  if (auto* unary = dynamic_cast<UnaryExpr*>(expr)) {
+    ScalarValue operand = evalConstExpr(unary->operand.get());
+    switch (unary->op) {
+      case UnaryExpr::U_PLUS:
+        return operand;
+      case UnaryExpr::U_MINUS:
+        if (operand.isFloat()) {
+          return ScalarValue::Float(-operand.floatValue);
+        }
+        return ScalarValue::Int(-operand.intValue);
+      case UnaryExpr::U_NOT:
+        if (operand.isFloat()) {
+          return ScalarValue::Int(operand.floatValue == 0.0f ? 1 : 0);
+        }
+        return ScalarValue::Int(operand.intValue == 0 ? 1 : 0);
+    }
+  }
+  // 对于当前不支持的非常量表达式，返回默认值
   return ScalarValue::Int(0);
 }
 
@@ -973,33 +1049,44 @@ IRGenerator::ExprResult IRGenerator::genLValueExpr(Expr* expr) {
       }
     }
 
-    // 计算地址: addr = base + index * elementCount * 4
-    int offsetReg = newVReg();
-    if (elementCount == 1) {
-      // offset = index * 4
-      current_->append<BinaryInst>(BinaryOp::Mul, ValueType::I32, ValueType::I32,
-                                   offsetReg, indexResult.operand, Operand::Imm(4));
+    // 计算地址: addr = base + index * (elementCount * 4)
+    int strideBytes = elementCount * 4;
+    Operand offsetOperand = Operand::Imm(0);
+    if (indexResult.operand.isImm()) {
+      offsetOperand = Operand::Imm(indexResult.operand.immValue * strideBytes);
     } else {
-      // offset = index * elementCount * 4
-      int tempReg = newVReg();
+      int offsetReg = newVReg();
       current_->append<BinaryInst>(BinaryOp::Mul, ValueType::I32, ValueType::I32,
-                                   tempReg, indexResult.operand,
-                                   Operand::Imm(elementCount));
-      current_->append<BinaryInst>(BinaryOp::Mul, ValueType::I32, ValueType::I32,
-                                   offsetReg, Operand::VReg(tempReg, ValueType::I32),
-                                   Operand::Imm(4));
+                                   offsetReg, indexResult.operand,
+                                   Operand::Imm(strideBytes));
+      offsetOperand = Operand::VReg(offsetReg, ValueType::I32);
     }
 
     // 计算最终地址
-    int addrReg = newVReg();
-    current_->append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32,
-                                 addrReg, baseResult.addrOperand,
-                                 Operand::VReg(offsetReg, ValueType::I32));
+    Operand finalAddr = baseResult.addrOperand;
+    if (offsetOperand.isImm()) {
+      if (offsetOperand.immValue != 0) {
+        if (baseResult.addrOperand.isLocalVarAddr()) {
+          finalAddr = Operand::LocalVarAddr(baseResult.addrOperand.immValue +
+                                            offsetOperand.immValue);
+        } else {
+          int addrReg = newVReg();
+          current_->append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32,
+                                       addrReg, baseResult.addrOperand, offsetOperand);
+          finalAddr = Operand::VReg(addrReg, ValueType::I32);
+        }
+      }
+    } else {
+      int addrReg = newVReg();
+      current_->append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32,
+                                   addrReg, baseResult.addrOperand, offsetOperand);
+      finalAddr = Operand::VReg(addrReg, ValueType::I32);
+    }
 
     // 构造结果类型（减少一个维度）
     ExprResult result;
     result.isArrayAccess = true;
-    result.addrOperand = Operand::VReg(addrReg, ValueType::I32);
+    result.addrOperand = finalAddr;
 
     Type resultType;
     resultType.base = baseResult.type.base;

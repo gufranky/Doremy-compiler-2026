@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 #define SYS_READ 63
 #define SYS_WRITE 64
@@ -132,57 +133,24 @@ static double pow10_int(int exp) {
 }
 
 float getfloat(void) {
+  char token[128];
+  size_t len = 0;
+
   int ch = skip_spaces();
-  int sign = 1;
-  if (ch == '-') {
-    sign = -1;
-    ch = next_char();
-  } else if (ch == '+') {
-    ch = next_char();
-  }
-
-  double value = 0.0;
-  while (ch >= '0' && ch <= '9') {
-    value = value * 10.0 + (double)(ch - '0');
-    ch = next_char();
-  }
-
-  if (ch == '.') {
-    double frac = 0.0;
-    double scale = 1.0;
-    ch = next_char();
-    while (ch >= '0' && ch <= '9') {
-      frac = frac * 10.0 + (double)(ch - '0');
-      scale *= 10.0;
-      ch = next_char();
+  while (ch >= 0 && ch != ' ' && ch != '\n' && ch != '\r' && ch != '\t' &&
+         ch != '\f' && ch != '\v') {
+    if (len + 1 < sizeof(token)) {
+      token[len++] = (char)ch;
     }
-    value += frac / scale;
-  }
-
-  if (ch == 'e' || ch == 'E') {
-    int exp_sign = 1;
-    int exp_value = 0;
     ch = next_char();
-    if (ch == '-') {
-      exp_sign = -1;
-      ch = next_char();
-    } else if (ch == '+') {
-      ch = next_char();
-    }
-    while (ch >= '0' && ch <= '9') {
-      exp_value = exp_value * 10 + (ch - '0');
-      ch = next_char();
-    }
-    value *= pow10_int(exp_sign * exp_value);
   }
 
   if (ch >= 0) {
     unread_char(ch);
   }
-  if (sign < 0) {
-    value = -value;
-  }
-  return (float)value;
+
+  token[len] = '\0';
+  return strtof(token, NULL);
 }
 
 int getarray(int a[]) {

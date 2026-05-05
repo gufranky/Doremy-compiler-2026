@@ -13,7 +13,7 @@ GENERATED_DIR = generated
 BUILD_DIR = build
 
 # Source files
-FRONTEND_SRCS = $(FRONTEND_DIR)/ast.cpp $(FRONTEND_DIR)/semantic_analyzer.cpp
+FRONTEND_SRCS = $(FRONTEND_DIR)/ast.cpp $(FRONTEND_DIR)/semantic_analyzer.cpp $(FRONTEND_DIR)/preprocessor.cpp $(FRONTEND_DIR)/parse_driver.cpp
 IR_SRCS = $(wildcard src/ir/*.cpp)
 OPT_SRCS = $(wildcard src/optimize/*.cpp)
 BACKEND_SRCS = $(wildcard src/backend/*.cpp)

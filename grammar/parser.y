@@ -304,6 +304,17 @@ VarDef
         }
         delete $1;
     }
+    | LPAREN VOID STAR RPAREN IDENTIFIER ArrayDims {
+        $$ = new VarDef(*$5);
+        $$->isArray = ($6 != nullptr && !$6->empty());
+        if ($6) {
+            for (auto* dim : *$6) {
+                $$->arrayDimExprs.emplace_back(dim);
+            }
+            delete $6;
+        }
+        delete $5;
+    }
     | IDENTIFIER ArrayDims ASSIGN InitVal {
         if ($4->isScalar && $4->elements.size() == 1) {
             // 标量初始化：提取表达式
@@ -322,6 +333,23 @@ VarDef
             delete $2;
         }
         delete $1;
+    }
+    | LPAREN VOID STAR RPAREN IDENTIFIER ArrayDims ASSIGN InitVal {
+        if ($8->isScalar && $8->elements.size() == 1) {
+            $$ = new VarDef(*$5, dynamic_cast<Expr*>($8->elements[0].release()));
+        } else {
+            $$ = new VarDef(*$5, $8);
+        }
+        $$->isArray = ($6 != nullptr && !$6->empty());
+        $$->hasInit = true;
+        $$->hasInitList = !($8->isScalar);
+        if ($6) {
+            for (auto* dim : *$6) {
+                $$->arrayDimExprs.emplace_back(dim);
+            }
+            delete $6;
+        }
+        delete $5;
     }
     ;
 
@@ -471,6 +499,10 @@ LVal
     : IDENTIFIER {
         $$ = new IdentifierExpr(*$1);
         delete $1;
+    }
+    | LPAREN VOID STAR RPAREN IDENTIFIER {
+        $$ = new IdentifierExpr(*$5);
+        delete $5;
     }
     | LVal LBRACKET Expr RBRACKET {
         $$ = new ArrayAccessExpr($1, $3);

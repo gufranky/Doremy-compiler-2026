@@ -67,6 +67,21 @@ Spill 槽从 4 字节扩展到 8 字节，匹配 RV64 的 64 位值大小。
 - **74_kmp** — 修复 `.in` 行尾后，KMP 模式匹配返回正确结果 23
 - **69_expr_eval** — 修复 `.in` 行尾后，表达式求值输出与预期一致
 
+### 当前全量 funct 基线（2026-05-05）
+- 总用例：141
+- 编译通过：136（96.45%）
+- 执行通过：134（95.04%）
+- 失败分布：`compile=5`、`run=1`、`mismatch=1`
+
+#### 当前失败清单
+- **19_search** — `run` 超时；在 120 秒下复测仍超时，属于真实运行性能问题
+- **23_json** — `compile` 超时；在 120 秒下复测仍超时，属于真实编译性能问题
+- **25_scope3** — `compile` 解析失败；`funct/25_scope3.sy:1` 使用 `(void *)putch` 这类 C 风格 cast / 指针写法，当前语法不支持
+- **30_many_dimensions** — `compile` 超时；在 120 秒下可通过，更像默认 30 秒阈值下的重型编译用例
+- **37_dct** — `mismatch`；数值内容一致，仅末尾空行差一个空白行，属于输出格式问题
+- **65_color** — `compile` 超时；在 120 秒下可通过，更像默认 30 秒阈值下的重型编译用例
+- **75_max_flow** — `compile` 语义分析失败；`Non-void function 'max_flow' must return a value on all execution paths`，属于 `while (1)` 内返回路径误报
+
 ### 剩余失败
 - 编译失败 24 个：语法/语义特性未实现（数组、多维数组等）
 - 链接失败 4 个：96-99_matrix 系列，报 `undefined reference to 'L'`，是标签生成的 bug

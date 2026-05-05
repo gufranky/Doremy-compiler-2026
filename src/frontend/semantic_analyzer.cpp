@@ -386,23 +386,42 @@ void SemanticAnalyzer::visit(BinaryExpr* node) {
 void SemanticAnalyzer::visit(Block* node) {
   symbolTable.enterScope();
   bool blockReturns = false;
+  bool blockBreaks = false;
+  bool blockFallsThrough = true;
   for (auto& stmt : node->stmts) {
+    if (!blockFallsThrough) {
+      break;
+    }
     hasReturn = false;
+    hasBreak = false;
+    hasFallthrough = true;
     stmt->accept(this);
-    if (hasReturn) blockReturns = true;
+    if (hasReturn) {
+      blockReturns = true;
+    }
+    if (hasBreak) {
+      blockBreaks = true;
+    }
+    blockFallsThrough = hasFallthrough;
   }
   hasReturn = blockReturns;
+  hasBreak = blockBreaks;
+  hasFallthrough = blockFallsThrough;
   symbolTable.exitScope();
 }
 
 void SemanticAnalyzer::visit(EmptyStmt* node) {
   (void)node;
   hasReturn = false;
+  hasBreak = false;
+  hasFallthrough = true;
 }
 
 void SemanticAnalyzer::visit(ExprStmt* node) {
   node->expr->accept(this);
   hasReturn = false;
+  hasBreak = false;
+  hasFallthrough = true;
 }
 
 void SemanticAnalyzer::visit(AssignStmt* node) {
@@ -412,6 +431,8 @@ void SemanticAnalyzer::visit(AssignStmt* node) {
     // 错误已在 analyzeLValue 中报告
     node->value->accept(this);
     hasReturn = false;
+    hasBreak = false;
+    hasFallthrough = true;
     return;
   }
 
@@ -430,6 +451,8 @@ void SemanticAnalyzer::visit(AssignStmt* node) {
   }
 
   hasReturn = false;
+  hasBreak = false;
+  hasFallthrough = true;
 }
 
 void SemanticAnalyzer::visitDeclDefs(VarDeclStmt* node) {
@@ -446,31 +469,22 @@ void SemanticAnalyzer::visitDeclDefs(VarDeclStmt* node) {
         continue;
       }
       varType.isArray = true;
-      varType.arrayDimensions = def->arrayDimensions;
-    }
-
-    if (varType.isConst && !def->hasInit) {
-      addError("Const variable '" + def->name + "' must be initialized");
-    }
-
-    if (def->hasInit) {
-      if (def->hasInitList) {
-        // 数组初始化列表
-        if (!varType.isArray) {
-          addError("Init list can only be used for array initialization for '" + def->name + "'");
-        } else {
-          if (validateInitList(def->initList.get(), varType, &constArrayValues)) {
-            initIsConst = true;
-            // 存储扁平化的初始化值
-            def->typedConstInitValue = constArrayValues.empty() ?
-                ScalarValue::Int(0) : constArrayValues[0];
-          }
+      varType.arrayDimensions.clear();
+      for (auto& dimExpr : def->arrayDimExprs) {
+        ScalarValue dimValue;
+        if (evalConstExpr(dimExpr.get(), &dimValue)) {
+          int dim = dimValue.isFloat() ? static_cast<int>(dimValue.floatValue) : dimValue.intValue;
+          varType.arrayDimensions.push_back(dim);
         }
-      } else if (def->initExpr) {
-        // 标量初始化
-        def->initExpr->accept(this);
+      }
+    }
+
+    // 处理初始化表达式
+    if (def->initExpr) {
+      def->initExpr->accept(this);
+      if (!def->isArray) {
         if (!isNumericType(lastExprType)) {
-          addError("Initializer for '" + def->name + "' must be int or float expression");
+          addError("Initializer for '" + def->name + "' must be numeric expression");
         } else if (!canImplicitlyConvert(lastExprType, varType)) {
           addError("Initializer type mismatch for '" + def->name + "'");
         }
@@ -478,13 +492,17 @@ void SemanticAnalyzer::visitDeclDefs(VarDeclStmt* node) {
         if (initIsConst) {
           constValue = castConstValue(constValue, varType);
         }
+      } else {
+        // 数组不能用单一表达式初始化
+        addError("Array '" + def->name + "' must be initialized with braces");
       }
-
-      if (varType.isConst && !initIsConst) {
-        addError("Const variable '" + def->name + "' must use a constant expression initializer");
-      }
-      if (symbolTable.isGlobalScope() && !initIsConst) {
-        addError("Global variable '" + def->name + "' must use a constant expression initializer");
+    } else if (def->initList) {
+      if (!def->isArray) {
+        addError("Scalar variable '" + def->name + "' cannot be initialized with braces");
+      } else {
+        if (validateInitList(def->initList.get(), varType, &constArrayValues)) {
+          initIsConst = true;
+        }
       }
     }
 
@@ -507,6 +525,8 @@ void SemanticAnalyzer::visitDeclDefs(VarDeclStmt* node) {
 void SemanticAnalyzer::visit(VarDeclStmt* node) {
   visitDeclDefs(node);
   hasReturn = false;
+  hasBreak = false;
+  hasFallthrough = true;
 }
 
 void SemanticAnalyzer::visit(IfStmt* node) {
@@ -516,18 +536,32 @@ void SemanticAnalyzer::visit(IfStmt* node) {
   }
 
   bool thenHasReturn = false;
+  bool thenHasBreak = false;
+  bool thenFallsThrough = true;
   hasReturn = false;
+  hasBreak = false;
+  hasFallthrough = true;
   node->thenStmt->accept(this);
   thenHasReturn = hasReturn;
+  thenHasBreak = hasBreak;
+  thenFallsThrough = hasFallthrough;
 
   bool elseHasReturn = false;
+  bool elseHasBreak = false;
+  bool elseFallsThrough = true;
   if (node->elseStmt) {
     hasReturn = false;
+    hasBreak = false;
+    hasFallthrough = true;
     node->elseStmt->accept(this);
     elseHasReturn = hasReturn;
+    elseHasBreak = hasBreak;
+    elseFallsThrough = hasFallthrough;
   }
 
-  hasReturn = thenHasReturn && elseHasReturn;
+  hasReturn = thenHasReturn && node->elseStmt && elseHasReturn;
+  hasBreak = thenHasBreak || elseHasBreak;
+  hasFallthrough = node->elseStmt ? (thenFallsThrough || elseFallsThrough) : true;
 }
 
 void SemanticAnalyzer::visit(WhileStmt* node) {
@@ -536,11 +570,25 @@ void SemanticAnalyzer::visit(WhileStmt* node) {
     addError("While condition must be int or float expression");
   }
 
+  bool conditionAlwaysTrue = false;
+  ScalarValue condValue;
+  if (evalConstExpr(node->condition.get(), &condValue)) {
+    conditionAlwaysTrue = isTruthy(condValue);
+  }
+
   loopDepth++;
   hasReturn = false;
+  hasBreak = false;
+  hasFallthrough = true;
   node->body->accept(this);
+  bool bodyHasReturn = hasReturn;
+  bool bodyHasBreak = hasBreak;
+  bool bodyFallsThrough = hasFallthrough;
   loopDepth--;
-  hasReturn = false;
+
+  hasReturn = conditionAlwaysTrue && bodyHasReturn && !bodyHasBreak;
+  hasBreak = false;
+  hasFallthrough = !conditionAlwaysTrue || bodyHasBreak;
 }
 
 void SemanticAnalyzer::visit(BreakStmt* node) {
@@ -549,6 +597,8 @@ void SemanticAnalyzer::visit(BreakStmt* node) {
     addError("'break' statement not in loop");
   }
   hasReturn = false;
+  hasBreak = true;
+  hasFallthrough = false;
 }
 
 void SemanticAnalyzer::visit(ContinueStmt* node) {
@@ -557,6 +607,8 @@ void SemanticAnalyzer::visit(ContinueStmt* node) {
     addError("'continue' statement not in loop");
   }
   hasReturn = false;
+  hasBreak = false;
+  hasFallthrough = false;
 }
 
 void SemanticAnalyzer::visit(ReturnStmt* node) {
@@ -570,6 +622,8 @@ void SemanticAnalyzer::visit(ReturnStmt* node) {
       addError("Non-void function '" + currentFunction->name + "' must return a value");
     }
     hasReturn = true;
+    hasBreak = false;
+    hasFallthrough = false;
     return;
   }
 
@@ -581,11 +635,15 @@ void SemanticAnalyzer::visit(ReturnStmt* node) {
     addError("Non-void function '" + currentFunction->name + "' has incompatible return expression");
   }
   hasReturn = true;
+  hasBreak = false;
+  hasFallthrough = false;
 }
 
 void SemanticAnalyzer::visit(FuncDef* node) {
   currentFunction = node;
   hasReturn = false;
+  hasBreak = false;
+  hasFallthrough = true;
   symbolTable.enterScope();
 
   for (auto& param : node->params) {
@@ -609,15 +667,18 @@ void SemanticAnalyzer::visit(FuncDef* node) {
 
   if ((node->returnType.base == BaseType::INT ||
        node->returnType.base == BaseType::FLOAT) &&
-      !hasReturn) {
+      hasFallthrough) {
     addError("Non-void function '" + node->name + "' must return a value on all execution paths");
   }
 
   symbolTable.exitScope();
   currentFunction = nullptr;
+  hasBreak = false;
+  hasFallthrough = false;
 }
 
 void SemanticAnalyzer::visit(CompUnit* node) {
+
   for (auto& item : node->items) {
     if (auto* decl = dynamic_cast<VarDeclStmt*>(item.get())) {
       decl->accept(this);

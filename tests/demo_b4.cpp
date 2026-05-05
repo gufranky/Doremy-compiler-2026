@@ -6,22 +6,19 @@
 #include "backend_codegen.h"
 #include "ir_generator.h"
 #include "optimizer.h"
+#include "parse_driver.h"
 #include "semantic_analyzer.h"
 
 using namespace ir;
 
-extern FILE* yyin;
-extern int yyparse();
 extern CompUnit* root;
 
 int main() {
   // Test with a simple function
   const char* testcase = "testcases/functional/f03_if_else.c";
 
-  yyin = fopen(testcase, "r");
-  assert(yyin && "failed to open testcase");
-  int parseRet = yyparse();
-  assert(parseRet == 0 && root);
+  bool parsed = frontend::parse_from_file(testcase);
+  assert(parsed && root);
 
   SemanticAnalyzer sema;
   bool ok = sema.analyze(root);
@@ -32,7 +29,6 @@ int main() {
 
   delete root;
   root = nullptr;
-  fclose(yyin);
 
   // Optimize
   OptimizeProgram(prog);

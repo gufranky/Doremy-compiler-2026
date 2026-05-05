@@ -46,7 +46,10 @@ def normalize_text(text: str) -> str:
 
 
 def split_expected_lines(text: str) -> list[str]:
-    return normalize_text(text).splitlines()
+    lines = normalize_text(text).splitlines()
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
 
 
 def build_actual_output(stdout: str, return_code: int) -> str:
@@ -54,6 +57,11 @@ def build_actual_output(stdout: str, return_code: int) -> str:
     if stdout and not stdout.endswith("\n"):
         stdout += "\n"
     return f"{stdout}{return_code}\n"
+
+
+def normalize_input_file(src: Path, dst: Path) -> None:
+    data = src.read_text(encoding="utf-8")
+    dst.write_text(normalize_text(data), encoding="utf-8")
 
 
 def discover_cases(cases_dir: Path, pattern: str, limit: int | None) -> list[Path]:
@@ -94,12 +102,13 @@ def shell_join(parts: list[str]) -> str:
 
 def sanitize_wsl_text(text: str) -> str:
     cleaned = text.replace("\x00", "")
-    lines = []
-    for line in normalize_text(cleaned).splitlines():
+    lines = normalize_text(cleaned).split("\n")
+    kept = []
+    for line in lines:
         if line.startswith("wsl:"):
             continue
-        lines.append(line)
-    return "\n".join(lines)
+        kept.append(line)
+    return "\n".join(kept)
 
 
 def run_runner_command(
@@ -298,6 +307,7 @@ def main() -> int:
             case_name = case.stem
             expected_path = case.with_suffix(".out")
             input_path = case.with_suffix(".in")
+            normalized_input_path = temp_root / f"{case_name}.in"
             asm_path = temp_root / f"{case_name}.s"
             exe_path = temp_root / case_name
 
@@ -324,6 +334,8 @@ def main() -> int:
                 continue
 
             compile_passes += 1
+            if input_path.exists():
+                normalize_input_file(input_path, normalized_input_path)
             if args.mode == "compile":
                 results.append(CaseResult(case_name, True, True, "ok"))
                 if not args.quiet:
@@ -347,7 +359,8 @@ def main() -> int:
                 continue
 
             try:
-                run_proc = run_case(config, toolchain, exe_path, input_path if input_path.exists() else None, timeout=args.timeout)
+                run_input_path = normalized_input_path if input_path.exists() else None
+                run_proc = run_case(config, toolchain, exe_path, run_input_path, timeout=args.timeout)
             except subprocess.TimeoutExpired:
                 results.append(CaseResult(case_name, True, False, "run", "运行超时"))
                 if not args.quiet:

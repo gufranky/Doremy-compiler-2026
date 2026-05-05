@@ -91,6 +91,7 @@ class IRGenerator {
                         int totalSize);
   void flattenInitListWithDims(InitList* initList, std::vector<ScalarValue>& result,
                                 const std::vector<int>& dimensions);
+  bool isZeroInitializedArray(VarDef* def) const;
   // 新增：收集初始化表达式（支持非常量表达式）
   struct InitElement {
     bool isConst = true;

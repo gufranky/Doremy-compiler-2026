@@ -7,10 +7,9 @@
 #include "backend_codegen.h"
 #include "ir_generator.h"
 #include "optimizer.h"
+#include "parse_driver.h"
 #include "semantic_analyzer.h"
 
-extern FILE* yyin;
-extern int yyparse();
 extern CompUnit* root;
 
 int main(int argc, char** argv) {
@@ -26,26 +25,12 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Read from stdin by default, or from file if specified
-  if (!inputFile.empty()) {
-    yyin = fopen(inputFile.c_str(), "r");
-    if (!yyin) {
-      std::cerr << "Error: Cannot open file " << inputFile << "\n";
-      return 1;
-    }
-  } else {
-    yyin = stdin;
-  }
-
   // Parse the input
-  if (yyparse() != 0) {
+  bool parsed = inputFile.empty() ? frontend::parse_from_stdin()
+                                  : frontend::parse_from_file(inputFile);
+  if (!parsed) {
     std::cerr << "Parsing failed!\n";
-    if (yyin != stdin) fclose(yyin);
     return 1;
-  }
-
-  if (yyin != stdin) {
-    fclose(yyin);
   }
 
   if (!root) {
