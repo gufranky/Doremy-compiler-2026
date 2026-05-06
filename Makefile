@@ -55,6 +55,9 @@ $(PARSER_SRC) $(PARSER_HDR): $(GRAMMAR_DIR)/parser.y | $(GENERATED_DIR)
 $(FRONTEND_OBJS): $(BUILD_DIR)/%.o: $(FRONTEND_DIR)/%.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/generated_frontend.o: $(FRONTEND_DIR)/generated_frontend.cpp $(LEXER_SRC) $(PARSER_SRC) $(PARSER_HDR) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $(FRONTEND_DIR)/generated_frontend.cpp -o $(BUILD_DIR)/generated_frontend.o
+
 $(IR_OBJS): $(BUILD_DIR)/%.o: src/ir/%.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
