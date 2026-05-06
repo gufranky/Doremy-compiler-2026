@@ -61,7 +61,7 @@ def build_actual_output(stdout: str, return_code: int) -> str:
 
 def normalize_input_file(src: Path, dst: Path) -> None:
     data = src.read_text(encoding="utf-8")
-    dst.write_text(normalize_text(data), encoding="utf-8")
+    dst.write_text(normalize_text(data), encoding="utf-8", newline="\n")
 
 
 def discover_cases(cases_dir: Path, pattern: str, limit: int | None) -> list[Path]:

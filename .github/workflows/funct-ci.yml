@@ -50,6 +50,7 @@ jobs:
             --runner host \
             --build-cmd "make clean && make" \
             --runtime libsysy_riscv.a \
+            --timeout 60 \
             --summary-json full-summary.json \
             --quiet | tee full.log
           status=${PIPESTATUS[0]}
