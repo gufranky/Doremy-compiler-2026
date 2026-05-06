@@ -26,6 +26,9 @@ jobs:
 
       - name: Prepare com branch content
         shell: bash
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_REPO_URL: ${{ secrets.GITLAB_REPO_URL }}
         run: |
           set -euo pipefail
 
@@ -64,11 +67,31 @@ jobs:
 
           if git diff --cached --quiet; then
             echo "No changes to export."
-            exit 0
+          else
+            git commit -m "[SKIP_CI] Sync compiler-only com branch from ${GITHUB_SHA}"
+            git push --force origin HEAD:com
           fi
 
-          git commit -m "[SKIP_CI] Sync compiler-only com branch from ${GITHUB_SHA}"
-          git push --force origin HEAD:com
+          if [ -n "${GITLAB_TOKEN:-}" ] && [ -n "${GITLAB_REPO_URL:-}" ]; then
+            case "${GITLAB_REPO_URL}" in
+              https://*)
+                gitlab_remote="https://oauth2:${GITLAB_TOKEN}@${GITLAB_REPO_URL#https://}"
+                ;;
+              http://*)
+                gitlab_remote="http://oauth2:${GITLAB_TOKEN}@${GITLAB_REPO_URL#http://}"
+                ;;
+              *)
+                echo "GITLAB_REPO_URL must start with http:// or https://"
+                exit 1
+                ;;
+            esac
+
+            git remote remove gitlab 2>/dev/null || true
+            git remote add gitlab "${gitlab_remote}"
+            git push --force gitlab HEAD:master
+          else
+            echo "Skip GitLab push because GITLAB_TOKEN or GITLAB_REPO_URL is not configured."
+          fi
 
       - name: Cleanup worktree
         if: always()
