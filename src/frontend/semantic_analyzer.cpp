@@ -24,6 +24,9 @@ void SemanticAnalyzer::declareBuiltinFunctions() {
   symbolTable.declareFunction("getfarray", Type::Int(), {floatArrayParam});
   symbolTable.declareFunction("putarray", Type::Void(), {Type::Int(), intArrayParam});
   symbolTable.declareFunction("putfarray", Type::Void(), {Type::Int(), floatArrayParam});
+
+  symbolTable.declareFunction("_sysy_starttime", Type::Void(), {Type::Int()});
+  symbolTable.declareFunction("_sysy_stoptime", Type::Void(), {Type::Int()});
 }
 
 bool SemanticAnalyzer::isIntType(const Type& type) const {
