@@ -11,6 +11,8 @@ using namespace regalloc;
 // ================== Assembly-level Peephole Optimizer ==================
 namespace {
 
+int gPcrelLabelCounter = 0;
+
 inline bool startsWith(const std::string& s, const std::string& prefix) {
   return s.rfind(prefix, 0) == 0;
 }
@@ -749,8 +751,13 @@ std::vector<std::string> optimizeDeadCodeAfterJump(const std::vector<std::string
 std::vector<std::string> optimizeUnusedLabels(const std::vector<std::string>& lines) {
   // Collect all referenced labels
   std::set<std::string> refs;
+  std::set<std::string> globalSymbols;
   for (const auto& line : lines) {
     std::string t = trim(line);
+    if (startsWith(t, ".globl ")) {
+      globalSymbols.insert(trim(t.substr(7)));
+      continue;
+    }
     if (startsWith(t, "j ")) {
       refs.insert(trim(t.substr(2)));
     } else if (startsWith(t, "jal x0, ")) {
@@ -784,11 +791,20 @@ std::vector<std::string> optimizeUnusedLabels(const std::vector<std::string>& li
       std::string t = trim(lines[i]);
       lab = t.substr(0, t.size() - 1);
       
-      // Keep function labels and referenced labels
+      // Keep exported symbols and referenced labels.
+      if (globalSymbols.find(lab) != globalSymbols.end()) {
+        result.push_back(lines[i]);
+        continue;
+      }
+
+      // Drop only compiler-generated internal control-flow labels.
       bool isAuto = (!lab.empty() && lab[0] == 'L' && lab.size() > 1 && std::isdigit(lab[1])) ||
                     (lab.find("_B") != std::string::npos) ||
-                    (lab.find("_while") != std::string::npos) ||
-                    (lab.find("_if") != std::string::npos);
+                    (lab.find("_while_") != std::string::npos) ||
+                    (lab.find("_if_true") != std::string::npos) ||
+                    (lab.find("_if_false") != std::string::npos) ||
+                    (lab.find("_if_end") != std::string::npos) ||
+                    (lab.find("_for_") != std::string::npos);
       
       if (isAuto && refs.find(lab) == refs.end()) {
         continue;  // Drop unreferenced auto labels
@@ -1073,6 +1089,16 @@ void CodeGen::emitLoadFloatImmediate(const std::string& freg, float value,
                                      std::vector<std::string>& out) const {
   emitLoadImmediate("t6", floatBits(value), out);
   out.push_back("\tfmv.w.x " + freg + ", t6");
+}
+
+void CodeGen::emitLoadGlobalAddress(const std::string& dstReg,
+                                    const std::string& symbol,
+                                    std::vector<std::string>& out) const {
+  std::string anchor = ".Lpcrel_" + std::to_string(gPcrelLabelCounter++);
+  out.push_back(anchor + ":");
+  out.push_back("\tauipc " + dstReg + ", %pcrel_hi(" + symbol + ")");
+  out.push_back("\taddi " + dstReg + ", " + dstReg + ", %pcrel_lo(" + anchor +
+                ")");
 }
 
 void CodeGen::emitLoadImmediate(const std::string& reg, int imm,
@@ -1666,7 +1692,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       emitStackAddress(targetReg, "sp", totalOffset, insns);
       return targetReg;
     }
-    insns.push_back("\tla " + targetReg + ", " + op.globalName);
+    emitLoadGlobalAddress(targetReg, op.globalName, insns);
     return targetReg;
   };
 
@@ -2105,7 +2131,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           }
         }
 
-        insns.push_back("\tjal ra, " + c->callee);
+        insns.push_back("\tcall " + c->callee);
 
         for (const auto& reg : frame.callerSavedRegs) {
           if (!destRegName.empty() && reg == destRegName) {

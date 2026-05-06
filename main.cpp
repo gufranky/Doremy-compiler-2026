@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -12,22 +13,70 @@
 
 extern CompUnit* root;
 
-int main(int argc, char** argv) {
+namespace {
+
+void printUsage(const char* prog) {
+  std::cerr << "Usage: " << prog << " -S -o <output.s> <input.sy> [-O1]\n";
+}
+
+struct CommandLineOptions {
+  bool emitAssembly = false;
   bool enableOpt = false;
   std::string inputFile;
+  std::string outputFile;
+};
 
+bool parseCommandLine(int argc, char** argv, CommandLineOptions& options) {
   for (int i = 1; i < argc; ++i) {
     std::string arg(argv[i]);
-    if (arg == "-opt") {
-      enableOpt = true;
-    } else if (arg[0] != '-') {
-      inputFile = arg;
+    if (arg == "-S") {
+      options.emitAssembly = true;
+    } else if (arg == "-O1") {
+      options.enableOpt = true;
+    } else if (arg == "-o") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: missing output file after -o\n";
+        return false;
+      }
+      options.outputFile = argv[++i];
+    } else if (!arg.empty() && arg[0] == '-') {
+      std::cerr << "Error: unsupported option " << arg << "\n";
+      return false;
+    } else {
+      if (!options.inputFile.empty()) {
+        std::cerr << "Error: multiple input files are not supported\n";
+        return false;
+      }
+      options.inputFile = arg;
     }
   }
 
+  if (!options.emitAssembly) {
+    std::cerr << "Error: -S is required\n";
+    return false;
+  }
+  if (options.outputFile.empty()) {
+    std::cerr << "Error: -o <output.s> is required\n";
+    return false;
+  }
+  if (options.inputFile.empty()) {
+    std::cerr << "Error: input file is required\n";
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  CommandLineOptions options;
+  if (!parseCommandLine(argc, argv, options)) {
+    printUsage(argv[0]);
+    return 1;
+  }
+
   // Parse the input
-  bool parsed = inputFile.empty() ? frontend::parse_from_stdin()
-                                  : frontend::parse_from_file(inputFile);
+  bool parsed = frontend::parse_from_file(options.inputFile);
   if (!parsed) {
     std::cerr << "Parsing failed!\n";
     return 1;
@@ -52,7 +101,7 @@ int main(int argc, char** argv) {
   IRGenerator generator;
   ir::IRProgram program = generator.generate(root);
 
-  if (enableOpt) {
+  if (options.enableOpt) {
     ir::OptimizeProgram(program);
   }
 
@@ -60,9 +109,22 @@ int main(int argc, char** argv) {
   CodeGen codegen;
   std::vector<std::string> asmLines = codegen.generate(program);
 
-  // Output assembly to stdout
+  std::ofstream output(options.outputFile, std::ios::binary);
+  if (!output) {
+    std::cerr << "Error: Cannot open output file " << options.outputFile
+              << "\n";
+    delete root;
+    return 1;
+  }
+
   for (const auto& line : asmLines) {
-    std::cout << line << "\n";
+    output << line << "\n";
+  }
+  if (!output) {
+    std::cerr << "Error: Failed to write output file " << options.outputFile
+              << "\n";
+    delete root;
+    return 1;
   }
 
   // Clean up AST
