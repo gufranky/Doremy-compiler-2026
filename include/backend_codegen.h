@@ -76,6 +76,9 @@ class CodeGen {
                          std::vector<std::string>& out) const;
   void emitLoadFloatImmediate(const std::string& freg, float value,
                               std::vector<std::string>& out) const;
+  void emitLoadGlobalAddress(const std::string& dstReg,
+                             const std::string& symbol,
+                             std::vector<std::string>& out) const;
   void emitStackAddress(const std::string& dstReg,
                         const std::string& baseReg, int offset,
                         std::vector<std::string>& out) const;

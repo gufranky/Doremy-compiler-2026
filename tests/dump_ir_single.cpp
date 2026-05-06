@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cstdio>
+#include <cstdint>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -23,8 +24,20 @@ static std::string formatOperand(const Operand& op) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::cerr << "usage: dump_ir_single <cfile>\n";
+    std::cerr << "usage: dump_ir_single <cfile> [--pass-mask N] [--stop-after N] [--disable-ipa]\n";
     return 1;
+  }
+
+  OptimizeConfig config;
+  for (int i = 2; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--pass-mask" && i + 1 < argc) {
+      config.passMask = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+    } else if (arg == "--stop-after" && i + 1 < argc) {
+      config.stopAfter = std::stoi(argv[++i]);
+    } else if (arg == "--disable-ipa") {
+      config.disableIpa = true;
+    }
   }
 
   bool parsed = frontend::parse_from_file(argv[1]);
@@ -39,7 +52,7 @@ int main(int argc, char** argv) {
 
   IRGenerator gen;
   IRProgram prog = gen.generate(root);
-  OptimizeProgram(prog);
+  OptimizeProgram(prog, config);
 
   for (const auto& fn : prog.functions) {
     if (fn.name != "func") continue;

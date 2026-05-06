@@ -49,7 +49,7 @@ jobs:
             --mode full \
             --runner host \
             --build-cmd "make clean && make" \
-            --runtime libsysy_riscv.a \
+            --opt \
             --timeout 60 \
             --summary-json full-summary.json \
             --quiet | tee full.log

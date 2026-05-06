@@ -199,8 +199,10 @@ def compile_case(
     repo = as_wsl_path(config.repo_root) if config.runner == "wsl" else str(config.repo_root)
     case_ref = as_wsl_path(case) if config.runner == "wsl" else str(case)
     asm_ref = as_wsl_path(asm_path) if config.runner == "wsl" else str(asm_path)
-    opt_flag = " -opt" if enable_opt else ""
-    command = f"cd {shlex.quote(repo)} && {toolchain.compiler}{opt_flag} < {shlex.quote(case_ref)} > {shlex.quote(asm_ref)}"
+    parts = [toolchain.compiler, "-S", "-o", asm_ref, case_ref]
+    if enable_opt:
+        parts.append("-O1")
+    command = f"cd {shlex.quote(repo)} && {shell_join(parts)}"
     return run_runner_command(config, command, timeout=timeout)
 
 
@@ -248,16 +250,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--build-cmd", help="测试前先执行的构建命令，例如 make compiler")
     parser.add_argument("--gcc", help="RISC-V GCC 命令，默认 riscv64-linux-gnu-gcc")
     parser.add_argument("--qemu", help="QEMU 命令，默认 qemu-riscv64")
-    parser.add_argument("--runtime", nargs="*", default=[], help="运行时文件列表；默认自动探测 libsysy_riscv.a / sylib.c")
+    parser.add_argument("--runtime", nargs="*", default=[], help="运行时文件列表；默认自动探测 sysy_runtime_rv64.c")
     parser.add_argument("--runner", choices=["auto", "host", "wsl"], default="auto", help="命令执行环境，默认 auto")
     parser.add_argument("--wsl-distro", default=DEFAULT_WSL_DISTRO, help="WSL 发行版名称，默认 Ubuntu")
-    parser.add_argument("--opt", action="store_true", help="调用编译器时追加 -opt")
+    parser.add_argument("--opt", action="store_true", help="调用编译器时追加 -O1")
     parser.add_argument("--timeout", type=int, default=20, help="单个阶段超时秒数，默认 20")
     parser.add_argument("--limit", type=int, help="仅运行前 N 个用例")
     parser.add_argument("--diff-lines", type=int, default=12, help="失败时最多显示多少行 diff")
     parser.add_argument("--list-only", action="store_true", help="仅列出用例，不实际执行")
     parser.add_argument("--quiet", action="store_true", help="只输出失败用例和最终汇总")
     parser.add_argument("--summary-json", help="将汇总结果写入 JSON 文件")
+    parser.set_defaults(opt=True)
     return parser.parse_args()
 
 
@@ -293,7 +296,7 @@ def main() -> int:
         return build_rc
 
     if args.mode == "full" and not toolchain.runtime_files:
-        print("full 模式缺少运行时文件，请提供 --runtime 或将 libsysy_riscv.a 放在仓库根目录。", file=sys.stderr)
+        print("full 模式缺少运行时文件，请提供 --runtime 或将 sysy_runtime_rv64.c 放在仓库根目录。", file=sys.stderr)
         return 2
 
     compile_passes = 0

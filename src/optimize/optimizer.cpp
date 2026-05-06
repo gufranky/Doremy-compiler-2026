@@ -738,11 +738,51 @@ bool simplifyCFG(IRFunction& func) {
   return changed;
 }
 
+struct OperandKey {
+  Operand::Kind kind;
+  ValueType valueType;
+  int immValue;
+  int vregId;
+  std::string globalName;
+
+  bool operator==(const OperandKey& other) const {
+    return kind == other.kind && valueType == other.valueType &&
+           immValue == other.immValue && vregId == other.vregId &&
+           globalName == other.globalName;
+  }
+};
+
+struct OperandKeyHasher {
+  std::size_t operator()(const OperandKey& k) const {
+    std::size_t h = static_cast<std::size_t>(k.kind);
+    h ^= static_cast<std::size_t>(k.valueType) + 0x9e3779b9 + (h << 6) +
+         (h >> 2);
+    h ^= static_cast<std::size_t>(k.immValue) + 0x9e3779b9 + (h << 6) +
+         (h >> 2);
+    h ^= static_cast<std::size_t>(k.vregId) + 0x9e3779b9 + (h << 6) +
+         (h >> 2);
+    for (char c : k.globalName) {
+      h ^= static_cast<std::size_t>(c) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    }
+    return h;
+  }
+};
+
+OperandKey makeOperandKey(const Operand& op) {
+  return OperandKey{op.kind, op.valueType, op.immValue, op.vregId,
+                    op.globalName};
+}
+
+bool isSafeGVNOperand(const Operand& op) {
+  return op.isImm() || op.isVReg();
+}
+
 struct VNKeyHash {
   std::size_t operator()(const std::pair<UnaryOp, int>& k) const {
     return static_cast<std::size_t>(k.first) * 1315423911u +
            static_cast<std::size_t>(k.second + 0x9e3779b9);
   }
+
   std::size_t operator()(const std::tuple<BinaryOp, int, int>& k) const {
     std::size_t h = static_cast<std::size_t>(std::get<0>(k));
     h ^= static_cast<std::size_t>(std::get<1>(k)) + 0x9e3779b9 + (h << 6) +
@@ -771,9 +811,7 @@ bool blockGVN(IRFunction& func) {
     if (!reachable.count(blk)) continue;
 
     int nextVN = 0;
-    std::unordered_map<int, int> immToVN;
-    std::unordered_map<std::string, int> globToVN;
-    std::unordered_map<int, int> regToVN;
+    std::unordered_map<OperandKey, int, OperandKeyHasher> operandToVN;
     std::unordered_map<int, Operand> vnRep;
     std::unordered_map<std::pair<UnaryOp, int>, int, VNKeyHash> unaryMap;
     std::unordered_map<std::tuple<BinaryOp, int, int>, int, VNKeyHash>
@@ -781,33 +819,23 @@ bool blockGVN(IRFunction& func) {
 
     auto newVN = [&]() { return nextVN++; };
 
+    auto killExprTables = [&]() {
+      unaryMap.clear();
+      binaryMap.clear();
+    };
+
     auto getVN = [&](const Operand& op) {
-      if (op.isImm()) {
-        auto it = immToVN.find(op.immValue);
-        if (it != immToVN.end()) return it->second;
-        int vn = newVN();
-        immToVN[op.immValue] = vn;
-        vnRep[vn] = op;
-        return vn;
-      }
-      if (op.isGlobal()) {
-        auto it = globToVN.find(op.globalName);
-        if (it != globToVN.end()) return it->second;
-        int vn = newVN();
-        globToVN[op.globalName] = vn;
-        vnRep[vn] = op;
-        return vn;
-      }
-      auto it = regToVN.find(op.vregId);
-      if (it != regToVN.end()) return it->second;
+      OperandKey key = makeOperandKey(op);
+      auto it = operandToVN.find(key);
+      if (it != operandToVN.end()) return it->second;
       int vn = newVN();
-      regToVN[op.vregId] = vn;
+      operandToVN.emplace(key, vn);
       vnRep[vn] = op;
       return vn;
     };
 
     auto setDest = [&](int dest, int vn) {
-      regToVN[dest] = vn;
+      operandToVN[makeOperandKey(Operand::VReg(dest))] = vn;
       if (!vnRep.count(vn)) vnRep[vn] = Operand::VReg(dest);
     };
 
@@ -815,6 +843,10 @@ bool blockGVN(IRFunction& func) {
       switch (inst->kind) {
         case InstKind::Binary: {
           auto* b = static_cast<BinaryInst*>(inst);
+          if (!isSafeGVNOperand(b->lhs) || !isSafeGVNOperand(b->rhs)) {
+            setDest(b->dest, newVN());
+            break;
+          }
           int lhsVN = getVN(b->lhs);
           int rhsVN = getVN(b->rhs);
           if (isCommutative(b->op) && rhsVN < lhsVN) std::swap(lhsVN, rhsVN);
@@ -840,6 +872,10 @@ bool blockGVN(IRFunction& func) {
         }
         case InstKind::Unary: {
           auto* u = static_cast<UnaryInst*>(inst);
+          if (!isSafeGVNOperand(u->operand)) {
+            setDest(u->dest, newVN());
+            break;
+          }
           int opVN = getVN(u->operand);
           std::pair<UnaryOp, int> key{u->op, opVN};
           auto it = unaryMap.find(key);
@@ -869,22 +905,18 @@ bool blockGVN(IRFunction& func) {
         }
         case InstKind::Load: {
           auto* l = static_cast<LoadInst*>(inst);
-          (void)l;
-          binaryMap.clear();
-          unaryMap.clear();
-          setDest(static_cast<LoadInst*>(inst)->dest, newVN());
+          killExprTables();
+          setDest(l->dest, newVN());
           break;
         }
         case InstKind::Call: {
           auto* c = static_cast<CallInst*>(inst);
-          binaryMap.clear();
-          unaryMap.clear();
+          killExprTables();
           if (c->hasDest) setDest(c->dest, newVN());
           break;
         }
         case InstKind::Store: {
-          binaryMap.clear();
-          unaryMap.clear();
+          killExprTables();
           break;
         }
         default:
@@ -1007,58 +1039,53 @@ bool localMemOpt(IRFunction& func) {
   return changed;
 }
 
-// ================== GlobalVarConst: detect constant local variables ==================
-// If a local variable is only STORE'd with the same constant value, replace LOADs with that constant.
+// ================== GlobalVarConst: forward constant propagation for globals ==================
+// Replace a LOAD from a global with an immediate only when the latest value in
+// the current linear region is known to be that constant.
 bool globalVarConst(IRFunction& func) {
   bool changed = false;
-  
-  // First pass: find variables that are assigned exactly one constant
-  std::unordered_map<std::string, int> constVal;
-  std::unordered_set<std::string> nonConst;
-  std::unordered_set<std::string> seenStore;
-  
-  for (const auto& instPtr : func.instructions) {
-    if (auto* st = dynamic_cast<StoreInst*>(instPtr.get())) {
-      if (!st->addr.isGlobal()) continue;
-      const std::string& varName = st->addr.globalName;
-      
-      // Skip if already known to be non-constant
-      if (nonConst.count(varName)) continue;
-      
-      // If not storing an immediate, mark as non-constant
-      if (!st->src.isImm()) {
-        nonConst.insert(varName);
-        constVal.erase(varName);
-        continue;
-      }
-      
-      // Check if this is first store or same constant as before
-      if (seenStore.insert(varName).second) {
-        constVal[varName] = st->src.immValue;
-      } else {
-        auto it = constVal.find(varName);
-        if (it == constVal.end() || it->second != st->src.immValue) {
-          nonConst.insert(varName);
-          constVal.erase(varName);
+  std::unordered_map<std::string, int> currentConst;
+  std::vector<std::pair<size_t, std::unique_ptr<Instruction>>> replacements;
+
+  auto clearState = [&]() { currentConst.clear(); };
+
+  for (size_t i = 0; i < func.instructions.size(); ++i) {
+    Instruction* inst = func.instructions[i].get();
+
+    if (auto* ld = dynamic_cast<LoadInst*>(inst)) {
+      if (ld->addr.isGlobal()) {
+        auto it = currentConst.find(ld->addr.globalName);
+        if (it != currentConst.end()) {
+          replacements.emplace_back(
+              i, std::make_unique<CopyInst>(ld->dest, Operand::Imm(it->second)));
+          changed = true;
         }
       }
     }
-  }
-  
-  if (constVal.empty()) return false;
-  
-  // Second pass: replace LOADs of constant variables with Copy of immediate
-  for (auto& instPtr : func.instructions) {
-    if (auto* ld = dynamic_cast<LoadInst*>(instPtr.get())) {
-      if (!ld->addr.isGlobal()) continue;
-      auto it = constVal.find(ld->addr.globalName);
-      if (it != constVal.end()) {
-        instPtr = std::make_unique<CopyInst>(ld->dest, Operand::Imm(it->second));
-        changed = true;
+
+    if (auto* st = dynamic_cast<StoreInst*>(inst)) {
+      if (st->addr.isGlobal()) {
+        const std::string& varName = st->addr.globalName;
+        if (st->src.isImm()) {
+          currentConst[varName] = st->src.immValue;
+        } else {
+          currentConst.erase(varName);
+        }
+      } else {
+        clearState();
       }
     }
+
+    if (dynamic_cast<CallInst*>(inst) || dynamic_cast<LabelInst*>(inst) ||
+        dynamic_cast<BranchInst*>(inst) || dynamic_cast<JumpInst*>(inst)) {
+      clearState();
+    }
   }
-  
+
+  for (auto& replacement : replacements) {
+    func.instructions[replacement.first] = std::move(replacement.second);
+  }
+
   return changed;
 }
 
@@ -1227,30 +1254,47 @@ bool loopIVModElim(IRFunction& func) {
   return changed;
 }
 
-bool runOnce(IRFunction& func) {
+bool isPassEnabled(const OptimizeConfig& config, OptPass pass) {
+  return (config.passMask & optPassBit(pass)) != 0;
+}
+
+bool runOnce(IRFunction& func, const OptimizeConfig& config) {
   bool changed = false;
-  changed |= localMemOpt(func);
-  changed |= globalVarConst(func);
-  changed |= constantFold(func);
-  changed |= algebraicSimplify(func);
-  changed |= modSimplify(func);
-  changed |= loopIVModElim(func);
-  changed |= strengthReduction(func);
-  changed |= copyPropagate(func);
-  changed |= blockGVN(func);
-  changed |= commonSubexpr(func);
-  changed |= deadCodeElim(func);
-  changed |= deadStoreElim(func);
-  changed |= simplifyCFG(func);
+  int passIndex = 0;
+
+  auto runPass = [&](OptPass pass, auto&& fn) {
+    bool passChanged = false;
+    if (config.stopAfter >= 0 && passIndex > config.stopAfter) return false;
+    if (isPassEnabled(config, pass)) {
+      passChanged = fn();
+      changed |= passChanged;
+    }
+    ++passIndex;
+    return passChanged;
+  };
+
+  runPass(OptPass::LocalMemOpt, [&] { return localMemOpt(func); });
+  runPass(OptPass::GlobalVarConst, [&] { return globalVarConst(func); });
+  runPass(OptPass::ConstantFold, [&] { return constantFold(func); });
+  runPass(OptPass::AlgebraicSimplify, [&] { return algebraicSimplify(func); });
+  runPass(OptPass::ModSimplify, [&] { return modSimplify(func); });
+  runPass(OptPass::LoopIVModElim, [&] { return loopIVModElim(func); });
+  runPass(OptPass::StrengthReduction, [&] { return strengthReduction(func); });
+  runPass(OptPass::CopyPropagate, [&] { return copyPropagate(func); });
+  runPass(OptPass::BlockGVN, [&] { return blockGVN(func); });
+  runPass(OptPass::CommonSubexpr, [&] { return commonSubexpr(func); });
+  runPass(OptPass::DeadCodeElim, [&] { return deadCodeElim(func); });
+  runPass(OptPass::DeadStoreElim, [&] { return deadStoreElim(func); });
+  runPass(OptPass::SimplifyCFG, [&] { return simplifyCFG(func); });
   return changed;
 }
 
 }  // namespace
 
-void OptimizeFunction(IRFunction& func) {
+void OptimizeFunction(IRFunction& func, const OptimizeConfig& config) {
   if (functionHasFloatIR(func)) return;
   for (int i = 0; i < 10; ++i) {
-    if (!runOnce(func)) break;
+    if (!runOnce(func, config)) break;
   }
 }
 
@@ -1263,6 +1307,10 @@ struct FuncSummary {
   bool returnsParam = false;
   int returnedParamIndex = -1;
   int paramCount = 0;
+  bool hasCalls = false;
+  bool hasStores = false;
+  bool hasLoads = false;
+  bool isPureReturnOnly = false;
 };
 
 std::unordered_map<std::string, FuncSummary> buildFuncSummaries(IRProgram& program) {
@@ -1272,25 +1320,28 @@ std::unordered_map<std::string, FuncSummary> buildFuncSummaries(IRProgram& progr
     FuncSummary summary;
     summary.name = fn.name;
     summary.paramCount = static_cast<int>(fn.params.size());
-    
+
     // Check if function returns a constant or a parameter
     int returnCount = 0;
     bool allSameConstant = true;
     bool allSameParam = true;
     int constVal = 0;
     int paramIdx = -1;
-    
+
     for (const auto& instPtr : fn.instructions) {
       if (!instPtr) continue;
+      if (dynamic_cast<const CallInst*>(instPtr.get())) summary.hasCalls = true;
+      if (dynamic_cast<const StoreInst*>(instPtr.get())) summary.hasStores = true;
+      if (dynamic_cast<const LoadInst*>(instPtr.get())) summary.hasLoads = true;
       if (auto* ret = dynamic_cast<ReturnInst*>(instPtr.get())) {
         if (!ret->hasValue) {
           allSameConstant = false;
           allSameParam = false;
           break;
         }
-        
+
         returnCount++;
-        
+
         if (ret->value.isImm()) {
           if (returnCount == 1) {
             constVal = ret->value.immValue;
@@ -1318,7 +1369,8 @@ std::unordered_map<std::string, FuncSummary> buildFuncSummaries(IRProgram& progr
         }
       }
     }
-    
+
+    summary.isPureReturnOnly = !summary.hasCalls && !summary.hasStores && !summary.hasLoads;
     if (returnCount > 0 && allSameConstant) {
       summary.returnsConstant = true;
       summary.constantReturnValue = constVal;
@@ -1327,7 +1379,7 @@ std::unordered_map<std::string, FuncSummary> buildFuncSummaries(IRProgram& progr
       summary.returnsParam = true;
       summary.returnedParamIndex = paramIdx;
     }
-    
+
     summaries[fn.name] = summary;
   }
   
@@ -1347,7 +1399,8 @@ bool simplifyCallsInFunc(IRFunction& func,
       if (it == summaries.end()) continue;
       
       const FuncSummary& summary = it->second;
-      
+      if (!summary.isPureReturnOnly) continue;
+
       // Replace call with constant if function always returns same constant
       if (summary.returnsConstant) {
         if (call->resultType == ValueType::F32) continue;
@@ -1371,34 +1424,36 @@ bool simplifyCallsInFunc(IRFunction& func,
   return changed;
 }
 
-void OptimizeProgram(IRProgram& program) {
+void OptimizeProgram(IRProgram& program, const OptimizeConfig& config) {
   for (auto& fn : program.functions) {
-    OptimizeFunction(fn);
+    OptimizeFunction(fn, config);
   }
 
-  auto summaries = buildFuncSummaries(program);
+  if (!config.disableIpa) {
+    auto summaries = buildFuncSummaries(program);
 
-  bool ipaChanged = true;
-  int ipaPass = 0;
-  while (ipaChanged && ipaPass < 5) {
-    ipaChanged = false;
-    ipaPass++;
+    bool ipaChanged = true;
+    int ipaPass = 0;
+    while (ipaChanged && ipaPass < 5) {
+      ipaChanged = false;
+      ipaPass++;
 
-    for (auto& fn : program.functions) {
-      if (simplifyCallsInFunc(fn, summaries)) {
-        ipaChanged = true;
-        OptimizeFunction(fn);
+      for (auto& fn : program.functions) {
+        if (simplifyCallsInFunc(fn, summaries)) {
+          ipaChanged = true;
+          OptimizeFunction(fn, config);
+        }
       }
-    }
 
-    if (ipaChanged) {
-      summaries = buildFuncSummaries(program);
+      if (ipaChanged) {
+        summaries = buildFuncSummaries(program);
+      }
     }
   }
 
   for (int pass = 0; pass < 3; ++pass) {
     for (auto& fn : program.functions) {
-      OptimizeFunction(fn);
+      OptimizeFunction(fn, config);
     }
   }
 }
