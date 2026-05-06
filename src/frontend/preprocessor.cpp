@@ -74,6 +74,30 @@ std::string expand_identifiers(const std::string& text, const MacroTable& macros
   return expanded;
 }
 
+std::string expand_builtin_timing_macros(const std::string& text, int line_number) {
+  std::string expanded = text;
+  const std::string start_macro = "starttime()";
+  const std::string stop_macro = "stoptime()";
+  const std::string start_repl =
+      "_sysy_starttime(" + std::to_string(line_number) + ")";
+  const std::string stop_repl =
+      "_sysy_stoptime(" + std::to_string(line_number) + ")";
+
+  size_t pos = 0;
+  while ((pos = expanded.find(start_macro, pos)) != std::string::npos) {
+    expanded.replace(pos, start_macro.size(), start_repl);
+    pos += start_repl.size();
+  }
+
+  pos = 0;
+  while ((pos = expanded.find(stop_macro, pos)) != std::string::npos) {
+    expanded.replace(pos, stop_macro.size(), stop_repl);
+    pos += stop_repl.size();
+  }
+
+  return expanded;
+}
+
 bool handle_define(const std::string& directive, MacroTable& macros,
                    std::string& error) {
   size_t index = 1;
@@ -135,6 +159,8 @@ bool preprocess_source(const std::string& input, std::string& output,
   error.clear();
 
   MacroTable macros;
+  macros["starttime"] = "_sysy_starttime";
+  macros["stoptime"] = "_sysy_stoptime";
   size_t position = 0;
   int line_number = 1;
 
@@ -158,7 +184,8 @@ bool preprocess_source(const std::string& input, std::string& output,
         output.push_back('\n');
       }
     } else {
-      output += expand_identifiers(line, macros);
+      output += expand_builtin_timing_macros(
+          expand_identifiers(line, macros), line_number);
       if (has_newline) {
         output.push_back('\n');
       }
