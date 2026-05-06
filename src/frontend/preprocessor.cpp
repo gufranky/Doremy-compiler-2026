@@ -71,37 +71,21 @@ std::string expand_identifiers(const std::string& text, const MacroTable& macros
 
     std::string token = text.substr(index, end - index);
     auto iter = macros.find(token);
-    if (iter != macros.end()) {
+    bool followed_by_lparen = end < text.size() && text[end] == '(';
+    bool followed_by_empty_args =
+        followed_by_lparen && end + 1 < text.size() && text[end + 1] == ')';
+    if (iter != macros.end() &&
+        (!followed_by_lparen || followed_by_empty_args)) {
       expanded += iter->second;
+      if (followed_by_empty_args) {
+        index = end + 2;
+        continue;
+      }
     } else {
       expanded += token;
     }
 
     index = end;
-  }
-
-  return expanded;
-}
-
-std::string expand_builtin_timing_macros(const std::string& text, int line_number) {
-  std::string expanded = text;
-  const std::string start_macro = "starttime()";
-  const std::string stop_macro = "stoptime()";
-  const std::string start_repl =
-      "_sysy_starttime(" + std::to_string(line_number) + ")";
-  const std::string stop_repl =
-      "_sysy_stoptime(" + std::to_string(line_number) + ")";
-
-  size_t pos = 0;
-  while ((pos = expanded.find(start_macro, pos)) != std::string::npos) {
-    expanded.replace(pos, start_macro.size(), start_repl);
-    pos += start_repl.size();
-  }
-
-  pos = 0;
-  while ((pos = expanded.find(stop_macro, pos)) != std::string::npos) {
-    expanded.replace(pos, stop_macro.size(), stop_repl);
-    pos += stop_repl.size();
   }
 
   return expanded;
@@ -348,6 +332,10 @@ bool handle_define(const std::string& directive, MacroTable& macros,
   std::string macro_name = directive.substr(index, name_end - index);
 
   index = name_end;
+  if (index + 1 < directive.size() && directive[index] == '(' &&
+      directive[index + 1] == ')') {
+    index += 2;
+  }
   while (index < directive.size() &&
          std::isspace(static_cast<unsigned char>(directive[index]))) {
     ++index;
@@ -397,8 +385,7 @@ bool preprocess_source_impl(const std::string& input, const std::string& source_
         output.push_back('\n');
       }
     } else {
-      output += expand_builtin_timing_macros(
-          expand_identifiers(line, context.macros), line_number);
+      output += expand_identifiers(line, context.macros);
       if (has_newline) {
         output.push_back('\n');
       }
@@ -416,8 +403,6 @@ bool preprocess_source_impl(const std::string& input, const std::string& source_
 bool preprocess_source(const std::string& input, const std::string& source_path,
                        std::string& output, std::string& error) {
   PreprocessContext context;
-  context.macros["starttime"] = "_sysy_starttime";
-  context.macros["stoptime"] = "_sysy_stoptime";
   return preprocess_source_impl(
       input, source_path.empty() ? std::string() : normalize_path(source_path),
       output, error, context);
