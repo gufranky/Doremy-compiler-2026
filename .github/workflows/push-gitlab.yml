@@ -1,0 +1,57 @@
+name: push-gitlab
+
+on:
+  push:
+    branches:
+      - com
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: push-gitlab-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  push-to-gitlab:
+    name: Push com to GitLab master
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout com branch
+        uses: actions/checkout@v4
+        with:
+          ref: com
+          fetch-depth: 0
+
+      - name: Push to GitLab master
+        shell: bash
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_REPO_URL: ${{ secrets.GITLAB_REPO_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GITLAB_TOKEN}" ] || [ -z "${GITLAB_REPO_URL}" ]; then
+            echo "GITLAB_TOKEN or GITLAB_REPO_URL is not configured."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          case "${GITLAB_REPO_URL}" in
+            https://*)
+              remote_url="https://oauth2:${GITLAB_TOKEN}@${GITLAB_REPO_URL#https://}"
+              ;;
+            http://*)
+              remote_url="http://oauth2:${GITLAB_TOKEN}@${GITLAB_REPO_URL#http://}"
+              ;;
+            *)
+              echo "GITLAB_REPO_URL must start with http:// or https://"
+              exit 1
+              ;;
+          esac
+
+          git remote add gitlab "${remote_url}"
+          git push --force gitlab HEAD:master
