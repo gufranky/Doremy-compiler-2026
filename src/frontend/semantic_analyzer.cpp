@@ -583,7 +583,6 @@ void SemanticAnalyzer::visit(WhileStmt* node) {
   node->body->accept(this);
   bool bodyHasReturn = hasReturn;
   bool bodyHasBreak = hasBreak;
-  bool bodyFallsThrough = hasFallthrough;
   loopDepth--;
 
   hasReturn = conditionAlwaysTrue && bodyHasReturn && !bodyHasBreak;
