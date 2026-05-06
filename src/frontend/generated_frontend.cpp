@@ -1,2 +1,2 @@
-#include "../../generated/parser.tab.c"
-#include "../../generated/lex.yy.c"
+#include "parser.tab.c"
+#include "lex.yy.c"
