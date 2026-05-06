@@ -1,13 +1,22 @@
 #include "preprocessor.h"
 
 #include <cctype>
+#include <fstream>
+#include <sstream>
 #include <string>
+#include <vector>
+#include <unordered_set>
 #include <unordered_map>
 
 namespace frontend {
 namespace {
 
 using MacroTable = std::unordered_map<std::string, std::string>;
+
+struct PreprocessContext {
+  MacroTable macros;
+  std::unordered_set<std::string> include_stack;
+};
 
 bool is_identifier_start(char ch) {
   unsigned char uch = static_cast<unsigned char>(ch);
@@ -74,6 +83,233 @@ std::string expand_identifiers(const std::string& text, const MacroTable& macros
   return expanded;
 }
 
+std::string expand_builtin_timing_macros(const std::string& text, int line_number) {
+  std::string expanded = text;
+  const std::string start_macro = "starttime()";
+  const std::string stop_macro = "stoptime()";
+  const std::string start_repl =
+      "_sysy_starttime(" + std::to_string(line_number) + ")";
+  const std::string stop_repl =
+      "_sysy_stoptime(" + std::to_string(line_number) + ")";
+
+  size_t pos = 0;
+  while ((pos = expanded.find(start_macro, pos)) != std::string::npos) {
+    expanded.replace(pos, start_macro.size(), start_repl);
+    pos += start_repl.size();
+  }
+
+  pos = 0;
+  while ((pos = expanded.find(stop_macro, pos)) != std::string::npos) {
+    expanded.replace(pos, stop_macro.size(), stop_repl);
+    pos += stop_repl.size();
+  }
+
+  return expanded;
+}
+
+std::string normalize_separators(std::string path) {
+  for (char& ch : path) {
+    if (ch == '\\') {
+      ch = '/';
+    }
+  }
+  return path;
+}
+
+bool is_absolute_path(const std::string& path) {
+  if (path.empty()) return false;
+  if (path[0] == '/' || path[0] == '\\') return true;
+  return path.size() >= 2 && std::isalpha(static_cast<unsigned char>(path[0])) &&
+         path[1] == ':';
+}
+
+std::string parent_path(const std::string& path) {
+  std::string normalized = normalize_separators(path);
+  size_t pos = normalized.find_last_of('/');
+  if (pos == std::string::npos) {
+    return "";
+  }
+  return normalized.substr(0, pos);
+}
+
+std::string join_path(const std::string& base, const std::string& child) {
+  if (child.empty()) return normalize_separators(base);
+  if (is_absolute_path(child)) return normalize_separators(child);
+  if (base.empty()) return normalize_separators(child);
+  return normalize_separators(base + "/" + child);
+}
+
+std::string normalize_path(std::string path) {
+  path = normalize_separators(path);
+
+  std::string prefix;
+  size_t start = 0;
+  if (path.size() >= 2 && std::isalpha(static_cast<unsigned char>(path[0])) &&
+      path[1] == ':') {
+    prefix = path.substr(0, 2);
+    start = 2;
+    if (start < path.size() && path[start] == '/') {
+      prefix += '/';
+      ++start;
+    }
+  } else if (!path.empty() && path[0] == '/') {
+    prefix = "/";
+    start = 1;
+  }
+
+  std::vector<std::string> parts;
+  size_t i = start;
+  while (i <= path.size()) {
+    size_t j = path.find('/', i);
+    if (j == std::string::npos) j = path.size();
+    std::string part = path.substr(i, j - i);
+    if (part.empty() || part == ".") {
+      // skip
+    } else if (part == "..") {
+      if (!parts.empty() && parts.back() != "..") {
+        parts.pop_back();
+      } else if (prefix.empty()) {
+        parts.push_back(part);
+      }
+    } else {
+      parts.push_back(part);
+    }
+    i = j + 1;
+  }
+
+  std::ostringstream oss;
+  oss << prefix;
+  for (size_t idx = 0; idx < parts.size(); ++idx) {
+    if (!(prefix.empty() && idx == 0) &&
+        !(idx == 0 && !prefix.empty() && prefix.back() == '/')) {
+      if (!(idx == 0 && !prefix.empty() && prefix == "/")) {
+        oss << '/';
+      }
+    }
+    oss << parts[idx];
+  }
+
+  std::string normalized = oss.str();
+  if (normalized.empty()) {
+    return prefix.empty() ? "." : prefix;
+  }
+  return normalized;
+}
+
+bool load_file_text(const std::string& path, std::string& content) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    return false;
+  }
+  content.assign(std::istreambuf_iterator<char>(input),
+                 std::istreambuf_iterator<char>());
+  return true;
+}
+
+bool is_supported_sysy_header_line(const std::string& trimmed) {
+  if (trimmed.empty()) return true;
+  if (trimmed.rfind("#define starttime()", 0) == 0) return true;
+  if (trimmed.rfind("#define stoptime()", 0) == 0) return true;
+  if (trimmed.rfind("int getint()", 0) == 0) return true;
+  if (trimmed.rfind("int getch()", 0) == 0) return true;
+  if (trimmed.rfind("int getarray(", 0) == 0) return true;
+  if (trimmed.rfind("float getfloat()", 0) == 0) return true;
+  if (trimmed.rfind("int getfarray(", 0) == 0) return true;
+  if (trimmed.rfind("void putint(", 0) == 0) return true;
+  if (trimmed.rfind("void putch(", 0) == 0) return true;
+  if (trimmed.rfind("void putarray(", 0) == 0) return true;
+  if (trimmed.rfind("void putfloat(", 0) == 0) return true;
+  if (trimmed.rfind("void putfarray(", 0) == 0) return true;
+  if (trimmed.rfind("void putf(", 0) == 0) return true;
+  if (trimmed.rfind("void _sysy_starttime(", 0) == 0) return true;
+  if (trimmed.rfind("void _sysy_stoptime(", 0) == 0) return true;
+  return false;
+}
+
+std::string filter_sysy_header_source(const std::string& input) {
+  std::ostringstream filtered;
+  size_t position = 0;
+  while (position < input.size()) {
+    size_t line_end = input.find('\n', position);
+    bool has_newline = line_end != std::string::npos;
+    size_t raw_end = has_newline ? line_end : input.size();
+    std::string line = input.substr(position, raw_end - position);
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    std::string trimmed = trim(line);
+    if (is_supported_sysy_header_line(trimmed)) {
+      filtered << line;
+    }
+    if (has_newline) {
+      filtered << '\n';
+    }
+    position = has_newline ? line_end + 1 : input.size();
+  }
+  return filtered.str();
+}
+
+bool preprocess_source_impl(const std::string& input, const std::string& source_path,
+                            std::string& output, std::string& error,
+                            PreprocessContext& context);
+
+bool handle_include(const std::string& directive, const std::string& current_path,
+                    std::string& output, std::string& error,
+                    PreprocessContext& context) {
+  const std::string prefix = "#include";
+  size_t index = prefix.size();
+  while (index < directive.size() &&
+         std::isspace(static_cast<unsigned char>(directive[index]))) {
+    ++index;
+  }
+
+  if (index >= directive.size() || directive[index] != '"') {
+    error = "only #include \"...\" is supported";
+    return false;
+  }
+  ++index;
+
+  size_t end = directive.find('"', index);
+  if (end == std::string::npos) {
+    error = "unterminated include path";
+    return false;
+  }
+
+  std::string include_name = directive.substr(index, end - index);
+  std::string base_dir = parent_path(current_path);
+  std::string include_path = normalize_path(join_path(base_dir, include_name));
+  std::string include_key = include_path;
+
+  if (context.include_stack.count(include_key) != 0) {
+    error = "recursive include detected for '" + include_name + "'";
+    return false;
+  }
+
+  std::string include_source;
+  if (!load_file_text(include_path, include_source)) {
+    error = "cannot open include file '" + include_name + "'";
+    return false;
+  }
+
+  if (normalize_separators(include_name) == "sylib.h" ||
+      include_path.size() >= 7 &&
+          include_path.substr(include_path.size() - 7) == "sylib.h") {
+    include_source = filter_sysy_header_source(include_source);
+  }
+
+  context.include_stack.insert(include_key);
+  std::string include_output;
+  bool ok = preprocess_source_impl(include_source, include_path, include_output,
+                                   error, context);
+  context.include_stack.erase(include_key);
+  if (!ok) {
+    return false;
+  }
+
+  output += include_output;
+  return true;
+}
+
 bool handle_define(const std::string& directive, MacroTable& macros,
                    std::string& error) {
   size_t index = 1;
@@ -127,14 +363,12 @@ bool handle_define(const std::string& directive, MacroTable& macros,
   return true;
 }
 
-}  // namespace
-
-bool preprocess_source(const std::string& input, std::string& output,
-                       std::string& error) {
+bool preprocess_source_impl(const std::string& input, const std::string& source_path,
+                            std::string& output, std::string& error,
+                            PreprocessContext& context) {
   output.clear();
   error.clear();
 
-  MacroTable macros;
   size_t position = 0;
   int line_number = 1;
 
@@ -150,7 +384,12 @@ bool preprocess_source(const std::string& input, std::string& output,
 
     std::string trimmed = trim_left(line);
     if (!trimmed.empty() && trimmed.front() == '#') {
-      if (!handle_define(trimmed, macros, error)) {
+      if (trimmed.rfind("#include", 0) == 0) {
+        if (!handle_include(trimmed, source_path, output, error, context)) {
+          error = "line " + std::to_string(line_number) + ": " + error;
+          return false;
+        }
+      } else if (!handle_define(trimmed, context.macros, error)) {
         error = "line " + std::to_string(line_number) + ": " + error;
         return false;
       }
@@ -158,7 +397,8 @@ bool preprocess_source(const std::string& input, std::string& output,
         output.push_back('\n');
       }
     } else {
-      output += expand_identifiers(line, macros);
+      output += expand_builtin_timing_macros(
+          expand_identifiers(line, context.macros), line_number);
       if (has_newline) {
         output.push_back('\n');
       }
@@ -169,6 +409,18 @@ bool preprocess_source(const std::string& input, std::string& output,
   }
 
   return true;
+}
+
+}  // namespace
+
+bool preprocess_source(const std::string& input, const std::string& source_path,
+                       std::string& output, std::string& error) {
+  PreprocessContext context;
+  context.macros["starttime"] = "_sysy_starttime";
+  context.macros["stoptime"] = "_sysy_stoptime";
+  return preprocess_source_impl(
+      input, source_path.empty() ? std::string() : normalize_path(source_path),
+      output, error, context);
 }
 
 }  // namespace frontend
