@@ -1,0 +1,77 @@
+name: sync-com
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-com-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  export-com:
+    name: Export compiler-only com branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.BOT_PAT }}
+
+      - name: Prepare com branch content
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export_paths=(
+            ".gitignore"
+            "main.cpp"
+            "Makefile"
+            "grammar"
+            "generated"
+            "include"
+            "src"
+          )
+
+          worktree_dir="$(mktemp -d)"
+
+          git fetch origin com || true
+          if git ls-remote --exit-code origin refs/heads/com >/dev/null 2>&1; then
+            git worktree add -B com "$worktree_dir" origin/com
+          else
+            git worktree add -B com "$worktree_dir" HEAD
+          fi
+
+          find "$worktree_dir" -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+
+          for path in "${export_paths[@]}"; do
+            if [ -e "$GITHUB_WORKSPACE/$path" ]; then
+              mkdir -p "$worktree_dir/$(dirname "$path")"
+              cp -a "$GITHUB_WORKSPACE/$path" "$worktree_dir/$path"
+            fi
+          done
+
+          cd "$worktree_dir"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to export."
+            exit 0
+          fi
+
+          git commit -m "[SKIP_CI] Sync compiler-only com branch from ${GITHUB_SHA}"
+          git push --force origin HEAD:com
+
+      - name: Cleanup worktree
+        if: always()
+        shell: bash
+        run: |
+          git worktree prune
