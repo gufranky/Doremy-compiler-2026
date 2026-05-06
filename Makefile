@@ -13,7 +13,7 @@ GENERATED_DIR = generated
 BUILD_DIR = build
 
 # Source files
-FRONTEND_SRCS = $(FRONTEND_DIR)/ast.cpp $(FRONTEND_DIR)/semantic_analyzer.cpp $(FRONTEND_DIR)/preprocessor.cpp $(FRONTEND_DIR)/parse_driver.cpp
+FRONTEND_SRCS = $(FRONTEND_DIR)/ast.cpp $(FRONTEND_DIR)/semantic_analyzer.cpp $(FRONTEND_DIR)/preprocessor.cpp $(FRONTEND_DIR)/parse_driver.cpp $(FRONTEND_DIR)/generated_frontend.cpp
 IR_SRCS = $(wildcard src/ir/*.cpp)
 OPT_SRCS = $(wildcard src/optimize/*.cpp)
 BACKEND_SRCS = $(wildcard src/backend/*.cpp)
@@ -30,9 +30,6 @@ IR_OBJS = $(patsubst src/ir/%.cpp,$(BUILD_DIR)/%.o,$(IR_SRCS))
 OPT_OBJS = $(patsubst src/optimize/%.cpp,$(BUILD_DIR)/%.o,$(OPT_SRCS))
 BACKEND_OBJS = $(patsubst src/backend/%.cpp,$(BUILD_DIR)/%.o,$(BACKEND_SRCS))
 MAIN_OBJ = $(BUILD_DIR)/main.o
-LEXER_OBJ = $(BUILD_DIR)/lex.yy.o
-PARSER_OBJ = $(BUILD_DIR)/parser.tab.o
-
 # Target executable
 TARGET = compiler
 
@@ -54,14 +51,6 @@ $(LEXER_SRC): $(GRAMMAR_DIR)/lexer.l | $(GENERATED_DIR)
 $(PARSER_SRC) $(PARSER_HDR): $(GRAMMAR_DIR)/parser.y | $(GENERATED_DIR)
 	bison -d -o $(PARSER_SRC) $(GRAMMAR_DIR)/parser.y
 
-# Compile lexer
-$(LEXER_OBJ): $(LEXER_SRC) $(PARSER_HDR) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $(LEXER_SRC) -o $(LEXER_OBJ)
-
-# Compile parser
-$(PARSER_OBJ): $(PARSER_SRC) $(PARSER_HDR) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $(PARSER_SRC) -o $(PARSER_OBJ)
-
 # Compile frontend sources
 $(FRONTEND_OBJS): $(BUILD_DIR)/%.o: $(FRONTEND_DIR)/%.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -80,7 +69,7 @@ $(MAIN_OBJ): $(MAIN_SRC) $(PARSER_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $(MAIN_SRC) -o $(MAIN_OBJ)
 
 # Link executable
-$(TARGET): $(LEXER_OBJ) $(PARSER_OBJ) $(FRONTEND_OBJS) $(IR_OBJS) $(OPT_OBJS) $(BACKEND_OBJS) $(MAIN_OBJ)
+$(TARGET): $(FRONTEND_OBJS) $(IR_OBJS) $(OPT_OBJS) $(BACKEND_OBJS) $(MAIN_OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $(TARGET) $(LDFLAGS)
 
 # IR unit tests (M1, M2)
@@ -99,19 +88,19 @@ IR_M3_TEST_BIN = ir_m3_tests
 $(IR_M1_TEST_OBJ): $(IR_M1_TEST_SRC) include/ir.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $(IR_M1_TEST_SRC) -o $(IR_M1_TEST_OBJ)
 
-$(IR_M1_TEST_BIN): $(IR_M1_TEST_OBJ) $(IR_OBJS) $(OPT_OBJS) $(FRONTEND_OBJS) $(LEXER_OBJ) $(PARSER_OBJ)
+$(IR_M1_TEST_BIN): $(IR_M1_TEST_OBJ) $(IR_OBJS) $(OPT_OBJS) $(FRONTEND_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $(IR_M1_TEST_BIN)
 
 $(IR_M2_TEST_OBJ): $(IR_M2_TEST_SRC) include/ir.h include/ir_generator.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $(IR_M2_TEST_SRC) -o $(IR_M2_TEST_OBJ)
 
-$(IR_M2_TEST_BIN): $(IR_M2_TEST_OBJ) $(IR_OBJS) $(OPT_OBJS) $(FRONTEND_OBJS) $(LEXER_OBJ) $(PARSER_OBJ)
+$(IR_M2_TEST_BIN): $(IR_M2_TEST_OBJ) $(IR_OBJS) $(OPT_OBJS) $(FRONTEND_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $(IR_M2_TEST_BIN)
 
 $(IR_M3_TEST_OBJ): $(IR_M3_TEST_SRC) include/ir.h include/cfg.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $(IR_M3_TEST_SRC) -o $(IR_M3_TEST_OBJ)
 
-$(IR_M3_TEST_BIN): $(IR_M3_TEST_OBJ) $(IR_OBJS) $(OPT_OBJS) $(FRONTEND_OBJS) $(LEXER_OBJ) $(PARSER_OBJ)
+$(IR_M3_TEST_BIN): $(IR_M3_TEST_OBJ) $(IR_OBJS) $(OPT_OBJS) $(FRONTEND_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $(IR_M3_TEST_BIN)
 
 IR_M4_TEST_SRC = tests/ir_m4_tests.cpp
@@ -137,32 +126,32 @@ BACKEND_B4_TEST_BIN = backend_b4_tests
 $(IR_M4_TEST_OBJ): $(IR_M4_TEST_SRC) include/ir.h include/optimizer.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $(IR_M4_TEST_SRC) -o $(IR_M4_TEST_OBJ)
 
-$(IR_M4_TEST_BIN): $(IR_M4_TEST_OBJ) $(IR_OBJS) $(OPT_OBJS) $(FRONTEND_OBJS) $(LEXER_OBJ) $(PARSER_OBJ)
+$(IR_M4_TEST_BIN): $(IR_M4_TEST_OBJ) $(IR_OBJS) $(OPT_OBJS) $(FRONTEND_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $(IR_M4_TEST_BIN)
 
 $(BACKEND_B1_TEST_OBJ): $(BACKEND_B1_TEST_SRC) include/ir.h include/backend_codegen.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $(BACKEND_B1_TEST_SRC) -o $(BACKEND_B1_TEST_OBJ)
 
 
-$(BACKEND_B1_TEST_BIN): $(BACKEND_B1_TEST_OBJ) $(IR_OBJS) $(BACKEND_OBJS) $(FRONTEND_OBJS) $(LEXER_OBJ) $(PARSER_OBJ)
+$(BACKEND_B1_TEST_BIN): $(BACKEND_B1_TEST_OBJ) $(IR_OBJS) $(BACKEND_OBJS) $(FRONTEND_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $(BACKEND_B1_TEST_BIN)
 
 $(BACKEND_B2_TEST_OBJ): $(BACKEND_B2_TEST_SRC) include/ir.h include/backend_codegen.h include/optimizer.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $(BACKEND_B2_TEST_SRC) -o $(BACKEND_B2_TEST_OBJ)
 
-$(BACKEND_B2_TEST_BIN): $(BACKEND_B2_TEST_OBJ) $(IR_OBJS) $(OPT_OBJS) $(BACKEND_OBJS) $(FRONTEND_OBJS) $(LEXER_OBJ) $(PARSER_OBJ)
+$(BACKEND_B2_TEST_BIN): $(BACKEND_B2_TEST_OBJ) $(IR_OBJS) $(OPT_OBJS) $(BACKEND_OBJS) $(FRONTEND_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $(BACKEND_B2_TEST_BIN)
 
 $(BACKEND_B3_TEST_OBJ): $(BACKEND_B3_TEST_SRC) include/ir.h include/backend_liveness.h include/backend_regalloc.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $(BACKEND_B3_TEST_SRC) -o $(BACKEND_B3_TEST_OBJ)
 
-$(BACKEND_B3_TEST_BIN): $(BACKEND_B3_TEST_OBJ) $(IR_OBJS) $(BACKEND_OBJS) $(FRONTEND_OBJS) $(LEXER_OBJ) $(PARSER_OBJ)
+$(BACKEND_B3_TEST_BIN): $(BACKEND_B3_TEST_OBJ) $(IR_OBJS) $(BACKEND_OBJS) $(FRONTEND_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $(BACKEND_B3_TEST_BIN)
 
 $(BACKEND_B4_TEST_OBJ): $(BACKEND_B4_TEST_SRC) include/ir.h include/backend_codegen.h include/optimizer.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $(BACKEND_B4_TEST_SRC) -o $(BACKEND_B4_TEST_OBJ)
 
-$(BACKEND_B4_TEST_BIN): $(BACKEND_B4_TEST_OBJ) $(IR_OBJS) $(OPT_OBJS) $(BACKEND_OBJS) $(FRONTEND_OBJS) $(LEXER_OBJ) $(PARSER_OBJ)
+$(BACKEND_B4_TEST_BIN): $(BACKEND_B4_TEST_OBJ) $(IR_OBJS) $(OPT_OBJS) $(BACKEND_OBJS) $(FRONTEND_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $(BACKEND_B4_TEST_BIN)
 
 ir-test: $(IR_M1_TEST_BIN)
