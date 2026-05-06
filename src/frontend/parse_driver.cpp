@@ -60,10 +60,11 @@ bool parse_preprocessed_source(const std::string& source) {
   return parse_result == 0 && root != nullptr;
 }
 
-bool parse_source_impl(const std::string& source, const std::string& label) {
+bool parse_source_impl(const std::string& source, const std::string& label,
+                       const std::string& source_path) {
   std::string preprocessed;
   std::string error;
-  if (!preprocess_source(source, preprocessed, error)) {
+  if (!preprocess_source(source, source_path, preprocessed, error)) {
     std::cerr << "Preprocess error in " << label << ": " << error << "\n";
     return false;
   }
@@ -80,7 +81,7 @@ bool parse_from_file(const std::string& path) {
     return false;
   }
 
-  return parse_source_impl(source, path);
+  return parse_source_impl(source, path, path);
 }
 
 bool parse_from_stdin() {
@@ -90,7 +91,7 @@ bool parse_from_stdin() {
     return false;
   }
 
-  return parse_source_impl(source, "<stdin>");
+  return parse_source_impl(source, "<stdin>", "");
 }
 
 }  // namespace frontend
