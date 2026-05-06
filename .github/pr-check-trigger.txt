@@ -1,3 +1,0 @@
-# 临时 PR 触发文件
-
-用于触发 GitHub PR checks，验证 `Full baseline gate` 能否出现在 required checks 列表中。

@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python3 \"d:/桌面/系统能力大赛/Doremy-compiler-2026/run_funct_tests.py\" --runner host --mode compile --limit 1)",
-      "Bash(python3 \"d:/桌面/系统能力大赛/Doremy-compiler-2026/run_funct_tests.py\" --runner host --mode full --limit 1)"
-    ]
-  }
-}
