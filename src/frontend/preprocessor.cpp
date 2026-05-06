@@ -11,7 +11,13 @@
 namespace frontend {
 namespace {
 
-using MacroTable = std::unordered_map<std::string, std::string>;
+struct MacroDef {
+  std::string replacement;
+  bool zero_arg_function = false;
+  bool inject_line_number = false;
+};
+
+using MacroTable = std::unordered_map<std::string, MacroDef>;
 
 struct PreprocessContext {
   MacroTable macros;
@@ -52,7 +58,8 @@ std::string trim(const std::string& text) {
   return text.substr(start, end - start);
 }
 
-std::string expand_identifiers(const std::string& text, const MacroTable& macros) {
+std::string expand_identifiers(const std::string& text, const MacroTable& macros,
+                               int line_number) {
   std::string expanded;
   expanded.reserve(text.size());
 
@@ -75,8 +82,17 @@ std::string expand_identifiers(const std::string& text, const MacroTable& macros
     bool followed_by_empty_args =
         followed_by_lparen && end + 1 < text.size() && text[end + 1] == ')';
     if (iter != macros.end() &&
-        (!followed_by_lparen || followed_by_empty_args)) {
-      expanded += iter->second;
+        (!followed_by_lparen ||
+         (iter->second.zero_arg_function && followed_by_empty_args))) {
+      std::string replacement = iter->second.replacement;
+      if (iter->second.inject_line_number) {
+        size_t placeholder = replacement.find("__LINE__");
+        while (placeholder != std::string::npos) {
+          replacement.replace(placeholder, 8, std::to_string(line_number));
+          placeholder = replacement.find("__LINE__", placeholder + 1);
+        }
+      }
+      expanded += replacement;
       if (followed_by_empty_args) {
         index = end + 2;
         continue;
@@ -331,9 +347,11 @@ bool handle_define(const std::string& directive, MacroTable& macros,
   }
   std::string macro_name = directive.substr(index, name_end - index);
 
+  bool zero_arg_function = false;
   index = name_end;
   if (index + 1 < directive.size() && directive[index] == '(' &&
       directive[index + 1] == ')') {
+    zero_arg_function = true;
     index += 2;
   }
   while (index < directive.size() &&
@@ -347,7 +365,11 @@ bool handle_define(const std::string& directive, MacroTable& macros,
   }
 
   std::string replacement = trim(directive.substr(index));
-  macros[macro_name] = expand_identifiers(replacement, macros);
+  MacroDef macro;
+  macro.replacement = replacement;
+  macro.zero_arg_function = zero_arg_function;
+  macro.inject_line_number = replacement.find("__LINE__") != std::string::npos;
+  macros[macro_name] = macro;
   return true;
 }
 
@@ -385,7 +407,7 @@ bool preprocess_source_impl(const std::string& input, const std::string& source_
         output.push_back('\n');
       }
     } else {
-      output += expand_identifiers(line, context.macros);
+      output += expand_identifiers(line, context.macros, line_number);
       if (has_newline) {
         output.push_back('\n');
       }
@@ -403,6 +425,10 @@ bool preprocess_source_impl(const std::string& input, const std::string& source_
 bool preprocess_source(const std::string& input, const std::string& source_path,
                        std::string& output, std::string& error) {
   PreprocessContext context;
+  context.macros["starttime"] = MacroDef{
+      "_sysy_starttime(__LINE__)", true, true};
+  context.macros["stoptime"] = MacroDef{
+      "_sysy_stoptime(__LINE__)", true, true};
   return preprocess_source_impl(
       input, source_path.empty() ? std::string() : normalize_path(source_path),
       output, error, context);
