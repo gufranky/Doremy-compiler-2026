@@ -2,14 +2,12 @@
 
 # Compiler and flags
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -g -Iinclude -Igenerated
+CXXFLAGS = -std=c++17 -Wall -g -Iinclude -Isrc/frontend
 LDFLAGS =
 
 # Directories
 SRC_DIR = src
 FRONTEND_DIR = $(SRC_DIR)/frontend
-GRAMMAR_DIR = grammar
-GENERATED_DIR = generated
 BUILD_DIR = build
 
 # Source files
@@ -18,11 +16,6 @@ IR_SRCS = $(wildcard src/ir/*.cpp)
 OPT_SRCS = $(wildcard src/optimize/*.cpp)
 BACKEND_SRCS = $(wildcard src/backend/*.cpp)
 MAIN_SRC = main.cpp
-
-# Generated files
-LEXER_SRC = $(GENERATED_DIR)/lex.yy.c
-PARSER_SRC = $(GENERATED_DIR)/parser.tab.c
-PARSER_HDR = $(GENERATED_DIR)/parser.tab.h
 
 # Object files
 FRONTEND_OBJS = $(patsubst $(FRONTEND_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(FRONTEND_SRCS))
@@ -40,23 +33,9 @@ all: $(TARGET)
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(GENERATED_DIR):
-	mkdir -p $(GENERATED_DIR)
-
-# Generate lexer
-$(LEXER_SRC): $(GRAMMAR_DIR)/lexer.l | $(GENERATED_DIR)
-	flex -o $(LEXER_SRC) $(GRAMMAR_DIR)/lexer.l
-
-# Generate parser
-$(PARSER_SRC) $(PARSER_HDR): $(GRAMMAR_DIR)/parser.y | $(GENERATED_DIR)
-	bison -d -o $(PARSER_SRC) $(GRAMMAR_DIR)/parser.y
-
 # Compile frontend sources
 $(FRONTEND_OBJS): $(BUILD_DIR)/%.o: $(FRONTEND_DIR)/%.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(BUILD_DIR)/generated_frontend.o: $(FRONTEND_DIR)/generated_frontend.cpp $(LEXER_SRC) $(PARSER_SRC) $(PARSER_HDR) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $(FRONTEND_DIR)/generated_frontend.cpp -o $(BUILD_DIR)/generated_frontend.o
 
 $(IR_OBJS): $(BUILD_DIR)/%.o: src/ir/%.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -68,7 +47,7 @@ $(BACKEND_OBJS): $(BUILD_DIR)/%.o: src/backend/%.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # Compile main
-$(MAIN_OBJ): $(MAIN_SRC) $(PARSER_HDR) | $(BUILD_DIR)
+$(MAIN_OBJ): $(MAIN_SRC) $(FRONTEND_DIR)/parser.tab.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $(MAIN_SRC) -o $(MAIN_OBJ)
 
 # Link executable
@@ -219,6 +198,6 @@ test-verbose: $(TARGET)
 
 # Clean build artifacts
 clean:
-	rm -rf $(BUILD_DIR) $(GENERATED_DIR) $(TARGET) $(IR_M1_TEST_BIN) $(IR_M2_TEST_BIN) $(IR_M3_TEST_BIN) $(IR_M4_TEST_BIN) $(BACKEND_B1_TEST_BIN) $(BACKEND_B2_TEST_BIN) $(BACKEND_B3_TEST_BIN) $(BACKEND_B4_TEST_BIN)
+	rm -rf $(BUILD_DIR) $(TARGET) $(IR_M1_TEST_BIN) $(IR_M2_TEST_BIN) $(IR_M3_TEST_BIN) $(IR_M4_TEST_BIN) $(BACKEND_B1_TEST_BIN) $(BACKEND_B2_TEST_BIN) $(BACKEND_B3_TEST_BIN) $(BACKEND_B4_TEST_BIN)
 
 .PHONY: all test test-verbose clean distclean
