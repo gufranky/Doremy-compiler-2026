@@ -7,6 +7,7 @@
 #include "ast.h"
 #include "backend_codegen.h"
 #include "ir_generator.h"
+#include "midir.h"
 #include "optimizer.h"
 #include "parse_driver.h"
 #include "semantic_analyzer.h"
@@ -16,12 +17,23 @@ extern CompUnit* root;
 namespace {
 
 void printUsage(const char* prog) {
-  std::cerr << "Usage: " << prog << " -S -o <output.s> <input.sy> [-O1]\n";
+  std::cerr << "Usage: " << prog
+            << " -S -o <output.s> <input.sy> [-O1]"
+            << " [--disable-midir|--midir-build-only|--midir-stop-after-ssa|--midir-lower-only]\n";
 }
 
 struct CommandLineOptions {
+  enum class MidIRMode {
+    Default,
+    Disable,
+    BuildOnly,
+    StopAfterSSA,
+    LowerOnly,
+  };
+
   bool emitAssembly = false;
   bool enableOpt = false;
+  MidIRMode midirMode = MidIRMode::Default;
   std::string inputFile;
   std::string outputFile;
 };
@@ -33,6 +45,14 @@ bool parseCommandLine(int argc, char** argv, CommandLineOptions& options) {
       options.emitAssembly = true;
     } else if (arg == "-O1") {
       options.enableOpt = true;
+    } else if (arg == "--disable-midir") {
+      options.midirMode = CommandLineOptions::MidIRMode::Disable;
+    } else if (arg == "--midir-build-only") {
+      options.midirMode = CommandLineOptions::MidIRMode::BuildOnly;
+    } else if (arg == "--midir-stop-after-ssa") {
+      options.midirMode = CommandLineOptions::MidIRMode::StopAfterSSA;
+    } else if (arg == "--midir-lower-only") {
+      options.midirMode = CommandLineOptions::MidIRMode::LowerOnly;
     } else if (arg == "-o") {
       if (i + 1 >= argc) {
         std::cerr << "Error: missing output file after -o\n";
@@ -102,7 +122,40 @@ int main(int argc, char** argv) {
   ir::IRProgram program = generator.generate(root);
 
   if (options.enableOpt) {
-    ir::OptimizeProgram(program);
+    if (options.midirMode == CommandLineOptions::MidIRMode::Disable) {
+      ir::OptimizeProgram(program);
+    } else {
+      midir::Module midModule = midir::BuildMidIR(program);
+      std::string verifyError;
+      if (!midir::VerifyMidIR(midModule, &verifyError)) {
+        std::cerr << "MidIR verification failed: " << verifyError << "\n";
+        delete root;
+        return 1;
+      }
+
+      if (options.midirMode == CommandLineOptions::MidIRMode::BuildOnly) {
+        // Keep legacy behavior reachable for migration A/B checks.
+      } else if (options.midirMode == CommandLineOptions::MidIRMode::LowerOnly) {
+        program = midir::LowerMidToLIR(midModule);
+      } else {
+        ir::OptimizeMidProgram(midModule);
+        if (!midir::VerifyMidIR(midModule, &verifyError)) {
+          std::cerr << "Optimized MidIR verification failed: " << verifyError << "\n";
+          delete root;
+          return 1;
+        }
+        if (options.midirMode != CommandLineOptions::MidIRMode::StopAfterSSA) {
+          program = midir::LowerMidToLIR(midModule);
+        }
+      }
+
+      if (options.midirMode == CommandLineOptions::MidIRMode::BuildOnly ||
+          options.midirMode == CommandLineOptions::MidIRMode::StopAfterSSA) {
+        delete root;
+        return 0;
+      }
+      ir::OptimizeLIRProgram(program);
+    }
   }
 
   // Backend code generation (register allocation + assembly)

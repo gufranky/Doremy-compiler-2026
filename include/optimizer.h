@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "ir.h"
+#include "midir.h"
 
 namespace ir {
 
@@ -41,6 +42,8 @@ constexpr std::uint64_t optPassBit(OptPass pass) {
 // The default configuration keeps the full pipeline unchanged, while
 // OptimizeConfig can selectively disable passes for debugging.
 void OptimizeFunction(IRFunction& func, const OptimizeConfig& config = {});
+void OptimizeLIRProgram(IRProgram& program, const OptimizeConfig& config = {});
+void OptimizeMidProgram(midir::Module& module);
 void OptimizeProgram(IRProgram& program, const OptimizeConfig& config = {});
 
 }  // namespace ir

@@ -1425,6 +1425,10 @@ bool simplifyCallsInFunc(IRFunction& func,
 }
 
 void OptimizeProgram(IRProgram& program, const OptimizeConfig& config) {
+  OptimizeLIRProgram(program, config);
+}
+
+void OptimizeLIRProgram(IRProgram& program, const OptimizeConfig& config) {
   for (auto& fn : program.functions) {
     OptimizeFunction(fn, config);
   }
@@ -1456,6 +1460,10 @@ void OptimizeProgram(IRProgram& program, const OptimizeConfig& config) {
       OptimizeFunction(fn, config);
     }
   }
+}
+
+void OptimizeMidProgram(midir::Module& module) {
+  midir::OptimizeMidProgram(module);
 }
 
 }  // namespace ir

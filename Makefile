@@ -94,6 +94,10 @@ IR_M4_TEST_SRC = tests/ir_m4_tests.cpp
 IR_M4_TEST_OBJ = $(BUILD_DIR)/ir_m4_tests.o
 IR_M4_TEST_BIN = ir_m4_tests
 
+MIDIR_TEST_SRC = tests/midir_tests.cpp
+MIDIR_TEST_OBJ = $(BUILD_DIR)/midir_tests.o
+MIDIR_TEST_BIN = midir_tests
+
 BACKEND_B1_TEST_SRC = tests/backend_b1_tests.cpp
 BACKEND_B1_TEST_OBJ = $(BUILD_DIR)/backend_b1_tests.o
 BACKEND_B1_TEST_BIN = backend_b1_tests
@@ -115,6 +119,12 @@ $(IR_M4_TEST_OBJ): $(IR_M4_TEST_SRC) include/ir.h include/optimizer.h | $(BUILD_
 
 $(IR_M4_TEST_BIN): $(IR_M4_TEST_OBJ) $(IR_OBJS) $(OPT_OBJS) $(FRONTEND_OBJS) $(FRONTEND_GEN_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $(IR_M4_TEST_BIN)
+
+$(MIDIR_TEST_OBJ): $(MIDIR_TEST_SRC) include/ir.h include/midir.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $(MIDIR_TEST_SRC) -o $(MIDIR_TEST_OBJ)
+
+$(MIDIR_TEST_BIN): $(MIDIR_TEST_OBJ) $(IR_OBJS) $(OPT_OBJS) $(FRONTEND_OBJS) $(FRONTEND_GEN_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $(MIDIR_TEST_BIN)
 
 $(BACKEND_B1_TEST_OBJ): $(BACKEND_B1_TEST_SRC) include/ir.h include/backend_codegen.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $(BACKEND_B1_TEST_SRC) -o $(BACKEND_B1_TEST_OBJ)
@@ -153,6 +163,9 @@ ir-m3-test: $(IR_M3_TEST_BIN)
 ir-m4-test: $(IR_M4_TEST_BIN)
 	./$(IR_M4_TEST_BIN)
 
+midir-test: $(MIDIR_TEST_BIN)
+	./$(MIDIR_TEST_BIN)
+
 backend-b1-test: $(BACKEND_B1_TEST_BIN)
 	./$(BACKEND_B1_TEST_BIN)
 
@@ -165,7 +178,7 @@ backend-b3-test: $(BACKEND_B3_TEST_BIN)
 backend-b4-test: $(BACKEND_B4_TEST_BIN)
 	./$(BACKEND_B4_TEST_BIN)
 
-ir-tests: ir-test ir-m2-test ir-m3-test ir-m4-test
+ir-tests: ir-test ir-m2-test ir-m3-test ir-m4-test midir-test
 
 backend-tests: backend-b1-test backend-b2-test backend-b3-test backend-b4-test
 
@@ -203,6 +216,6 @@ test-verbose: $(TARGET)
 
 # Clean build artifacts
 clean:
-	rm -rf $(BUILD_DIR) $(TARGET) $(IR_M1_TEST_BIN) $(IR_M2_TEST_BIN) $(IR_M3_TEST_BIN) $(IR_M4_TEST_BIN) $(BACKEND_B1_TEST_BIN) $(BACKEND_B2_TEST_BIN) $(BACKEND_B3_TEST_BIN) $(BACKEND_B4_TEST_BIN)
+	rm -rf $(BUILD_DIR) $(TARGET) $(IR_M1_TEST_BIN) $(IR_M2_TEST_BIN) $(IR_M3_TEST_BIN) $(IR_M4_TEST_BIN) $(MIDIR_TEST_BIN) $(BACKEND_B1_TEST_BIN) $(BACKEND_B2_TEST_BIN) $(BACKEND_B3_TEST_BIN) $(BACKEND_B4_TEST_BIN)
 
 .PHONY: all test test-verbose clean distclean
