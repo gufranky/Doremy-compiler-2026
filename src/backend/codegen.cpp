@@ -1002,9 +1002,9 @@ std::string CodeGen::binOpMnemonic(BinaryOp op, ValueType type) const {
   std::string w = isW ? "w" : "";
   switch (op) {
     case BinaryOp::Add:
-      return "add";
+      return "add" + w;
     case BinaryOp::Sub:
-      return "sub";
+      return "sub" + w;
     case BinaryOp::Mul:
       return "mul" + w;
     case BinaryOp::Div:
@@ -1840,7 +1840,11 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       if (it != allocation.end()) {
         std::string dst = RISCVRegMap::physicalRegName(it->second);
         if (dst != srcReg) {
-          insns.push_back("\taddi " + dst + ", " + srcReg + ", 0");
+          if (paramType == ValueType::I32) {
+            insns.push_back("\taddiw " + dst + ", " + srcReg + ", 0");
+          } else {
+            insns.push_back("\taddi " + dst + ", " + srcReg + ", 0");
+          }
         }
       } else {
         storeIncomingParam(vreg, srcReg, insns, {srcReg});
@@ -1927,13 +1931,20 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
             break;
           case BinaryOp::Add:
             if (b->rhs.isImm() && isInt12(b->rhs.immValue)) {
-              insns.push_back("\taddi " + destReg + ", " + lhs + ", " +
-                              std::to_string(b->rhs.immValue));
+              std::string addiOp =
+                  b->operandType == ValueType::I32 ? "addiw" : "addi";
+              insns.push_back("\t" + addiOp + " " + destReg + ", " + lhs +
+                              ", " + std::to_string(b->rhs.immValue));
             } else if (b->lhs.isImm() && isInt12(b->lhs.immValue)) {
-              insns.push_back("\taddi " + destReg + ", " + rhs + ", " +
-                              std::to_string(b->lhs.immValue));
+              std::string addiOp =
+                  b->operandType == ValueType::I32 ? "addiw" : "addi";
+              insns.push_back("\t" + addiOp + " " + destReg + ", " + rhs +
+                              ", " + std::to_string(b->lhs.immValue));
             } else {
-              insns.push_back("\tadd " + destReg + ", " + lhs + ", " + rhs);
+              std::string addOp =
+                  b->operandType == ValueType::I32 ? "addw" : "add";
+              insns.push_back("\t" + addOp + " " + destReg + ", " + lhs +
+                              ", " + rhs);
             }
             break;
           case BinaryOp::Mul:
@@ -2004,13 +2015,21 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
 
         switch (u->op) {
           case UnaryOp::Neg:
-            insns.push_back("\tsub " + destReg + ", x0, " + opnd);
+            if (u->operandType == ValueType::I32) {
+              insns.push_back("\tsubw " + destReg + ", x0, " + opnd);
+            } else {
+              insns.push_back("\tsub " + destReg + ", x0, " + opnd);
+            }
             break;
           case UnaryOp::Not:
             insns.push_back("\tsltiu " + destReg + ", " + opnd + ", 1");
             break;
           case UnaryOp::Plus:
-            insns.push_back("\taddi " + destReg + ", " + opnd + ", 0");
+            if (u->operandType == ValueType::I32) {
+              insns.push_back("\taddiw " + destReg + ", " + opnd + ", 0");
+            } else {
+              insns.push_back("\taddi " + destReg + ", " + opnd + ", 0");
+            }
             break;
         }
         storeCurrentValue(u->dest, destReg, insns);
@@ -2039,7 +2058,11 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
         auto it = allocation.find(c->dest);
         if (it != allocation.end()) {
           std::string dst = RISCVRegMap::physicalRegName(it->second);
-          insns.push_back("\taddi " + dst + ", " + src + ", 0");
+          if (c->destType == ValueType::I32) {
+            insns.push_back("\taddiw " + dst + ", " + src + ", 0");
+          } else {
+            insns.push_back("\taddi " + dst + ", " + src + ", 0");
+          }
         } else {
           storeCurrentValue(c->dest, src, insns, {src});
         }
@@ -2123,7 +2146,11 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           if (loc.useIntReg) {
             std::string target = "a" + std::to_string(loc.regIndex);
             if (argReg != target) {
-              insns.push_back("\taddi " + target + ", " + argReg + ", 0");
+              if (argType == ValueType::I32) {
+                insns.push_back("\taddiw " + target + ", " + argReg + ", 0");
+              } else {
+                insns.push_back("\taddi " + target + ", " + argReg + ", 0");
+              }
             }
           } else {
             int offset = frame.outgoingArgOffset + loc.stackIndex * 8;
@@ -2158,7 +2185,11 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
             auto it = allocation.find(c->dest);
             if (it != allocation.end()) {
               std::string dst = RISCVRegMap::physicalRegName(it->second);
-              insns.push_back("\taddi " + dst + ", a0, 0");
+              if (c->resultType == ValueType::I32) {
+                insns.push_back("\taddiw " + dst + ", a0, 0");
+              } else {
+                insns.push_back("\taddi " + dst + ", a0, 0");
+              }
             } else {
               storeCurrentValue(c->dest, "a0", insns, {"a0"});
             }
@@ -2175,7 +2206,11 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           } else {
             std::string valReg = loadOperand(r->value, scratchIdx, insns);
             if (valReg != "a0") {
-              insns.push_back("\taddi a0, " + valReg + ", 0");
+              if (r->valueType == ValueType::I32) {
+                insns.push_back("\taddiw a0, " + valReg + ", 0");
+              } else {
+                insns.push_back("\taddi a0, " + valReg + ", 0");
+              }
             }
           }
         }
