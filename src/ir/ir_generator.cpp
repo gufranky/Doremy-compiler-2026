@@ -102,6 +102,7 @@ IRProgram IRGenerator::generate(CompUnit* root) {
       declareLocalValue(paramPtr->name, binding);
       current_->params.push_back(reg);
       current_->paramTypes.push_back(toIRValueType(paramPtr->type));
+      current_->paramIsArray.push_back(paramPtr->type.isArray);
     }
 
     genBlock(func->body.get());

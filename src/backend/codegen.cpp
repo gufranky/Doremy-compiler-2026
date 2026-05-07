@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <unordered_set>
 #include <cstring>
 #include <set>
 #include <sstream>
@@ -1612,6 +1613,43 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
                                std::vector<std::string>& out) {
   (void)liveness;
   const std::vector<std::string> scratchRegs = {"t5", "t6"};
+  std::unordered_set<int> addressVRegs;
+  auto seedAddressOperand = [&](const Operand& op) -> bool {
+    if (op.isLocalVarAddr() || op.isGlobal() || op.isStackPtr()) return true;
+    if (!op.isVReg()) return false;
+    return addressVRegs.find(op.vregId) != addressVRegs.end();
+  };
+
+  for (size_t i = 0; i < fn.params.size(); ++i) {
+    if (i < fn.paramIsArray.size() && fn.paramIsArray[i]) {
+      addressVRegs.insert(fn.params[i]);
+    }
+  }
+  for (const auto& inst : fn.instructions) {
+    switch (inst->kind) {
+      case InstKind::Copy: {
+        auto* c = static_cast<const CopyInst*>(inst.get());
+        if (c->src.isLocalVarAddr()) {
+          addressVRegs.insert(c->dest);
+        } else if (c->src.isVReg() &&
+                   addressVRegs.find(c->src.vregId) != addressVRegs.end()) {
+          addressVRegs.insert(c->dest);
+        }
+        break;
+      }
+      case InstKind::Binary: {
+        auto* b = static_cast<const BinaryInst*>(inst.get());
+        bool lhsIsAddr = seedAddressOperand(b->lhs);
+        bool rhsIsAddr = seedAddressOperand(b->rhs);
+        if (b->op == BinaryOp::Add && (lhsIsAddr || rhsIsAddr)) {
+          addressVRegs.insert(b->dest);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
 
   auto mangleLabel = [&](const std::string& lbl) {
     return fn.name + "_" + lbl;
@@ -1625,6 +1663,10 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       }
     }
     return std::string("t6");
+  };
+
+  auto isAddressOperand = [&](const Operand& op) -> bool {
+    return seedAddressOperand(op);
   };
 
   auto loadOperandInto = [&](const Operand& op, const std::string& targetReg,
@@ -1813,6 +1855,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
     int scratchIdx = 0;
     std::vector<std::string> insns;
     ValueType paramType = i < fn.paramTypes.size() ? fn.paramTypes[i] : ValueType::I32;
+    bool paramIsAddr = i < fn.paramIsArray.size() && fn.paramIsArray[i];
     ArgLocation loc = classifyArgLocation(paramType, incomingIntRegCount,
                                           incomingFloatRegCount, incomingStackCount);
 
@@ -1840,7 +1883,9 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       if (it != allocation.end()) {
         std::string dst = RISCVRegMap::physicalRegName(it->second);
         if (dst != srcReg) {
-          if (paramType == ValueType::I32) {
+          if (paramIsAddr) {
+            insns.push_back("\taddi " + dst + ", " + srcReg + ", 0");
+          } else if (paramType == ValueType::I32) {
             insns.push_back("\taddiw " + dst + ", " + srcReg + ", 0");
           } else {
             insns.push_back("\taddi " + dst + ", " + srcReg + ", 0");
@@ -1908,6 +1953,8 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           std::vector<std::string> reservedRegs{lhs, rhs};
           destReg = chooseScratch(reservedRegs);
         }
+        bool use64BitAddrMath = isAddressOperand(b->lhs) || isAddressOperand(b->rhs) ||
+                                addressVRegs.find(b->dest) != addressVRegs.end();
 
         switch (b->op) {
           case BinaryOp::Eq:
@@ -1932,17 +1979,17 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           case BinaryOp::Add:
             if (b->rhs.isImm() && isInt12(b->rhs.immValue)) {
               std::string addiOp =
-                  b->operandType == ValueType::I32 ? "addiw" : "addi";
+                  (b->operandType == ValueType::I32 && !use64BitAddrMath) ? "addiw" : "addi";
               insns.push_back("\t" + addiOp + " " + destReg + ", " + lhs +
                               ", " + std::to_string(b->rhs.immValue));
             } else if (b->lhs.isImm() && isInt12(b->lhs.immValue)) {
               std::string addiOp =
-                  b->operandType == ValueType::I32 ? "addiw" : "addi";
+                  (b->operandType == ValueType::I32 && !use64BitAddrMath) ? "addiw" : "addi";
               insns.push_back("\t" + addiOp + " " + destReg + ", " + rhs +
                               ", " + std::to_string(b->lhs.immValue));
             } else {
               std::string addOp =
-                  b->operandType == ValueType::I32 ? "addw" : "add";
+                  (b->operandType == ValueType::I32 && !use64BitAddrMath) ? "addw" : "add";
               insns.push_back("\t" + addOp + " " + destReg + ", " + lhs +
                               ", " + rhs);
             }
@@ -1950,12 +1997,14 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           case BinaryOp::Mul:
             if (b->rhs.isImm() && b->rhs.immValue > 0 &&
                 (b->rhs.immValue & (b->rhs.immValue - 1)) == 0) {
-              std::string shiftOp = b->operandType == ValueType::I32 ? "slliw" : "slli";
+              std::string shiftOp =
+                  (b->operandType == ValueType::I32 && !use64BitAddrMath) ? "slliw" : "slli";
               insns.push_back("\t" + shiftOp + " " + destReg + ", " + lhs + ", " +
                               std::to_string(__builtin_ctz(b->rhs.immValue)));
             } else if (b->lhs.isImm() && b->lhs.immValue > 0 &&
                        (b->lhs.immValue & (b->lhs.immValue - 1)) == 0) {
-              std::string shiftOp = b->operandType == ValueType::I32 ? "slliw" : "slli";
+              std::string shiftOp =
+                  (b->operandType == ValueType::I32 && !use64BitAddrMath) ? "slliw" : "slli";
               insns.push_back("\t" + shiftOp + " " + destReg + ", " + rhs + ", " +
                               std::to_string(__builtin_ctz(b->lhs.immValue)));
             } else {
@@ -2025,7 +2074,9 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
             insns.push_back("\tsltiu " + destReg + ", " + opnd + ", 1");
             break;
           case UnaryOp::Plus:
-            if (u->operandType == ValueType::I32) {
+            if (u->operandType == ValueType::I32 &&
+                addressVRegs.find(u->dest) == addressVRegs.end() &&
+                !isAddressOperand(u->operand)) {
               insns.push_back("\taddiw " + destReg + ", " + opnd + ", 0");
             } else {
               insns.push_back("\taddi " + destReg + ", " + opnd + ", 0");
@@ -2058,7 +2109,9 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
         auto it = allocation.find(c->dest);
         if (it != allocation.end()) {
           std::string dst = RISCVRegMap::physicalRegName(it->second);
-          if (c->destType == ValueType::I32) {
+          if (c->destType == ValueType::I32 &&
+              addressVRegs.find(c->dest) == addressVRegs.end() &&
+              !isAddressOperand(c->src)) {
             insns.push_back("\taddiw " + dst + ", " + src + ", 0");
           } else {
             insns.push_back("\taddi " + dst + ", " + src + ", 0");
@@ -2146,7 +2199,9 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           if (loc.useIntReg) {
             std::string target = "a" + std::to_string(loc.regIndex);
             if (argReg != target) {
-              if (argType == ValueType::I32) {
+              if (isAddressOperand(c->args[ai])) {
+                insns.push_back("\taddi " + target + ", " + argReg + ", 0");
+              } else if (argType == ValueType::I32) {
                 insns.push_back("\taddiw " + target + ", " + argReg + ", 0");
               } else {
                 insns.push_back("\taddi " + target + ", " + argReg + ", 0");
@@ -2185,7 +2240,8 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
             auto it = allocation.find(c->dest);
             if (it != allocation.end()) {
               std::string dst = RISCVRegMap::physicalRegName(it->second);
-              if (c->resultType == ValueType::I32) {
+              if (addressVRegs.find(c->dest) == addressVRegs.end() &&
+                  c->resultType == ValueType::I32) {
                 insns.push_back("\taddiw " + dst + ", a0, 0");
               } else {
                 insns.push_back("\taddi " + dst + ", a0, 0");
