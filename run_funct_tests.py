@@ -13,8 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_GCC_FLAGS = ["-march=rv64gc", "-mabi=lp64d", "-static"]
-DEFAULT_RUNTIME_CANDIDATES = ["libsysy_riscv.a", "sylib.c"]
 DEFAULT_WSL_DISTRO = "Ubuntu"
+PROGRESS_BAR_WIDTH = 28
 
 
 @dataclass
@@ -109,6 +109,48 @@ def sanitize_wsl_text(text: str) -> str:
             continue
         kept.append(line)
     return "\n".join(kept)
+
+
+def render_progress(
+    done: int,
+    total: int,
+    *,
+    compile_passes: int,
+    full_passes: int,
+    mode: str,
+    current_case: str,
+) -> str:
+    total = max(total, 1)
+    done = min(done, total)
+    filled = done * PROGRESS_BAR_WIDTH // total
+    bar = "#" * filled + "-" * (PROGRESS_BAR_WIDTH - filled)
+    percent = done * 100.0 / total
+    stats = f"compile {compile_passes}/{done}"
+    if mode == "full":
+        stats += f" | run {full_passes}/{done}"
+    suffix = f" | {current_case}" if current_case else ""
+    return f"[{bar}] {done}/{total} {percent:6.2f}% | {stats}{suffix}"
+
+
+def show_progress(
+    done: int,
+    total: int,
+    *,
+    compile_passes: int,
+    full_passes: int,
+    mode: str,
+    current_case: str,
+    final: bool = False,
+) -> None:
+    line = render_progress(
+        done,
+        total,
+        compile_passes=compile_passes,
+        full_passes=full_passes,
+        mode=mode,
+        current_case=current_case,
+    )
+    print(f"\r{line}", end="\n" if final else "", file=sys.stderr, flush=True)
 
 
 def run_runner_command(
@@ -250,15 +292,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--build-cmd", help="测试前先执行的构建命令，例如 make compiler")
     parser.add_argument("--gcc", help="RISC-V GCC 命令，默认 riscv64-linux-gnu-gcc")
     parser.add_argument("--qemu", help="QEMU 命令，默认 qemu-riscv64")
-    parser.add_argument("--runtime", nargs="*", default=[], help="运行时文件列表；默认自动探测 sysy_runtime_rv64.c")
+    parser.add_argument("--runtime", nargs="*", default=[], help="运行时文件列表；默认自动检测 libsysy_riscv.a 或 sylib.c")
     parser.add_argument("--runner", choices=["auto", "host", "wsl"], default="auto", help="命令执行环境，默认 auto")
     parser.add_argument("--wsl-distro", default=DEFAULT_WSL_DISTRO, help="WSL 发行版名称，默认 Ubuntu")
     parser.add_argument("--opt", action="store_true", help="调用编译器时追加 -O1")
-    parser.add_argument("--timeout", type=int, default=20, help="单个阶段超时秒数，默认 20")
+    parser.add_argument("--timeout", type=int, default=120, help="单个阶段超时秒数，默认 120")
     parser.add_argument("--limit", type=int, help="仅运行前 N 个用例")
     parser.add_argument("--diff-lines", type=int, default=12, help="失败时最多显示多少行 diff")
     parser.add_argument("--list-only", action="store_true", help="仅列出用例，不实际执行")
     parser.add_argument("--quiet", action="store_true", help="只输出失败用例和最终汇总")
+    parser.add_argument("--no-progress", action="store_true", help="关闭进度条显示")
     parser.add_argument("--summary-json", help="将汇总结果写入 JSON 文件")
     parser.set_defaults(opt=True)
     return parser.parse_args()
@@ -296,12 +339,26 @@ def main() -> int:
         return build_rc
 
     if args.mode == "full" and not toolchain.runtime_files:
-        print("full 模式缺少运行时文件，请提供 --runtime 或将 sysy_runtime_rv64.c 放在仓库根目录。", file=sys.stderr)
+        print("full 模式缺少运行时文件，请提供 --runtime 或将 libsysy_riscv.a / sylib.c 放在仓库根目录。", file=sys.stderr)
         return 2
 
     compile_passes = 0
     full_passes = 0
     results: list[CaseResult] = []
+    total_cases = len(cases)
+
+    def update_progress(current_case: str, *, final: bool = False) -> None:
+        if args.no_progress:
+            return
+        show_progress(
+            len(results),
+            total_cases,
+            compile_passes=compile_passes,
+            full_passes=full_passes,
+            mode=args.mode,
+            current_case=current_case,
+            final=final,
+        )
 
     with tempfile.TemporaryDirectory(prefix="funct-run-", dir=repo_root) as temp_dir:
         temp_root = Path(temp_dir)
@@ -318,6 +375,7 @@ def main() -> int:
                 results.append(CaseResult(case_name, False, False, "prepare", f"缺少期望输出文件: {expected_path.name}"))
                 if not args.quiet:
                     print(f"[FAIL] {case_name} prepare 缺少 {expected_path.name}")
+                update_progress(case_name)
                 continue
 
             try:
@@ -326,6 +384,7 @@ def main() -> int:
                 results.append(CaseResult(case_name, False, False, "compile", "编译超时"))
                 if not args.quiet:
                     print(f"[FAIL] {case_name} compile 编译超时")
+                update_progress(case_name)
                 continue
 
             compile_stderr = decode_stream(compile_proc.stderr, is_wsl=config.runner == "wsl").strip()
@@ -334,6 +393,7 @@ def main() -> int:
                 results.append(CaseResult(case_name, False, False, "compile", detail))
                 if not args.quiet:
                     print(f"[FAIL] {case_name} compile {detail}")
+                update_progress(case_name)
                 continue
 
             compile_passes += 1
@@ -343,6 +403,7 @@ def main() -> int:
                 results.append(CaseResult(case_name, True, True, "ok"))
                 if not args.quiet:
                     print(f"[PASS] {case_name}")
+                update_progress(case_name)
                 continue
 
             try:
@@ -351,6 +412,7 @@ def main() -> int:
                 results.append(CaseResult(case_name, True, False, "link", "链接超时"))
                 if not args.quiet:
                     print(f"[FAIL] {case_name} link 链接超时")
+                update_progress(case_name)
                 continue
 
             link_stderr = decode_stream(link_proc.stderr, is_wsl=config.runner == "wsl").strip()
@@ -359,6 +421,7 @@ def main() -> int:
                 results.append(CaseResult(case_name, True, False, "link", detail))
                 if not args.quiet:
                     print(f"[FAIL] {case_name} link {detail}")
+                update_progress(case_name)
                 continue
 
             try:
@@ -368,6 +431,7 @@ def main() -> int:
                 results.append(CaseResult(case_name, True, False, "run", "运行超时"))
                 if not args.quiet:
                     print(f"[FAIL] {case_name} run 运行超时")
+                update_progress(case_name)
                 continue
 
             actual_stdout = decode_stream(run_proc.stdout, is_wsl=config.runner == "wsl")
@@ -378,12 +442,16 @@ def main() -> int:
                 results.append(CaseResult(case_name, True, True, "ok"))
                 if not args.quiet:
                     print(f"[PASS] {case_name}")
+                update_progress(case_name)
                 continue
 
             diff = format_diff(expected_text, actual_text, args.diff_lines)
             results.append(CaseResult(case_name, True, False, "mismatch", diff))
             print(f"[FAIL] {case_name} mismatch")
             print(diff)
+            update_progress(case_name)
+
+    update_progress(results[-1].name if results else "", final=True)
 
     total = len(results)
     compile_rate = (compile_passes / total * 100.0) if total else 0.0

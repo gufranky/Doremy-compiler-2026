@@ -3,6 +3,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -156,6 +157,28 @@ struct ValueInfo {
   std::vector<int> users;
 };
 
+enum class ObjectKind {
+  Unknown,
+  ParamScalar,
+  LocalScalar,
+  TempScalar,
+  Aggregate,
+  AddressTaken,
+  GlobalMemory,
+};
+
+struct VariableObject {
+  int id = -1;
+  ObjectKind kind = ObjectKind::Unknown;
+  std::string name;
+  Type type = Type::Void();
+  ir::ValueType lirType = ir::ValueType::I32;
+  int baseReg = -1;
+  int frameOffset = 0;
+  bool renameable = false;
+  bool addressEscapes = false;
+};
+
 struct Function {
   std::string name;
   std::vector<BasicBlock> blocks;
@@ -167,10 +190,14 @@ struct Function {
   Type returnType = Type::Void();
   int localArraySize = 0;
   int nextValueId = 0;
+  int nextObjectId = 0;
   bool inSSA = false;
   std::vector<ValueInfo> values;
+  std::unordered_map<int, VariableObject> frameObjects;
+  std::unordered_map<int, VariableObject> registerObjects;
 
   int allocateValue(Type type);
+  int allocateObject();
 };
 
 struct GlobalVar {

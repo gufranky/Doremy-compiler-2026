@@ -137,6 +137,17 @@ int main(int argc, char** argv) {
         // Keep legacy behavior reachable for migration A/B checks.
       } else if (options.midirMode == CommandLineOptions::MidIRMode::LowerOnly) {
         program = midir::LowerMidToLIR(midModule);
+      } else if (options.midirMode == CommandLineOptions::MidIRMode::StopAfterSSA) {
+        for (auto& fn : midModule.functions) {
+          midir::ConvertToSSA(fn);
+        }
+        if (!midir::VerifyMidIR(midModule, &verifyError)) {
+          std::cerr << "SSA MidIR verification failed: " << verifyError << "\n";
+          delete root;
+          return 1;
+        }
+        delete root;
+        return 0;
       } else {
         ir::OptimizeMidProgram(midModule);
         if (!midir::VerifyMidIR(midModule, &verifyError)) {
@@ -144,16 +155,9 @@ int main(int argc, char** argv) {
           delete root;
           return 1;
         }
-        if (options.midirMode != CommandLineOptions::MidIRMode::StopAfterSSA) {
-          program = midir::LowerMidToLIR(midModule);
-        }
+        program = midir::LowerMidToLIR(midModule);
       }
 
-      if (options.midirMode == CommandLineOptions::MidIRMode::BuildOnly ||
-          options.midirMode == CommandLineOptions::MidIRMode::StopAfterSSA) {
-        delete root;
-        return 0;
-      }
       ir::OptimizeLIRProgram(program);
     }
   }
