@@ -93,22 +93,24 @@ static IRProgram buildParallelCopyProgram() {
   IRProgram program;
   IRFunction fn("parallel_copy");
   fn.returnType = ValueType::I32;
-  fn.nextVReg = 4;
+  fn.nextVReg = 3;
 
   fn.append<LabelInst>("entry");
   fn.append<BranchInst>(Operand::VReg(0), "left", "right");
 
   fn.append<LabelInst>("left");
-  fn.append<CopyInst>(ValueType::I32, 1, Operand::Imm(10));
-  fn.append<CopyInst>(ValueType::I32, 2, Operand::Imm(20));
+  fn.append<StoreInst>(ValueType::I32, Operand::Imm(10), Operand::LocalVarAddr(0));
+  fn.append<StoreInst>(ValueType::I32, Operand::Imm(20), Operand::LocalVarAddr(8));
   fn.append<JumpInst>("merge");
 
   fn.append<LabelInst>("right");
-  fn.append<CopyInst>(ValueType::I32, 1, Operand::Imm(20));
-  fn.append<CopyInst>(ValueType::I32, 2, Operand::Imm(10));
+  fn.append<StoreInst>(ValueType::I32, Operand::Imm(20), Operand::LocalVarAddr(0));
+  fn.append<StoreInst>(ValueType::I32, Operand::Imm(10), Operand::LocalVarAddr(8));
   fn.append<JumpInst>("merge");
 
   fn.append<LabelInst>("merge");
+  fn.append<LoadInst>(ValueType::I32, 1, Operand::LocalVarAddr(0));
+  fn.append<LoadInst>(ValueType::I32, 2, Operand::LocalVarAddr(8));
   fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 3,
                         Operand::VReg(1), Operand::VReg(2));
   fn.append<ReturnInst>(ValueType::I32, Operand::VReg(3));
@@ -170,6 +172,230 @@ static IRProgram buildParamMutationProgram() {
   fn.append<BinaryInst>(BinaryOp::Mul, ValueType::I32, ValueType::I32, 2,
                         Operand::VReg(1), Operand::Imm(2));
   fn.append<ReturnInst>(ValueType::I32, Operand::VReg(2));
+
+  program.functions.push_back(std::move(fn));
+  return program;
+}
+
+static IRProgram buildLoopInvariantLoadProgram() {
+  IRProgram program;
+  program.globals.emplace_back("gA", ScalarValue::Int(7), false);
+  program.globals.back().valueType = ValueType::I32;
+  program.globals.back().typedInitialValue = ScalarValue::Int(7);
+
+  IRFunction fn("loop_invariant_load");
+  fn.returnType = ValueType::I32;
+  fn.nextVReg = 6;
+
+  fn.append<LabelInst>("entry");
+  fn.append<CopyInst>(ValueType::I32, 0, Operand::Imm(0));
+  fn.append<CopyInst>(ValueType::I32, 1, Operand::Imm(0));
+  fn.append<JumpInst>("header");
+
+  fn.append<LabelInst>("header");
+  fn.append<BinaryInst>(BinaryOp::Lt, ValueType::I32, ValueType::I32, 2,
+                        Operand::VReg(0), Operand::Imm(4));
+  fn.append<BranchInst>(Operand::VReg(2), "body", "exit");
+
+  fn.append<LabelInst>("body");
+  fn.append<LoadInst>(ValueType::I32, 3, Operand::Global("gA"));
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 4,
+                        Operand::VReg(1), Operand::VReg(3));
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 1,
+                        Operand::VReg(4), Operand::Imm(0));
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 0,
+                        Operand::VReg(0), Operand::Imm(1));
+  fn.append<JumpInst>("header");
+
+  fn.append<LabelInst>("exit");
+  fn.append<ReturnInst>(ValueType::I32, Operand::VReg(1));
+
+  program.functions.push_back(std::move(fn));
+  return program;
+}
+
+static IRProgram buildLoopClobberedLoadProgram() {
+  IRProgram program;
+  program.globals.emplace_back("gA", ScalarValue::Int(7), false);
+  program.globals.back().valueType = ValueType::I32;
+  program.globals.back().typedInitialValue = ScalarValue::Int(7);
+
+  IRFunction fn("loop_clobbered_load");
+  fn.returnType = ValueType::I32;
+  fn.nextVReg = 5;
+
+  fn.append<LabelInst>("entry");
+  fn.append<CopyInst>(ValueType::I32, 0, Operand::Imm(0));
+  fn.append<JumpInst>("header");
+
+  fn.append<LabelInst>("header");
+  fn.append<BinaryInst>(BinaryOp::Lt, ValueType::I32, ValueType::I32, 1,
+                        Operand::VReg(0), Operand::Imm(4));
+  fn.append<BranchInst>(Operand::VReg(1), "body", "exit");
+
+  fn.append<LabelInst>("body");
+  fn.append<LoadInst>(ValueType::I32, 2, Operand::Global("gA"));
+  fn.append<StoreInst>(ValueType::I32, Operand::VReg(0), Operand::Global("gA"));
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 0,
+                        Operand::VReg(0), Operand::Imm(1));
+  fn.append<JumpInst>("header");
+
+  fn.append<LabelInst>("exit");
+  fn.append<ReturnInst>(ValueType::I32, Operand::Imm(0));
+
+  program.functions.push_back(std::move(fn));
+  return program;
+}
+
+static IRProgram buildLoopDisjointOffsetLoadProgram() {
+  IRProgram program;
+  program.globals.emplace_back("gArrBase", ScalarValue::Int(7), false);
+  program.globals.back().valueType = ValueType::I32;
+  program.globals.back().typedInitialValue = ScalarValue::Int(7);
+  IRFunction fn("loop_disjoint_offset_load");
+  fn.returnType = ValueType::I32;
+  fn.nextVReg = 8;
+
+  fn.append<LabelInst>("entry");
+  fn.append<CopyInst>(ValueType::I32, 0, Operand::Imm(0));
+  fn.append<JumpInst>("header");
+
+  fn.append<LabelInst>("header");
+  fn.append<BinaryInst>(BinaryOp::Lt, ValueType::I32, ValueType::I32, 1,
+                        Operand::VReg(0), Operand::Imm(4));
+  fn.append<BranchInst>(Operand::VReg(1), "body", "exit");
+
+  fn.append<LabelInst>("body");
+  fn.append<LoadInst>(ValueType::I32, 2, Operand::Global("gArrBase"));
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 3,
+                        Operand::Global("gArrBase"), Operand::Imm(32));
+  fn.append<StoreInst>(ValueType::I32, Operand::VReg(0), Operand::VReg(3));
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 0,
+                        Operand::VReg(0), Operand::Imm(1));
+  fn.append<JumpInst>("header");
+
+  fn.append<LabelInst>("exit");
+  fn.append<ReturnInst>(ValueType::I32, Operand::VReg(2));
+
+  program.functions.push_back(std::move(fn));
+  return program;
+}
+
+static IRProgram buildLoopNeedPreheaderProgram() {
+  IRProgram program;
+  IRFunction fn("loop_need_preheader");
+  fn.returnType = ValueType::I32;
+  fn.nextVReg = 5;
+
+  fn.append<LabelInst>("entry");
+  fn.append<BranchInst>(Operand::VReg(0), "setup1", "setup2");
+
+  fn.append<LabelInst>("setup1");
+  fn.append<JumpInst>("header");
+
+  fn.append<LabelInst>("setup2");
+  fn.append<JumpInst>("header");
+
+  fn.append<LabelInst>("header");
+  fn.append<BinaryInst>(BinaryOp::Lt, ValueType::I32, ValueType::I32, 1,
+                        Operand::VReg(2), Operand::Imm(4));
+  fn.append<BranchInst>(Operand::VReg(1), "body", "exit");
+
+  fn.append<LabelInst>("body");
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 2,
+                        Operand::VReg(2), Operand::Imm(1));
+  fn.append<JumpInst>("header");
+
+  fn.append<LabelInst>("exit");
+  fn.append<ReturnInst>(ValueType::I32, Operand::Imm(0));
+
+  program.functions.push_back(std::move(fn));
+  return program;
+}
+
+static IRProgram buildLCSSAProgram() {
+  IRProgram program;
+  IRFunction fn("lcssa");
+  fn.returnType = ValueType::I32;
+  fn.nextVReg = 5;
+
+  fn.append<LabelInst>("entry");
+  fn.append<CopyInst>(ValueType::I32, 0, Operand::Imm(0));
+  fn.append<JumpInst>("header");
+
+  fn.append<LabelInst>("header");
+  fn.append<BinaryInst>(BinaryOp::Lt, ValueType::I32, ValueType::I32, 1,
+                        Operand::VReg(0), Operand::Imm(4));
+  fn.append<BranchInst>(Operand::VReg(1), "body", "exit");
+
+  fn.append<LabelInst>("body");
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 2,
+                        Operand::VReg(0), Operand::Imm(10));
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 0,
+                        Operand::VReg(0), Operand::Imm(1));
+  fn.append<JumpInst>("header");
+
+  fn.append<LabelInst>("exit");
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 3,
+                        Operand::VReg(2), Operand::Imm(1));
+  fn.append<ReturnInst>(ValueType::I32, Operand::VReg(3));
+
+  program.functions.push_back(std::move(fn));
+  return program;
+}
+
+static IRProgram buildAddressCanonicalizationProgram() {
+  IRProgram program;
+  IRFunction fn("addr_canonical");
+  fn.returnType = ValueType::I32;
+  fn.nextVReg = 4;
+
+  fn.append<LabelInst>("entry");
+  fn.append<CopyInst>(ValueType::I32, 0, Operand::LocalVarAddr(0));
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 1,
+                        Operand::LocalVarAddr(8), Operand::Imm(16));
+  fn.append<LoadInst>(ValueType::I32, 2, Operand::VReg(1));
+  fn.append<ReturnInst>(ValueType::I32, Operand::VReg(2));
+
+  program.functions.push_back(std::move(fn));
+  return program;
+}
+
+static IRProgram buildGEPCanonicalizationProgram() {
+  IRProgram program;
+  IRFunction fn("gep_canonical");
+  fn.returnType = ValueType::I32;
+  fn.nextVReg = 6;
+
+  fn.append<LabelInst>("entry");
+  fn.append<CopyInst>(ValueType::I32, 0, Operand::Imm(3));
+  fn.append<BinaryInst>(BinaryOp::Mul, ValueType::I32, ValueType::I32, 1,
+                        Operand::VReg(0), Operand::Imm(4));
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 2,
+                        Operand::LocalVarAddr(32), Operand::VReg(1));
+  fn.append<LoadInst>(ValueType::I32, 3, Operand::VReg(2));
+  fn.append<ReturnInst>(ValueType::I32, Operand::VReg(3));
+
+  program.functions.push_back(std::move(fn));
+  return program;
+}
+
+static IRProgram buildNestedGEPCanonicalizationProgram() {
+  IRProgram program;
+  IRFunction fn("nested_gep_canonical");
+  fn.returnType = ValueType::I32;
+  fn.nextVReg = 8;
+
+  fn.append<LabelInst>("entry");
+  fn.append<CopyInst>(ValueType::I32, 0, Operand::Imm(3));
+  fn.append<BinaryInst>(BinaryOp::Mul, ValueType::I32, ValueType::I32, 1,
+                        Operand::VReg(0), Operand::Imm(4));
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 2,
+                        Operand::LocalVarAddr(32), Operand::VReg(1));
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 3,
+                        Operand::VReg(2), Operand::Imm(8));
+  fn.append<LoadInst>(ValueType::I32, 4, Operand::VReg(3));
+  fn.append<ReturnInst>(ValueType::I32, Operand::VReg(4));
 
   program.functions.push_back(std::move(fn));
   return program;
@@ -316,6 +542,104 @@ int main() {
   }
 
   {
+    IRProgram program = buildAddressCanonicalizationProgram();
+    midir::Module module = midir::BuildMidIR(program);
+    midir::OptimizeMidProgram(module);
+    std::string error;
+    assert(midir::VerifyMidIR(module, &error));
+
+    IRProgram lowered = midir::LowerMidToLIR(module);
+    assert(!lowered.functions.empty());
+  }
+
+  {
+    IRProgram program = buildGEPCanonicalizationProgram();
+    midir::Module module = midir::BuildMidIR(program);
+    midir::OptimizeMidProgram(module);
+    std::string error;
+    assert(midir::VerifyMidIR(module, &error));
+
+    bool sawGEP = false;
+    for (const auto& block : module.functions.front().blocks) {
+      for (const auto& inst : block.instructions) {
+        if (inst.kind == midir::InstKind::GEP) {
+          sawGEP = true;
+          assert(inst.operands.size() == 1);
+          assert(inst.operands[0].isRegister());
+          assert(inst.gepIndex.isRegister() || inst.gepIndex.isConstInt());
+        }
+      }
+    }
+    assert(sawGEP);
+  }
+
+  {
+    IRProgram program = buildNestedGEPCanonicalizationProgram();
+    midir::Module module = midir::BuildMidIR(program);
+    midir::OptimizeMidProgram(module);
+    std::string error;
+    assert(midir::VerifyMidIR(module, &error));
+
+    bool sawNestedFoldedGEP = false;
+    bool sawPtrAdd = false;
+    for (const auto& block : module.functions.front().blocks) {
+      for (const auto& inst : block.instructions) {
+        if (inst.kind == midir::InstKind::GEP && inst.gepOffset == 8) {
+          sawNestedFoldedGEP = true;
+        }
+        if (inst.kind == midir::InstKind::Binary && inst.type.kind == midir::TypeKind::Ptr) {
+          sawPtrAdd = true;
+        }
+      }
+    }
+    assert(sawNestedFoldedGEP);
+    assert(!sawPtrAdd);
+  }
+
+  {
+    midir::Function fn;
+    fn.name = "invalid_ptr_ir";
+    fn.entryBlock = 0;
+    fn.nextValueId = 3;
+    fn.values.resize(3);
+
+    midir::BasicBlock block;
+    block.name = "entry";
+
+    midir::Instruction badCopy;
+    badCopy.kind = midir::InstKind::Copy;
+    badCopy.type = midir::Type::Ptr();
+    badCopy.dest = 0;
+    badCopy.hasResult = true;
+    badCopy.operands.push_back(midir::Operand::ConstInt(4));
+    block.instructions.push_back(std::move(badCopy));
+
+    midir::Instruction badAdd;
+    badAdd.kind = midir::InstKind::Binary;
+    badAdd.binaryOp = ir::BinaryOp::Add;
+    badAdd.type = midir::Type::Ptr();
+    badAdd.dest = 1;
+    badAdd.hasResult = true;
+    badAdd.operands.push_back(midir::Operand::Reg(0, midir::Type::Ptr()));
+    badAdd.operands.push_back(midir::Operand::Global("gA"));
+    block.instructions.push_back(std::move(badAdd));
+
+    midir::Instruction ret;
+    ret.kind = midir::InstKind::Return;
+    ret.type = midir::Type::Void();
+    ret.hasValue = false;
+    block.instructions.push_back(std::move(ret));
+
+    fn.blocks.push_back(std::move(block));
+    midir::Module module;
+    module.functions.push_back(std::move(fn));
+
+    std::string error;
+    assert(!midir::VerifyMidIR(module, &error));
+    assert(!error.empty());
+  }
+
+  {
     IRProgram program = buildDeadAfterTerminatorProgram();
     midir::Module module = midir::BuildMidIR(program);
     std::string error;
@@ -345,6 +669,100 @@ int main() {
     }
     assert(phiCount == 0);
     assert(copyCount == 1);
+  }
+
+  {
+    IRProgram program = buildLoopInvariantLoadProgram();
+    midir::Module module = midir::BuildMidIR(program);
+    auto& fn = module.functions.front();
+
+    bool sawLoadInLoopBodyBefore = false;
+    for (const auto& inst : fn.blocks[2].instructions) {
+      if (inst.kind == midir::InstKind::Load) sawLoadInLoopBodyBefore = true;
+    }
+    assert(sawLoadInLoopBodyBefore);
+
+    midir::OptimizeMidProgram(module);
+
+    bool sawLoadInLoopBodyAfter = false;
+    bool sawLoadInPreheader = false;
+    for (const auto& inst : module.functions.front().blocks[0].instructions) {
+      if (inst.kind == midir::InstKind::Load) sawLoadInPreheader = true;
+    }
+    for (const auto& inst : module.functions.front().blocks[2].instructions) {
+      if (inst.kind == midir::InstKind::Load) sawLoadInLoopBodyAfter = true;
+    }
+    assert(sawLoadInPreheader);
+    assert(!sawLoadInLoopBodyAfter);
+  }
+
+  {
+    IRProgram program = buildLoopClobberedLoadProgram();
+    midir::Module module = midir::BuildMidIR(program);
+    midir::OptimizeMidProgram(module);
+
+    bool sawLoadInLoopBody = false;
+    for (const auto& inst : module.functions.front().blocks[2].instructions) {
+      if (inst.kind == midir::InstKind::Load) sawLoadInLoopBody = true;
+    }
+    assert(sawLoadInLoopBody);
+  }
+
+  {
+    IRProgram program = buildLoopDisjointOffsetLoadProgram();
+    midir::Module module = midir::BuildMidIR(program);
+    midir::OptimizeMidProgram(module);
+
+    bool sawLoadInLoopBody = false;
+    bool sawLoadInPreheader = false;
+    for (const auto& inst : module.functions.front().blocks[0].instructions) {
+      if (inst.kind == midir::InstKind::Load) sawLoadInPreheader = true;
+    }
+    for (const auto& inst : module.functions.front().blocks[2].instructions) {
+      if (inst.kind == midir::InstKind::Load) sawLoadInLoopBody = true;
+    }
+    assert(sawLoadInPreheader);
+    assert(!sawLoadInLoopBody);
+  }
+
+  {
+    IRProgram program = buildLoopNeedPreheaderProgram();
+    midir::Module module = midir::BuildMidIR(program);
+    midir::OptimizeMidProgram(module);
+
+    bool sawPreheader = false;
+    for (const auto& block : module.functions.front().blocks) {
+      if (block.name.find("header_preheader") != std::string::npos) {
+        sawPreheader = true;
+        break;
+      }
+    }
+    assert(sawPreheader);
+  }
+
+  {
+    IRProgram program = buildLCSSAProgram();
+    midir::Module module = midir::BuildMidIR(program);
+    midir::OptimizeMidProgram(module);
+
+    const auto& fn = module.functions.front();
+    int exitBlockIndex = -1;
+    for (size_t i = 0; i < fn.blocks.size(); ++i) {
+      if (fn.blocks[i].name == "exit") {
+        exitBlockIndex = static_cast<int>(i);
+        break;
+      }
+    }
+    assert(exitBlockIndex >= 0);
+
+    bool sawExitPhi = false;
+    for (const auto& inst : fn.blocks[exitBlockIndex].instructions) {
+      if (inst.kind == midir::InstKind::Phi) {
+        sawExitPhi = true;
+        break;
+      }
+    }
+    assert(sawExitPhi);
   }
 
   std::cout << "midir tests passed\n";

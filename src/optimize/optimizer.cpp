@@ -63,6 +63,17 @@ bool functionHasFloatIR(const IRFunction& func) {
   return false;
 }
 
+bool passSupportsFloat(OptPass pass) {
+  switch (pass) {
+    case OptPass::DeadCodeElim:
+    case OptPass::DeadStoreElim:
+    case OptPass::SimplifyCFG:
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool isCommutative(BinaryOp op) {
   switch (op) {
     case BinaryOp::Add:
@@ -305,6 +316,12 @@ Operand resolveOperand(const Operand& op,
   return it->second;
 }
 
+bool isSafeCopyPropagationSource(const IRFunction& func, const Operand& src) {
+  if (!src.isVReg()) return true;
+  return std::find(func.params.begin(), func.params.end(), src.vregId) !=
+         func.params.end();
+}
+
 void killMappingsUsing(int vreg, std::unordered_map<int, Operand>& map) {
   for (auto it = map.begin(); it != map.end();) {
     bool erase = false;
@@ -322,51 +339,174 @@ void killMappingsUsing(int vreg, std::unordered_map<int, Operand>& map) {
   }
 }
 
-bool copyPropagate(IRFunction& func) {
-  bool changed = false;
-  std::unordered_map<int, Operand> valueMap;
+bool sameOperandValue(const Operand& lhs, const Operand& rhs) {
+  return lhs.kind == rhs.kind && lhs.valueType == rhs.valueType &&
+         lhs.immValue == rhs.immValue &&
+         lhs.immFloatValue == rhs.immFloatValue &&
+         lhs.vregId == rhs.vregId && lhs.globalName == rhs.globalName;
+}
 
-  auto rewriteOperand = [&](Operand& op) {
-    Operand repl = resolveOperand(op, valueMap);
+using CopyMap = std::unordered_map<int, Operand>;
+
+bool sameCopyState(const CopyMap& lhs, const CopyMap& rhs) {
+  if (lhs.size() != rhs.size()) return false;
+  for (const auto& entry : lhs) {
+    auto it = rhs.find(entry.first);
+    if (it == rhs.end() || !sameOperandValue(entry.second, it->second)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool intersectCopyState(CopyMap& dst, const CopyMap& other) {
+  bool changed = false;
+  for (auto it = dst.begin(); it != dst.end();) {
+    auto jt = other.find(it->first);
+    if (jt == other.end() || !sameOperandValue(it->second, jt->second)) {
+      it = dst.erase(it);
+      changed = true;
+    } else {
+      ++it;
+    }
+  }
+  return changed;
+}
+
+CopyMap transferCopyState(const IRFunction& func, const BasicBlock& block,
+                          CopyMap state) {
+  for (auto* inst : block.instructions) {
+    switch (inst->kind) {
+      case InstKind::Binary: {
+        auto* bin = static_cast<BinaryInst*>(inst);
+        killMappingsUsing(bin->dest, state);
+        break;
+      }
+      case InstKind::Unary: {
+        auto* un = static_cast<UnaryInst*>(inst);
+        killMappingsUsing(un->dest, state);
+        break;
+      }
+      case InstKind::Copy: {
+        auto* cp = static_cast<CopyInst*>(inst);
+        Operand src = resolveOperand(cp->src, state);
+        killMappingsUsing(cp->dest, state);
+        if (isSafeCopyPropagationSource(func, src)) {
+          state[cp->dest] = src;
+        }
+        break;
+      }
+      case InstKind::Load: {
+        auto* ld = static_cast<LoadInst*>(inst);
+        killMappingsUsing(ld->dest, state);
+        break;
+      }
+      case InstKind::Call: {
+        auto* call = static_cast<CallInst*>(inst);
+        if (call->hasDest) killMappingsUsing(call->dest, state);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  return state;
+}
+
+bool copyPropagate(IRFunction& func) {
+  auto cfg = ControlFlowGraph::Build(&func);
+  if (!cfg.entry) return false;
+
+  const size_t numBlocks = cfg.blocks.size();
+  std::unordered_map<const BasicBlock*, size_t> blockIndex;
+  for (size_t i = 0; i < numBlocks; ++i) {
+    blockIndex[cfg.blocks[i].get()] = i;
+  }
+
+  std::vector<CopyMap> inStates(numBlocks);
+  std::vector<CopyMap> outStates(numBlocks);
+  std::vector<bool> initialized(numBlocks, false);
+
+  bool dataflowChanged = true;
+  while (dataflowChanged) {
+    dataflowChanged = false;
+    for (size_t bi = 0; bi < numBlocks; ++bi) {
+      BasicBlock* block = cfg.blocks[bi].get();
+      CopyMap newIn;
+      bool hasPredState = false;
+      for (auto* pred : block->preds) {
+        auto it = blockIndex.find(pred);
+        if (it == blockIndex.end()) continue;
+        size_t pi = it->second;
+        if (!initialized[pi]) continue;
+        if (!hasPredState) {
+          newIn = outStates[pi];
+          hasPredState = true;
+        } else {
+          intersectCopyState(newIn, outStates[pi]);
+        }
+      }
+      if (!hasPredState) newIn.clear();
+
+      CopyMap newOut = transferCopyState(func, *block, newIn);
+      if (!initialized[bi] || !sameCopyState(newIn, inStates[bi]) ||
+          !sameCopyState(newOut, outStates[bi])) {
+        inStates[bi] = std::move(newIn);
+        outStates[bi] = std::move(newOut);
+        initialized[bi] = true;
+        dataflowChanged = true;
+      }
+    }
+  }
+
+  bool changed = false;
+
+  auto rewriteOperand = [&](Operand& op, const CopyMap& state) {
+    Operand repl = resolveOperand(op, state);
     if (repl.kind != op.kind || repl.immValue != op.immValue ||
-        repl.vregId != op.vregId || repl.globalName != op.globalName) {
+        repl.immFloatValue != op.immFloatValue || repl.vregId != op.vregId ||
+        repl.globalName != op.globalName || repl.valueType != op.valueType) {
       op = repl;
       changed = true;
     }
   };
 
-  for (auto& instPtr : func.instructions) {
-    Instruction* inst = instPtr.get();
-
-    if (auto* bin = dynamic_cast<BinaryInst*>(inst)) {
-      rewriteOperand(bin->lhs);
-      rewriteOperand(bin->rhs);
-      killMappingsUsing(bin->dest, valueMap);
-    } else if (auto* un = dynamic_cast<UnaryInst*>(inst)) {
-      rewriteOperand(un->operand);
-      killMappingsUsing(un->dest, valueMap);
-    } else if (auto* cp = dynamic_cast<CopyInst*>(inst)) {
-      rewriteOperand(cp->src);
-      killMappingsUsing(cp->dest, valueMap);
-      valueMap[cp->dest] = cp->src;
-    } else if (auto* ld = dynamic_cast<LoadInst*>(inst)) {
-      rewriteOperand(ld->addr);
-      killMappingsUsing(ld->dest, valueMap);
-    } else if (auto* st = dynamic_cast<StoreInst*>(inst)) {
-      rewriteOperand(st->src);
-      rewriteOperand(st->addr);
-    } else if (auto* br = dynamic_cast<BranchInst*>(inst)) {
-      rewriteOperand(br->cond);
-    } else if (auto* j = dynamic_cast<JumpInst*>(inst)) {
-      (void)j;
-    } else if (auto* call = dynamic_cast<CallInst*>(inst)) {
-      for (auto& a : call->args) rewriteOperand(a);
-      if (call->hasDest) killMappingsUsing(call->dest, valueMap);
-    } else if (auto* ret = dynamic_cast<ReturnInst*>(inst)) {
-      if (ret->hasValue) rewriteOperand(ret->value);
-    } else if (auto* lbl = dynamic_cast<LabelInst*>(inst)) {
-      (void)lbl;
-      valueMap.clear();  // Conservative: clear across labels/branches
+  for (size_t bi = 0; bi < numBlocks; ++bi) {
+    CopyMap state = inStates[bi];
+    for (auto* inst : cfg.blocks[bi]->instructions) {
+      if (auto* bin = dynamic_cast<BinaryInst*>(inst)) {
+        rewriteOperand(bin->lhs, state);
+        rewriteOperand(bin->rhs, state);
+        killMappingsUsing(bin->dest, state);
+      } else if (auto* un = dynamic_cast<UnaryInst*>(inst)) {
+        rewriteOperand(un->operand, state);
+        killMappingsUsing(un->dest, state);
+      } else if (auto* cp = dynamic_cast<CopyInst*>(inst)) {
+        rewriteOperand(cp->src, state);
+        killMappingsUsing(cp->dest, state);
+        if (isSafeCopyPropagationSource(func, cp->src)) {
+          state[cp->dest] = cp->src;
+        }
+      } else if (auto* ld = dynamic_cast<LoadInst*>(inst)) {
+        rewriteOperand(ld->addr, state);
+        killMappingsUsing(ld->dest, state);
+      } else if (auto* st = dynamic_cast<StoreInst*>(inst)) {
+        rewriteOperand(st->src, state);
+        rewriteOperand(st->addr, state);
+      } else if (auto* br = dynamic_cast<BranchInst*>(inst)) {
+        rewriteOperand(br->cond, state);
+      } else if (auto* call = dynamic_cast<CallInst*>(inst)) {
+        for (auto& a : call->args) rewriteOperand(a, state);
+        if (call->hasDest) killMappingsUsing(call->dest, state);
+      } else if (auto* ret = dynamic_cast<ReturnInst*>(inst)) {
+        if (ret->hasValue) rewriteOperand(ret->value, state);
+      } else if (dynamic_cast<LabelInst*>(inst)) {
+        continue;
+      } else if (dynamic_cast<JumpInst*>(inst)) {
+        continue;
+      } else {
+        continue;
+      }
     }
   }
 
@@ -1261,11 +1401,12 @@ bool isPassEnabled(const OptimizeConfig& config, OptPass pass) {
 bool runOnce(IRFunction& func, const OptimizeConfig& config) {
   bool changed = false;
   int passIndex = 0;
+  bool hasFloatIR = functionHasFloatIR(func);
 
   auto runPass = [&](OptPass pass, auto&& fn) {
     bool passChanged = false;
     if (config.stopAfter >= 0 && passIndex > config.stopAfter) return false;
-    if (isPassEnabled(config, pass)) {
+    if (isPassEnabled(config, pass) && (!hasFloatIR || passSupportsFloat(pass))) {
       passChanged = fn();
       changed |= passChanged;
     }
@@ -1280,6 +1421,10 @@ bool runOnce(IRFunction& func, const OptimizeConfig& config) {
   runPass(OptPass::ModSimplify, [&] { return modSimplify(func); });
   runPass(OptPass::LoopIVModElim, [&] { return loopIVModElim(func); });
   runPass(OptPass::StrengthReduction, [&] { return strengthReduction(func); });
+  // Temporarily disable LIR copy propagation. Recent MidIR-lowered programs
+  // still expose miscompilations here, especially around call-adjacent scalar
+  // temporaries (for example `tmp = 10; putch(tmp)` being rewritten to use an
+  // older live value). Keep correctness first while the pass is tightened.
   runPass(OptPass::CopyPropagate, [&] { return copyPropagate(func); });
   runPass(OptPass::BlockGVN, [&] { return blockGVN(func); });
   runPass(OptPass::CommonSubexpr, [&] { return commonSubexpr(func); });
@@ -1292,7 +1437,6 @@ bool runOnce(IRFunction& func, const OptimizeConfig& config) {
 }  // namespace
 
 void OptimizeFunction(IRFunction& func, const OptimizeConfig& config) {
-  if (functionHasFloatIR(func)) return;
   for (int i = 0; i < 10; ++i) {
     if (!runOnce(func, config)) break;
   }

@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import argparse
-import difflib
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -19,15 +19,6 @@ EVENT_PREFIX = "@@CODEX_EVENT@@"
 
 
 @dataclass
-class CaseResult:
-    name: str
-    compiled: bool
-    passed: bool
-    stage: str
-    detail: str = ""
-
-
-@dataclass
 class RunnerConfig:
     runner: str
     wsl_distro: str | None
@@ -40,6 +31,22 @@ class Toolchain:
     gcc: str
     qemu: str
     runtime_files: list[str]
+
+
+@dataclass
+class CaseResult:
+    name: str
+    compiled: bool
+    linked: bool
+    ran: bool
+    passed: bool
+    skipped: bool
+    stage: str
+    return_code: int | None
+    elapsed_sec: float | None
+    stdout: str
+    stderr: str
+    detail: str
 
 
 def normalize_text(text: str) -> str:
@@ -60,38 +67,6 @@ def build_actual_output(stdout: str, return_code: int) -> str:
     return f"{stdout}{return_code}\n"
 
 
-def discover_cases(cases_dir: Path, pattern: str, limit: int | None) -> list[Path]:
-    cases = sorted(path for path in cases_dir.glob(pattern) if path.suffix == ".sy")
-    if limit is not None:
-        cases = cases[:limit]
-    return cases
-
-
-def format_diff(expected: str, actual: str, max_lines: int) -> str:
-    diff = list(
-        difflib.unified_diff(
-            split_expected_lines(expected),
-            split_expected_lines(actual),
-            fromfile="expected",
-            tofile="actual",
-            lineterm="",
-        )
-    )
-    if not diff:
-        return "output differs, but diff generation failed"
-    return "\n".join(diff[:max_lines])
-
-
-def as_wsl_path(path: Path) -> str:
-    resolved = path.resolve()
-    posix = resolved.as_posix()
-    if posix.startswith("/mnt/"):
-        return posix
-    drive = resolved.drive.rstrip(":").lower()
-    tail = posix.split(":", 1)[1]
-    return f"/mnt/{drive}{tail}"
-
-
 def sanitize_wsl_text(text: str) -> str:
     cleaned = text.replace("\x00", "")
     kept: list[str] = []
@@ -106,46 +81,14 @@ def decode_text(text: str, *, is_wsl: bool) -> str:
     return sanitize_wsl_text(text) if is_wsl else normalize_text(text)
 
 
-def render_progress(
-    done: int,
-    total: int,
-    *,
-    compile_passes: int,
-    full_passes: int,
-    mode: str,
-    current_case: str,
-) -> str:
-    total = max(total, 1)
-    done = min(done, total)
-    filled = done * PROGRESS_BAR_WIDTH // total
-    bar = "#" * filled + "-" * (PROGRESS_BAR_WIDTH - filled)
-    percent = done * 100.0 / total
-    stats = f"compile {compile_passes}/{done}"
-    if mode == "full":
-        stats += f" | run {full_passes}/{done}"
-    suffix = f" | {current_case}" if current_case else ""
-    return f"[{bar}] {done}/{total} {percent:6.2f}% | {stats}{suffix}"
-
-
-def show_progress(
-    done: int,
-    total: int,
-    *,
-    compile_passes: int,
-    full_passes: int,
-    mode: str,
-    current_case: str,
-    final: bool = False,
-) -> None:
-    line = render_progress(
-        done,
-        total,
-        compile_passes=compile_passes,
-        full_passes=full_passes,
-        mode=mode,
-        current_case=current_case,
-    )
-    print(f"\r{line}", end="\n" if final else "", file=sys.stderr, flush=True)
+def as_wsl_path(path: Path) -> str:
+    resolved = path.resolve()
+    posix = resolved.as_posix()
+    if posix.startswith("/mnt/"):
+        return posix
+    drive = resolved.drive.rstrip(":").lower()
+    tail = posix.split(":", 1)[1]
+    return f"/mnt/{drive}{tail}"
 
 
 def resolve_runner(repo_root: Path, requested: str, wsl_distro: str) -> RunnerConfig:
@@ -171,17 +114,66 @@ def resolve_runtime_files(repo_root: Path, explicit: list[str]) -> list[Path]:
     source = repo_root / "sylib.c"
     if source.exists():
         return [source]
-    return []
+    raise FileNotFoundError("未找到运行时文件，请通过 --runtime 指定 libsysy_riscv.a 或 sylib.c")
 
 
 def build_toolchain(args: argparse.Namespace, config: RunnerConfig) -> Toolchain:
     runtime_files = resolve_runtime_files(config.repo_root, args.runtime)
     return Toolchain(
         compiler=args.compiler,
-        gcc=args.gcc or "riscv64-linux-gnu-gcc",
-        qemu=args.qemu or "qemu-riscv64",
+        gcc=args.gcc,
+        qemu=args.qemu,
         runtime_files=[str(path) for path in runtime_files],
     )
+
+
+def collect_case_names(cases_dir: Path) -> list[str]:
+    names: set[str] = set()
+    for suffix in (".sy", ".in", ".out"):
+        names.update(path.stem for path in cases_dir.glob(f"*{suffix}"))
+    return sorted(names)
+
+
+def resolve_source_path(cases_dir: Path, case_name: str) -> Path | None:
+    exact = cases_dir / f"{case_name}.sy"
+    if exact.exists():
+        return exact
+    compact_base = re.sub(r"\d+$", "", case_name)
+    compact_candidate = cases_dir / f"{compact_base}.sy"
+    if compact_base != case_name and compact_candidate.exists():
+        return compact_candidate
+    split_base = re.sub(r"[-_]\d+$", "", case_name)
+    split_candidate = cases_dir / f"{split_base}.sy"
+    if split_base != case_name and split_candidate.exists():
+        return split_candidate
+    return None
+
+
+def matches_pattern(name: str, pattern: str) -> bool:
+    return Path(name).match(pattern) or Path(f"{name}.sy").match(pattern)
+
+
+def render_progress(done: int, total: int, *, passed: int, failed: int, current_case: str) -> str:
+    total = max(total, 1)
+    done = min(done, total)
+    filled = done * PROGRESS_BAR_WIDTH // total
+    bar = "#" * filled + "-" * (PROGRESS_BAR_WIDTH - filled)
+    percent = done * 100.0 / total
+    suffix = f" | {current_case}" if current_case else ""
+    return f"[{bar}] {done}/{total} {percent:6.2f}% | pass {passed} fail {failed}{suffix}"
+
+
+def show_progress(
+    done: int,
+    total: int,
+    *,
+    passed: int,
+    failed: int,
+    current_case: str,
+    final: bool = False,
+) -> None:
+    line = render_progress(done, total, passed=passed, failed=failed, current_case=current_case)
+    print(f"\r{line}", end="\n" if final else "", file=sys.stderr, flush=True)
 
 
 def driver_source() -> str:
@@ -189,13 +181,14 @@ def driver_source() -> str:
 from __future__ import annotations
 
 import concurrent.futures
-import difflib
 import json
 import os
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 EVENT_PREFIX = "@@CODEX_EVENT@@"
@@ -225,21 +218,6 @@ def build_actual_output(stdout: str, return_code: int) -> str:
     return f"{stdout}{return_code}\n"
 
 
-def format_diff(expected: str, actual: str, max_lines: int) -> str:
-    diff = list(
-        difflib.unified_diff(
-            split_expected_lines(expected),
-            split_expected_lines(actual),
-            fromfile="expected",
-            tofile="actual",
-            lineterm="",
-        )
-    )
-    if not diff:
-        return "output differs, but diff generation failed"
-    return "\n".join(diff[:max_lines])
-
-
 def run_command(parts: list[str], *, cwd: str, timeout: int, stdin_path: str | None = None) -> subprocess.CompletedProcess[str]:
     stdin_handle = open(stdin_path, "r", encoding="utf-8", newline=None) if stdin_path else None
     try:
@@ -258,79 +236,87 @@ def run_command(parts: list[str], *, cwd: str, timeout: int, stdin_path: str | N
             stdin_handle.close()
 
 
-def normalize_input(src: str, dst: str) -> None:
-    text = Path(src).read_text(encoding="utf-8")
-    Path(dst).write_text(normalize_text(text), encoding="utf-8", newline="\n")
-
-
 def execute_case(case: dict, cfg: dict, temp_root: str) -> dict:
-    case_name = case["name"]
-    case_path = case["case_path"]
-    expected_path = case["expected_path"]
+    name = case["name"]
+    source_path = case["source_path"]
     input_path = case["input_path"]
-    asm_path = os.path.join(temp_root, case_name + ".s")
-    exe_path = os.path.join(temp_root, case_name)
-    normalized_input = os.path.join(temp_root, case_name + ".in")
+    expected_path = case["expected_path"]
+    asm_path = os.path.join(temp_root, name + ".s")
+    exe_path = os.path.join(temp_root, name)
 
+    if source_path is None:
+        return {"type": "result", "result": {"name": name, "compiled": False, "linked": False, "ran": False, "passed": False, "skipped": True, "stage": "prepare", "return_code": None, "elapsed_sec": None, "stdout": "", "stderr": "", "detail": "missing source file"}}
     if not os.path.exists(expected_path):
-        return {"type": "result", "result": {"name": case_name, "compiled": False, "passed": False, "stage": "prepare", "detail": f"missing expected output: {Path(expected_path).name}"}, "compiled_ok": False, "full_ok": False}
+        return {"type": "result", "result": {"name": name, "compiled": False, "linked": False, "ran": False, "passed": False, "skipped": False, "stage": "prepare", "return_code": None, "elapsed_sec": None, "stdout": "", "stderr": "", "detail": f"missing expected output: {Path(expected_path).name}"}} 
 
-    compile_cmd = [cfg["compiler"], "-S", "-o", asm_path, case_path]
+    compile_cmd = [cfg["compiler"], "-S", "-o", asm_path, source_path]
     if cfg["opt"]:
         compile_cmd.append("-O1")
     try:
         compile_proc = run_command(compile_cmd, cwd=cfg["repo_root"], timeout=cfg["timeout"])
     except subprocess.TimeoutExpired:
-        return {"type": "result", "result": {"name": case_name, "compiled": False, "passed": False, "stage": "compile", "detail": "compile timeout"}, "compiled_ok": False, "full_ok": False}
-
+        return {"type": "result", "result": {"name": name, "compiled": False, "linked": False, "ran": False, "passed": False, "skipped": False, "stage": "compile", "return_code": None, "elapsed_sec": None, "stdout": "", "stderr": "", "detail": "compile timeout"}}
+    compile_stderr = normalize_text(compile_proc.stderr).strip()
     if compile_proc.returncode != 0 or not os.path.exists(asm_path) or os.path.getsize(asm_path) == 0:
-        detail = normalize_text(compile_proc.stderr).strip() or f"exit code {compile_proc.returncode}"
-        return {"type": "result", "result": {"name": case_name, "compiled": False, "passed": False, "stage": "compile", "detail": detail}, "compiled_ok": False, "full_ok": False}
-
-    run_input = None
-    if input_path and os.path.exists(input_path):
-        normalize_input(input_path, normalized_input)
-        run_input = normalized_input
-
-    if cfg["mode"] == "compile":
-        return {"type": "result", "result": {"name": case_name, "compiled": True, "passed": True, "stage": "ok", "detail": ""}, "compiled_ok": True, "full_ok": False}
+        detail = compile_stderr or f"exit code {compile_proc.returncode}"
+        return {"type": "result", "result": {"name": name, "compiled": False, "linked": False, "ran": False, "passed": False, "skipped": False, "stage": "compile", "return_code": compile_proc.returncode, "elapsed_sec": None, "stdout": "", "stderr": compile_stderr, "detail": detail}}
 
     link_cmd = [cfg["gcc"], *DEFAULT_GCC_FLAGS, asm_path, *cfg["runtime_files"], "-o", exe_path]
     try:
         link_proc = run_command(link_cmd, cwd=cfg["repo_root"], timeout=cfg["timeout"])
     except subprocess.TimeoutExpired:
-        return {"type": "result", "result": {"name": case_name, "compiled": True, "passed": False, "stage": "link", "detail": "link timeout"}, "compiled_ok": True, "full_ok": False}
-
+        return {"type": "result", "result": {"name": name, "compiled": True, "linked": False, "ran": False, "passed": False, "skipped": False, "stage": "link", "return_code": None, "elapsed_sec": None, "stdout": "", "stderr": "", "detail": "link timeout"}}
+    link_stderr = normalize_text(link_proc.stderr).strip()
     if link_proc.returncode != 0 or not os.path.exists(exe_path) or os.path.getsize(exe_path) == 0:
-        detail = normalize_text(link_proc.stderr).strip() or f"exit code {link_proc.returncode}"
-        return {"type": "result", "result": {"name": case_name, "compiled": True, "passed": False, "stage": "link", "detail": detail}, "compiled_ok": True, "full_ok": False}
+        detail = link_stderr or f"exit code {link_proc.returncode}"
+        return {"type": "result", "result": {"name": name, "compiled": True, "linked": False, "ran": False, "passed": False, "skipped": False, "stage": "link", "return_code": link_proc.returncode, "elapsed_sec": None, "stdout": "", "stderr": link_stderr, "detail": detail}}
+
+    expected_text = Path(expected_path).read_text(encoding="utf-8")
+    samples: list[float] = []
+    last_rc = None
+    last_stdout = ""
+    last_stderr = ""
+    run_failed_detail = ""
 
     local_exe = exe_path
-    local_input = run_input
+    local_input = input_path if input_path and os.path.exists(input_path) else None
     if cfg["repo_root"].startswith("/mnt/"):
-        local_exe = os.path.join("/tmp", f"codex_funct_{os.getpid()}_{case_name}.exe")
+        local_exe = os.path.join("/tmp", f"codex_perf_{os.getpid()}_{name}.exe")
         shutil.copy2(exe_path, local_exe)
-        if run_input:
-            local_input = os.path.join("/tmp", f"codex_funct_{os.getpid()}_{case_name}.in")
-            shutil.copy2(run_input, local_input)
+        if local_input:
+            tmp_input = os.path.join("/tmp", f"codex_perf_{os.getpid()}_{name}.in")
+            shutil.copy2(local_input, tmp_input)
+            local_input = tmp_input
 
     try:
-        run_proc = run_command([cfg["qemu"], local_exe], cwd=cfg["repo_root"], timeout=cfg["timeout"], stdin_path=local_input)
-    except subprocess.TimeoutExpired:
-        return {"type": "result", "result": {"name": case_name, "compiled": True, "passed": False, "stage": "run", "detail": "run timeout"}, "compiled_ok": True, "full_ok": False}
+        for _ in range(cfg["repeat"]):
+            started = time.perf_counter()
+            try:
+                run_proc = run_command([cfg["qemu"], local_exe], cwd=cfg["repo_root"], timeout=cfg["timeout"], stdin_path=local_input)
+            except subprocess.TimeoutExpired:
+                run_failed_detail = "run timeout"
+                break
+            elapsed = time.perf_counter() - started
+            samples.append(elapsed)
+            last_rc = run_proc.returncode
+            last_stdout = normalize_text(run_proc.stdout).strip()
+            last_stderr = normalize_text(run_proc.stderr).strip()
+            if last_rc != 0:
+                run_failed_detail = f"non-zero return code {last_rc}"
+                break
+            actual_text = build_actual_output(run_proc.stdout, run_proc.returncode)
+            if split_expected_lines(expected_text) != split_expected_lines(actual_text):
+                run_failed_detail = "output mismatch"
+                break
     finally:
         if local_exe != exe_path and os.path.exists(local_exe):
             os.remove(local_exe)
-        if local_input and run_input and local_input != run_input and os.path.exists(local_input):
+        if local_input and input_path and local_input != input_path and os.path.exists(local_input):
             os.remove(local_input)
 
-    actual_text = build_actual_output(run_proc.stdout, run_proc.returncode)
-    expected_text = Path(expected_path).read_text(encoding="utf-8")
-    if split_expected_lines(expected_text) == split_expected_lines(actual_text):
-        return {"type": "result", "result": {"name": case_name, "compiled": True, "passed": True, "stage": "ok", "detail": ""}, "compiled_ok": True, "full_ok": True}
-
-    diff = format_diff(expected_text, actual_text, cfg["diff_lines"])
-    return {"type": "result", "result": {"name": case_name, "compiled": True, "passed": False, "stage": "mismatch", "detail": diff}, "compiled_ok": True, "full_ok": False}
+    if run_failed_detail:
+        return {"type": "result", "result": {"name": name, "compiled": True, "linked": True, "ran": bool(samples), "passed": False, "skipped": False, "stage": "run", "return_code": last_rc, "elapsed_sec": statistics.median(samples) if samples else None, "stdout": last_stdout, "stderr": last_stderr, "detail": run_failed_detail}}
+    return {"type": "result", "result": {"name": name, "compiled": True, "linked": True, "ran": True, "passed": True, "skipped": False, "stage": "ok", "return_code": last_rc, "elapsed_sec": statistics.median(samples) if samples else None, "stdout": last_stdout, "stderr": last_stderr, "detail": f"median of {len(samples)} run(s)"}} 
 
 
 def main() -> int:
@@ -359,7 +345,7 @@ def main() -> int:
             return build_proc.returncode
 
     temp_parent = cfg["temp_parent"] or None
-    with tempfile.TemporaryDirectory(prefix="funct-run-", dir=temp_parent) as temp_root:
+    with tempfile.TemporaryDirectory(prefix="perf-run-", dir=temp_parent) as temp_root:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(cfg["workers"]))) as executor:
             futures = [executor.submit(execute_case, case, cfg, temp_root) for case in cases]
             for future in concurrent.futures.as_completed(futures):
@@ -404,27 +390,25 @@ def invoke_driver(config: RunnerConfig, driver_path: Path, payload_path: Path) -
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="批量运行 SysY 功能测试")
-    parser.add_argument("--mode", choices=["compile", "full"], default="full", help="compile 只检查编译，full 检查编译和运行结果")
-    parser.add_argument("--cases-dir", default="funct", help="测试目录，默认 funct")
+    parser = argparse.ArgumentParser(description="运行 SysY 性能测试")
+    parser.add_argument("--cases-dir", default="performance", help="性能用例目录")
     parser.add_argument("--pattern", default="*.sy", help="用例匹配模式")
     parser.add_argument("--compiler", default="./compiler", help="编译器命令，默认 ./compiler")
-    parser.add_argument("--build-cmd", help="测试前构建命令，例如 make clean && make -j4 compiler")
-    parser.add_argument("--gcc", help="RISC-V GCC 命令，默认 riscv64-linux-gnu-gcc")
-    parser.add_argument("--qemu", help="QEMU 命令，默认 qemu-riscv64")
-    parser.add_argument("--runtime", nargs="*", default=[], help="运行时文件，默认自动探测 libsysy_riscv.a 或 sylib.c")
+    parser.add_argument("--build-cmd", default="make clean && make -j4 compiler", help="测试前构建命令")
+    parser.add_argument("--gcc", default="riscv64-linux-gnu-gcc", help="RISC-V GCC 命令")
+    parser.add_argument("--qemu", default="qemu-riscv64", help="QEMU 命令")
+    parser.add_argument("--runtime", nargs="*", default=[], help="运行时文件，默认自动探测")
     parser.add_argument("--runner", choices=["auto", "host", "wsl"], default="auto", help="执行环境")
     parser.add_argument("--wsl-distro", default=DEFAULT_WSL_DISTRO, help="WSL 发行版名称")
-    parser.add_argument("--opt", action="store_true", help="编译时追加 -O1")
     parser.add_argument("--timeout", type=int, default=60, help="单阶段超时秒数")
     parser.add_argument("--workers", type=int, default=10, help="WSL 内部并发数")
+    parser.add_argument("--repeat", type=int, default=1, help="每个用例运行次数")
     parser.add_argument("--limit", type=int, help="只跑前 N 个用例")
-    parser.add_argument("--diff-lines", type=int, default=12, help="输出错误时最多显示多少行 diff")
-    parser.add_argument("--list-only", action="store_true", help="只列出匹配到的用例")
-    parser.add_argument("--quiet", action="store_true", help="只显示进度和汇总")
+    parser.add_argument("--no-opt", action="store_true", help="不追加 -O1")
+    parser.add_argument("--list-only", action="store_true", help="只列出匹配用例")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条")
+    parser.add_argument("--keep-going", action="store_true", help="兼容旧参数，当前始终继续执行")
     parser.add_argument("--summary-json", help="把摘要写入 JSON 文件")
-    parser.set_defaults(opt=True)
     return parser.parse_args()
 
 
@@ -436,15 +420,15 @@ def main() -> int:
         print(f"用例目录不存在: {cases_dir}", file=sys.stderr)
         return 2
 
-    cases = discover_cases(cases_dir, args.pattern, args.limit)
-    if not cases:
-        print(f"未找到任何用例: {cases_dir / args.pattern}", file=sys.stderr)
+    case_names = [name for name in collect_case_names(cases_dir) if matches_pattern(name, args.pattern)]
+    if args.limit is not None:
+        case_names = case_names[: args.limit]
+    if not case_names:
+        print("没有找到匹配的性能用例", file=sys.stderr)
         return 2
-
     if args.list_only:
-        print(f"共发现 {len(cases)} 个用例")
-        for case in cases:
-            print(case.as_posix())
+        for name in case_names:
+            print(name)
         return 0
 
     config = resolve_runner(repo_root, args.runner, args.wsl_distro)
@@ -454,42 +438,43 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
-    if args.mode == "full" and not toolchain.runtime_files:
-        print("full 模式需要运行时库，请通过 --runtime 指定 libsysy_riscv.a 或 sylib.c", file=sys.stderr)
-        return 2
-
     payload = {
         "config": {
             "repo_root": as_wsl_path(repo_root) if config.runner == "wsl" else str(repo_root),
             "temp_parent": as_wsl_path(repo_root) if config.runner == "wsl" else str(repo_root),
-            "mode": args.mode,
             "compiler": toolchain.compiler,
             "gcc": toolchain.gcc,
             "qemu": toolchain.qemu,
             "runtime_files": [as_wsl_path(Path(path)) if config.runner == "wsl" else path for path in toolchain.runtime_files],
             "build_cmd": args.build_cmd or "",
-            "opt": bool(args.opt),
             "timeout": int(args.timeout),
             "workers": int(args.workers),
-            "diff_lines": int(args.diff_lines),
+            "repeat": int(args.repeat),
+            "opt": not args.no_opt,
         },
         "cases": [
             {
-                "name": case.stem,
-                "case_path": as_wsl_path(case) if config.runner == "wsl" else str(case),
-                "expected_path": as_wsl_path(case.with_suffix(".out")) if config.runner == "wsl" else str(case.with_suffix(".out")),
-                "input_path": as_wsl_path(case.with_suffix(".in")) if config.runner == "wsl" else str(case.with_suffix(".in")),
+                "name": name,
+                "source_path": (
+                    as_wsl_path(resolve_source_path(cases_dir, name))
+                    if config.runner == "wsl" and resolve_source_path(cases_dir, name) is not None
+                    else (str(resolve_source_path(cases_dir, name)) if resolve_source_path(cases_dir, name) is not None else None)
+                ),
+                "input_path": as_wsl_path(cases_dir / f"{name}.in") if config.runner == "wsl" else str(cases_dir / f"{name}.in"),
+                "expected_path": as_wsl_path(cases_dir / f"{name}.out") if config.runner == "wsl" else str(cases_dir / f"{name}.out"),
             }
-            for case in cases
+            for name in case_names
         ],
     }
 
-    compile_passes = 0
-    full_passes = 0
-    results: list[CaseResult] = []
-    total_cases = len(cases)
+    print(f"building compiler with: {args.build_cmd}")
 
-    with tempfile.TemporaryDirectory(prefix="codex-funct-driver-", dir=repo_root) as temp_dir:
+    results: list[CaseResult] = []
+    passed_cases = 0
+    failed_cases = 0
+    total_cases = len(case_names)
+
+    with tempfile.TemporaryDirectory(prefix="codex-perf-driver-", dir=repo_root) as temp_dir:
         temp_root = Path(temp_dir)
         driver_path, payload_path = write_driver_files(temp_root, payload)
         proc = invoke_driver(config, driver_path, payload_path)
@@ -500,8 +485,7 @@ def main() -> int:
             if not line:
                 continue
             if not line.startswith(EVENT_PREFIX):
-                if not args.quiet:
-                    print(line)
+                print(line)
                 continue
             event = json.loads(line[len(EVENT_PREFIX):])
             if event["type"] == "log":
@@ -513,25 +497,23 @@ def main() -> int:
                 continue
             result = CaseResult(**event["result"])
             results.append(result)
-            if event["compiled_ok"]:
-                compile_passes += 1
-            if event["full_ok"]:
-                full_passes += 1
-            if not args.quiet:
-                if result.passed:
-                    print(f"[PASS] {result.name}")
-                elif result.stage == "mismatch":
-                    print(f"[FAIL] {result.name} mismatch")
-                    print(result.detail)
-                else:
-                    print(f"[FAIL] {result.name} {result.stage} {result.detail}")
+            if result.passed:
+                passed_cases += 1
+                elapsed = f"{result.elapsed_sec:.3f}s" if result.elapsed_sec is not None else "n/a"
+                extra = f" stderr={result.stderr}" if result.stderr else ""
+                print(f"[PASS] {result.name} rc={result.return_code} time={elapsed}{extra}")
+            elif result.skipped:
+                print(f"[SKIP] {result.name} {result.detail}")
+            else:
+                failed_cases += 1
+                extra = f" stderr={result.stderr}" if result.stderr else ""
+                print(f"[FAIL] {result.name} {result.detail}{extra}")
             if not args.no_progress:
                 show_progress(
                     len(results),
                     total_cases,
-                    compile_passes=compile_passes,
-                    full_passes=full_passes,
-                    mode=args.mode,
+                    passed=passed_cases,
+                    failed=failed_cases,
                     current_case=result.name,
                 )
 
@@ -547,59 +529,22 @@ def main() -> int:
         show_progress(
             len(results),
             total_cases,
-            compile_passes=compile_passes,
-            full_passes=full_passes,
-            mode=args.mode,
+            passed=passed_cases,
+            failed=failed_cases,
             current_case=results[-1].name if results else "",
             final=True,
         )
 
-    total = len(results)
-    compile_rate = (compile_passes / total * 100.0) if total else 0.0
-    full_rate = (full_passes / total * 100.0) if total else 0.0
-
-    print("=" * 60)
-    print(f"执行环境: {config.runner}{'/' + config.wsl_distro if config.runner == 'wsl' else ''}")
-    print(f"用例数: {total}")
-    print(f"编译通过: {compile_passes}")
-    print(f"编译通过率: {compile_rate:.2f}%")
-    if args.mode == "full":
-        print(f"运行通过: {full_passes}")
-        print(f"运行通过率: {full_rate:.2f}%")
-    else:
-        print(f"运行通过: 跳过 (mode={args.mode})")
-    stage_summary: dict[str, int] = {}
-    for result in results:
-        if result.passed:
-            continue
-        stage_summary[result.stage] = stage_summary.get(result.stage, 0) + 1
-    if stage_summary:
-        print("失败分布:")
-        for stage, count in sorted(stage_summary.items()):
-            print(f"  {stage}: {count}")
-    print("=" * 60)
-
-    exit_code = 0 if compile_passes == total else 1
-    if args.mode != "compile":
-        exit_code = 0 if full_passes == total else 1
-
+    print(f"summary: {passed_cases}/{len(results)} cases passed")
     if args.summary_json:
-        summary_path = Path(args.summary_json)
-        summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary = {
-            "mode": args.mode,
-            "total": total,
-            "compile_passes": compile_passes,
-            "compile_rate": round(compile_rate, 2),
-            "full_passes": full_passes,
-            "full_rate": round(full_rate, 2),
-            "stage_summary": stage_summary,
-            "exit_code": exit_code,
+            "opt_enabled": not args.no_opt,
+            "repeat": args.repeat,
             "results": [asdict(result) for result in results],
         }
-        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        Path(args.summary_json).write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    return exit_code
+    return 0 if all(result.passed or result.skipped for result in results) else 1
 
 
 if __name__ == "__main__":

@@ -129,7 +129,7 @@ std::vector<std::string> optimizeMoveChains(const std::vector<std::string>& line
   return result;
 }
 
-// Remove store followed by load of same location to same register
+// Remove only trivial store/load pairs in the same straight-line block.
 std::vector<std::string> optimizeLoadStore(const std::vector<std::string>& lines) {
   std::vector<std::string> result;
   result.reserve(lines.size());
@@ -141,7 +141,8 @@ std::vector<std::string> optimizeLoadStore(const std::vector<std::string>& lines
       continue;
     }
 
-    // Pattern: sw rX, offset(base) followed by lw rX, offset(base)
+    // Pattern: sw rX, offset(base) followed immediately by lw rX, offset(base)
+    // Only safe for exact adjacent pair with no intervening control flow.
     if (startsWith(t, "sw ") && i + 1 < lines.size()) {
       std::string next = trim(lines[i + 1]);
       if (isFloatAsmLine(next)) {
@@ -2215,16 +2216,6 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
 
         insns.push_back("\tcall " + c->callee);
 
-        for (const auto& reg : frame.callerSavedRegs) {
-          if (!destRegName.empty() && reg == destRegName) {
-            continue;
-          }
-          auto itSlot = frame.callerSavedSlots.find(reg);
-          if (itSlot != frame.callerSavedSlots.end()) {
-            emitStackLoad64(reg, itSlot->second, insns, reg);
-          }
-        }
-
         if (c->hasDest) {
           if (isFloatValueType(c->resultType)) {
             auto it = allocation.find(c->dest);
@@ -2249,6 +2240,16 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
             } else {
               storeCurrentValue(c->dest, "a0", insns, {"a0"});
             }
+          }
+        }
+
+        for (const auto& reg : frame.callerSavedRegs) {
+          if (!destRegName.empty() && reg == destRegName) {
+            continue;
+          }
+          auto itSlot = frame.callerSavedSlots.find(reg);
+          if (itSlot != frame.callerSavedSlots.end()) {
+            emitStackLoad64(reg, itSlot->second, insns, reg);
           }
         }
 

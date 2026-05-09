@@ -140,6 +140,7 @@ struct Instruction {
   std::string jumpTarget;
   int frameOffset = 0;
   int gepOffset = 0;
+  Operand gepIndex = Operand::Invalid();
   bool hasResult = false;
   bool hasValue = false;
   bool isPureCall = false;
