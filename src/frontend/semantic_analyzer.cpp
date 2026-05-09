@@ -286,7 +286,16 @@ void SemanticAnalyzer::visit(UnaryExpr* node) {
 }
 
 void SemanticAnalyzer::visit(BinaryExpr* node) {
-  node->left->accept(this);
+  std::vector<BinaryExpr*> chain;
+  BinaryExpr* cur = node;
+  while (true) {
+    chain.push_back(cur);
+    auto* leftBin = dynamic_cast<BinaryExpr*>(cur->left.get());
+    if (!leftBin) break;
+    cur = leftBin;
+  }
+
+  cur->left->accept(this);
   Type lhsType = lastExprType;
   bool lhsConst = lastExprIsConst;
   ScalarValue lhsValue = lastExprConstValue;
@@ -294,96 +303,104 @@ void SemanticAnalyzer::visit(BinaryExpr* node) {
     addError("Binary operator requires int or float operands");
   }
 
-  node->right->accept(this);
-  Type rhsType = lastExprType;
-  bool rhsConst = lastExprIsConst;
-  ScalarValue rhsValue = lastExprConstValue;
-  if (!isNumericType(rhsType)) {
-    addError("Binary operator requires int or float operands");
-  }
+  for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+    BinaryExpr* bin = *it;
+    bin->right->accept(this);
+    Type rhsType = lastExprType;
+    bool rhsConst = lastExprIsConst;
+    ScalarValue rhsValue = lastExprConstValue;
+    if (!isNumericType(rhsType)) {
+      addError("Binary operator requires int or float operands");
+    }
 
-  if (node->op == BinaryExpr::B_MOD && (!isIntType(lhsType) || !isIntType(rhsType))) {
-    addError("Modulo operator requires int operands");
-  }
+    if (bin->op == BinaryExpr::B_MOD &&
+        (!isIntType(lhsType) || !isIntType(rhsType))) {
+      addError("Modulo operator requires int operands");
+    }
 
-  Type resultType = Type::Int();
-  switch (node->op) {
-    case BinaryExpr::B_ADD:
-    case BinaryExpr::B_SUB:
-    case BinaryExpr::B_MUL:
-    case BinaryExpr::B_DIV:
-      resultType = commonNumericType(lhsType, rhsType);
-      break;
-    case BinaryExpr::B_MOD:
-      resultType = Type::Int();
-      break;
-    default:
-      resultType = Type::Int();
-      break;
-  }
-
-  bool isConst = lhsConst && rhsConst;
-  ScalarValue constValue = ScalarValue::Int(0);
-  if (isConst) {
-    float lf = lhsValue.isFloat() ? lhsValue.floatValue : static_cast<float>(lhsValue.intValue);
-    float rf = rhsValue.isFloat() ? rhsValue.floatValue : static_cast<float>(rhsValue.intValue);
-    int li = lhsValue.isFloat() ? static_cast<int>(lhsValue.floatValue) : lhsValue.intValue;
-    int ri = rhsValue.isFloat() ? static_cast<int>(rhsValue.floatValue) : rhsValue.intValue;
-
-    switch (node->op) {
+    Type resultType = Type::Int();
+    switch (bin->op) {
       case BinaryExpr::B_ADD:
-        constValue = resultType.isFloatScalar() ? ScalarValue::Float(lf + rf)
-                                                : ScalarValue::Int(li + ri);
-        break;
       case BinaryExpr::B_SUB:
-        constValue = resultType.isFloatScalar() ? ScalarValue::Float(lf - rf)
-                                                : ScalarValue::Int(li - ri);
-        break;
       case BinaryExpr::B_MUL:
-        constValue = resultType.isFloatScalar() ? ScalarValue::Float(lf * rf)
-                                                : ScalarValue::Int(li * ri);
-        break;
       case BinaryExpr::B_DIV:
-        if ((resultType.isFloatScalar() && rf == 0.0f) ||
-            (!resultType.isFloatScalar() && ri == 0)) {
-          isConst = false;
-        } else {
-          constValue = resultType.isFloatScalar() ? ScalarValue::Float(lf / rf)
-                                                  : ScalarValue::Int(li / ri);
-        }
+        resultType = commonNumericType(lhsType, rhsType);
         break;
       case BinaryExpr::B_MOD:
-        if (ri == 0) isConst = false;
-        else constValue = ScalarValue::Int(li % ri);
+        resultType = Type::Int();
         break;
-      case BinaryExpr::B_LT:
-        constValue = ScalarValue::Int((resultType.isFloatScalar() || lhsValue.isFloat() || rhsValue.isFloat()) ? (lf < rf) : (li < ri));
-        break;
-      case BinaryExpr::B_GT:
-        constValue = ScalarValue::Int((resultType.isFloatScalar() || lhsValue.isFloat() || rhsValue.isFloat()) ? (lf > rf) : (li > ri));
-        break;
-      case BinaryExpr::B_LE:
-        constValue = ScalarValue::Int((resultType.isFloatScalar() || lhsValue.isFloat() || rhsValue.isFloat()) ? (lf <= rf) : (li <= ri));
-        break;
-      case BinaryExpr::B_GE:
-        constValue = ScalarValue::Int((resultType.isFloatScalar() || lhsValue.isFloat() || rhsValue.isFloat()) ? (lf >= rf) : (li >= ri));
-        break;
-      case BinaryExpr::B_EQ:
-        constValue = ScalarValue::Int((lhsValue.isFloat() || rhsValue.isFloat()) ? (lf == rf) : (li == ri));
-        break;
-      case BinaryExpr::B_NE:
-        constValue = ScalarValue::Int((lhsValue.isFloat() || rhsValue.isFloat()) ? (lf != rf) : (li != ri));
-        break;
-      case BinaryExpr::B_AND:
-        constValue = ScalarValue::Int(isTruthy(lhsValue) && isTruthy(rhsValue));
-        break;
-      case BinaryExpr::B_OR:
-        constValue = ScalarValue::Int(isTruthy(lhsValue) || isTruthy(rhsValue));
+      default:
+        resultType = Type::Int();
         break;
     }
+
+    bool isConst = lhsConst && rhsConst;
+    ScalarValue constValue = ScalarValue::Int(0);
+    if (isConst) {
+      float lf = lhsValue.isFloat() ? lhsValue.floatValue : static_cast<float>(lhsValue.intValue);
+      float rf = rhsValue.isFloat() ? rhsValue.floatValue : static_cast<float>(rhsValue.intValue);
+      int li = lhsValue.isFloat() ? static_cast<int>(lhsValue.floatValue) : lhsValue.intValue;
+      int ri = rhsValue.isFloat() ? static_cast<int>(rhsValue.floatValue) : rhsValue.intValue;
+
+      switch (bin->op) {
+        case BinaryExpr::B_ADD:
+          constValue = resultType.isFloatScalar() ? ScalarValue::Float(lf + rf)
+                                                  : ScalarValue::Int(li + ri);
+          break;
+        case BinaryExpr::B_SUB:
+          constValue = resultType.isFloatScalar() ? ScalarValue::Float(lf - rf)
+                                                  : ScalarValue::Int(li - ri);
+          break;
+        case BinaryExpr::B_MUL:
+          constValue = resultType.isFloatScalar() ? ScalarValue::Float(lf * rf)
+                                                  : ScalarValue::Int(li * ri);
+          break;
+        case BinaryExpr::B_DIV:
+          if ((resultType.isFloatScalar() && rf == 0.0f) ||
+              (!resultType.isFloatScalar() && ri == 0)) {
+            isConst = false;
+          } else {
+            constValue = resultType.isFloatScalar() ? ScalarValue::Float(lf / rf)
+                                                    : ScalarValue::Int(li / ri);
+          }
+          break;
+        case BinaryExpr::B_MOD:
+          if (ri == 0) isConst = false;
+          else constValue = ScalarValue::Int(li % ri);
+          break;
+        case BinaryExpr::B_LT:
+          constValue = ScalarValue::Int((resultType.isFloatScalar() || lhsValue.isFloat() || rhsValue.isFloat()) ? (lf < rf) : (li < ri));
+          break;
+        case BinaryExpr::B_GT:
+          constValue = ScalarValue::Int((resultType.isFloatScalar() || lhsValue.isFloat() || rhsValue.isFloat()) ? (lf > rf) : (li > ri));
+          break;
+        case BinaryExpr::B_LE:
+          constValue = ScalarValue::Int((resultType.isFloatScalar() || lhsValue.isFloat() || rhsValue.isFloat()) ? (lf <= rf) : (li <= ri));
+          break;
+        case BinaryExpr::B_GE:
+          constValue = ScalarValue::Int((resultType.isFloatScalar() || lhsValue.isFloat() || rhsValue.isFloat()) ? (lf >= rf) : (li >= ri));
+          break;
+        case BinaryExpr::B_EQ:
+          constValue = ScalarValue::Int((lhsValue.isFloat() || rhsValue.isFloat()) ? (lf == rf) : (li == ri));
+          break;
+        case BinaryExpr::B_NE:
+          constValue = ScalarValue::Int((lhsValue.isFloat() || rhsValue.isFloat()) ? (lf != rf) : (li != ri));
+          break;
+        case BinaryExpr::B_AND:
+          constValue = ScalarValue::Int(isTruthy(lhsValue) && isTruthy(rhsValue));
+          break;
+        case BinaryExpr::B_OR:
+          constValue = ScalarValue::Int(isTruthy(lhsValue) || isTruthy(rhsValue));
+          break;
+      }
+    }
+
+    lhsType = resultType;
+    lhsConst = isConst;
+    lhsValue = constValue;
   }
 
-  setExprResult(resultType, isConst, constValue);
+  setExprResult(lhsType, lhsConst, lhsValue);
 }
 
 void SemanticAnalyzer::visit(Block* node) {

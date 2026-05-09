@@ -1,7 +1,7 @@
 # ToyC Compiler Makefile
 
 # Compiler and flags
-CXX = g++
+CXX = C:/mingw64/bin/g++.exe
 CXXFLAGS = -std=c++17 -Wall -g -Iinclude -Isrc/frontend
 LDFLAGS =
 

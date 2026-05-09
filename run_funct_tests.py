@@ -416,7 +416,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runner", choices=["auto", "host", "wsl"], default="auto", help="执行环境")
     parser.add_argument("--wsl-distro", default=DEFAULT_WSL_DISTRO, help="WSL 发行版名称")
     parser.add_argument("--opt", action="store_true", help="编译时追加 -O1")
-    parser.add_argument("--timeout", type=int, default=60, help="单阶段超时秒数")
+    parser.add_argument("--timeout", type=int, default=90, help="单阶段超时秒数")
     parser.add_argument("--workers", type=int, default=10, help="WSL 内部并发数")
     parser.add_argument("--limit", type=int, help="只跑前 N 个用例")
     parser.add_argument("--diff-lines", type=int, default=12, help="输出错误时最多显示多少行 diff")

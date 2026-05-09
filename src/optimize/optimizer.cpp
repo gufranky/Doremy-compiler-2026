@@ -68,6 +68,7 @@ bool passSupportsFloat(OptPass pass) {
     case OptPass::DeadCodeElim:
     case OptPass::DeadStoreElim:
     case OptPass::SimplifyCFG:
+    case OptPass::CopyPropagate:
       return true;
     default:
       return false;
@@ -99,8 +100,12 @@ struct ExprKey {
 
   bool operator==(const ExprKey& other) const {
     return op == other.op && lhs.kind == other.lhs.kind &&
+           lhs.valueType == other.lhs.valueType &&
            rhs.kind == other.rhs.kind && lhs.immValue == other.lhs.immValue &&
+           rhs.valueType == other.rhs.valueType &&
            rhs.immValue == other.rhs.immValue &&
+           lhs.immFloatValue == other.lhs.immFloatValue &&
+           rhs.immFloatValue == other.rhs.immFloatValue &&
            lhs.vregId == other.lhs.vregId && rhs.vregId == other.rhs.vregId &&
            lhs.globalName == other.lhs.globalName &&
            rhs.globalName == other.rhs.globalName;
@@ -112,8 +117,12 @@ struct ExprKeyHasher {
     std::size_t h = static_cast<std::size_t>(k.op);
     auto mix = [&](const Operand& o) {
       h ^= static_cast<std::size_t>(o.kind) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      h ^= static_cast<std::size_t>(o.valueType) + 0x9e3779b9 + (h << 6) +
+           (h >> 2);
       h ^= static_cast<std::size_t>(o.immValue) + 0x9e3779b9 + (h << 6) +
            (h >> 2);
+      h ^= static_cast<std::size_t>(std::hash<float>{}(o.immFloatValue)) +
+           0x9e3779b9 + (h << 6) + (h >> 2);
       h ^=
           static_cast<std::size_t>(o.vregId) + 0x9e3779b9 + (h << 6) + (h >> 2);
       for (char c : o.globalName) {
@@ -129,9 +138,9 @@ struct ExprKeyHasher {
 void normalizeComm(ExprKey& key) {
   if (!isCommutative(key.op)) return;
   auto encode = [](const Operand& o) {
-    if (o.isImm()) return std::make_pair(0, o.immValue);
-    if (o.isVReg()) return std::make_pair(1, o.vregId);
-    return std::make_pair(2, 0);
+    return std::make_tuple(static_cast<int>(o.kind),
+                           static_cast<int>(o.valueType), o.immValue,
+                           o.immFloatValue, o.vregId, o.globalName);
   };
   if (encode(key.rhs) < encode(key.lhs)) std::swap(key.lhs, key.rhs);
 }
@@ -341,9 +350,8 @@ void killMappingsUsing(int vreg, std::unordered_map<int, Operand>& map) {
 
 bool sameOperandValue(const Operand& lhs, const Operand& rhs) {
   return lhs.kind == rhs.kind && lhs.valueType == rhs.valueType &&
-         lhs.immValue == rhs.immValue &&
-         lhs.immFloatValue == rhs.immFloatValue &&
-         lhs.vregId == rhs.vregId && lhs.globalName == rhs.globalName;
+         lhs.immValue == rhs.immValue && lhs.vregId == rhs.vregId &&
+         lhs.globalName == rhs.globalName;
 }
 
 using CopyMap = std::unordered_map<int, Operand>;
@@ -391,7 +399,8 @@ CopyMap transferCopyState(const IRFunction& func, const BasicBlock& block,
         auto* cp = static_cast<CopyInst*>(inst);
         Operand src = resolveOperand(cp->src, state);
         killMappingsUsing(cp->dest, state);
-        if (isSafeCopyPropagationSource(func, src)) {
+        if (cp->destType == src.valueType &&
+            isSafeCopyPropagationSource(func, src)) {
           state[cp->dest] = src;
         }
         break;
@@ -484,7 +493,8 @@ bool copyPropagate(IRFunction& func) {
       } else if (auto* cp = dynamic_cast<CopyInst*>(inst)) {
         rewriteOperand(cp->src, state);
         killMappingsUsing(cp->dest, state);
-        if (isSafeCopyPropagationSource(func, cp->src)) {
+        if (cp->destType == cp->src.valueType &&
+            isSafeCopyPropagationSource(func, cp->src)) {
           state[cp->dest] = cp->src;
         }
       } else if (auto* ld = dynamic_cast<LoadInst*>(inst)) {
@@ -882,12 +892,14 @@ struct OperandKey {
   Operand::Kind kind;
   ValueType valueType;
   int immValue;
+  float immFloatValue;
   int vregId;
   std::string globalName;
 
   bool operator==(const OperandKey& other) const {
     return kind == other.kind && valueType == other.valueType &&
-           immValue == other.immValue && vregId == other.vregId &&
+           immValue == other.immValue &&
+           immFloatValue == other.immFloatValue && vregId == other.vregId &&
            globalName == other.globalName;
   }
 };
@@ -899,6 +911,8 @@ struct OperandKeyHasher {
          (h >> 2);
     h ^= static_cast<std::size_t>(k.immValue) + 0x9e3779b9 + (h << 6) +
          (h >> 2);
+    h ^= static_cast<std::size_t>(std::hash<float>{}(k.immFloatValue)) +
+         0x9e3779b9 + (h << 6) + (h >> 2);
     h ^= static_cast<std::size_t>(k.vregId) + 0x9e3779b9 + (h << 6) +
          (h >> 2);
     for (char c : k.globalName) {
@@ -909,8 +923,8 @@ struct OperandKeyHasher {
 };
 
 OperandKey makeOperandKey(const Operand& op) {
-  return OperandKey{op.kind, op.valueType, op.immValue, op.vregId,
-                    op.globalName};
+  return OperandKey{op.kind, op.valueType, op.immValue, op.immFloatValue,
+                    op.vregId, op.globalName};
 }
 
 bool isSafeGVNOperand(const Operand& op) {
@@ -974,9 +988,10 @@ bool blockGVN(IRFunction& func) {
       return vn;
     };
 
-    auto setDest = [&](int dest, int vn) {
-      operandToVN[makeOperandKey(Operand::VReg(dest))] = vn;
-      if (!vnRep.count(vn)) vnRep[vn] = Operand::VReg(dest);
+    auto setDest = [&](int dest, ValueType type, int vn) {
+      Operand rep = Operand::VReg(dest, type);
+      operandToVN[makeOperandKey(rep)] = vn;
+      if (!vnRep.count(vn)) vnRep[vn] = rep;
     };
 
     for (auto*& inst : blk->instructions) {
@@ -984,7 +999,7 @@ bool blockGVN(IRFunction& func) {
         case InstKind::Binary: {
           auto* b = static_cast<BinaryInst*>(inst);
           if (!isSafeGVNOperand(b->lhs) || !isSafeGVNOperand(b->rhs)) {
-            setDest(b->dest, newVN());
+            setDest(b->dest, b->resultType, newVN());
             break;
           }
           int lhsVN = getVN(b->lhs);
@@ -1001,19 +1016,19 @@ bool blockGVN(IRFunction& func) {
             owner.erase(inst);
             owner[newRaw] = ownerPtr;
             inst = newRaw;
-            setDest(b->dest, vn);
+            setDest(b->dest, b->resultType, vn);
           } else {
             int vn = newVN();
             binaryMap[key] = vn;
-            vnRep[vn] = Operand::VReg(b->dest);
-            setDest(b->dest, vn);
+            vnRep[vn] = Operand::VReg(b->dest, b->resultType);
+            setDest(b->dest, b->resultType, vn);
           }
           break;
         }
         case InstKind::Unary: {
           auto* u = static_cast<UnaryInst*>(inst);
           if (!isSafeGVNOperand(u->operand)) {
-            setDest(u->dest, newVN());
+            setDest(u->dest, u->resultType, newVN());
             break;
           }
           int opVN = getVN(u->operand);
@@ -1028,31 +1043,31 @@ bool blockGVN(IRFunction& func) {
             owner.erase(inst);
             owner[newRaw] = ownerPtr;
             inst = newRaw;
-            setDest(u->dest, vn);
+            setDest(u->dest, u->resultType, vn);
           } else {
             int vn = newVN();
             unaryMap[key] = vn;
-            vnRep[vn] = Operand::VReg(u->dest);
-            setDest(u->dest, vn);
+            vnRep[vn] = Operand::VReg(u->dest, u->resultType);
+            setDest(u->dest, u->resultType, vn);
           }
           break;
         }
         case InstKind::Copy: {
           auto* c = static_cast<CopyInst*>(inst);
           int vn = getVN(c->src);
-          setDest(c->dest, vn);
+          setDest(c->dest, c->destType, vn);
           break;
         }
         case InstKind::Load: {
           auto* l = static_cast<LoadInst*>(inst);
           killExprTables();
-          setDest(l->dest, newVN());
+          setDest(l->dest, l->valueType, newVN());
           break;
         }
         case InstKind::Call: {
           auto* c = static_cast<CallInst*>(inst);
           killExprTables();
-          if (c->hasDest) setDest(c->dest, newVN());
+          if (c->hasDest) setDest(c->dest, c->resultType, newVN());
           break;
         }
         case InstKind::Store: {
@@ -1235,42 +1250,58 @@ bool globalVarConst(IRFunction& func) {
 // in the optimization pass. It marks stores as dead if the variable
 // is never loaded in the entire function.
 bool deadStoreElim(IRFunction& func) {
-  std::unordered_set<std::string> loadedVars;
-  for (const auto& instPtr : func.instructions) {
-    if (!instPtr) continue;  // Safety check
-    if (auto* ld = dynamic_cast<LoadInst*>(instPtr.get())) {
-      if (ld->addr.isGlobal()) {
-        loadedVars.insert(ld->addr.globalName);
-      }
-    }
-  }
-  
-  std::vector<size_t> toRemove;
-  for (size_t i = 0; i < func.instructions.size(); ++i) {
-    if (!func.instructions[i]) continue;  // Safety check
-    if (auto* st = dynamic_cast<StoreInst*>(func.instructions[i].get())) {
-      if (!st->addr.isGlobal()) continue;
+  bool changed = false;
+  std::unordered_map<std::string, size_t> lastStoreIndex;
+  std::unordered_set<size_t> toRemove;
 
-      // Global stores are externally visible across calls/functions, so
-      // function-local dead store analysis must not remove them.
+  auto flushOnBarrier = [&]() {
+    lastStoreIndex.clear();
+  };
+
+  for (size_t i = 0; i < func.instructions.size(); ++i) {
+    Instruction* inst = func.instructions[i].get();
+    if (!inst) continue;
+
+    if (auto* ld = dynamic_cast<LoadInst*>(inst)) {
+      if (ld->addr.isGlobal() || ld->addr.isLocalVarAddr()) {
+        flushOnBarrier();
+      }
       continue;
     }
-  }
-  
-  if (toRemove.empty()) return false;
-  
-  std::unordered_set<size_t> removeSet(toRemove.begin(), toRemove.end());
-  std::vector<std::unique_ptr<Instruction>> newInstructions;
-  newInstructions.reserve(func.instructions.size() - toRemove.size());
-  
-  for (size_t i = 0; i < func.instructions.size(); ++i) {
-    if (!removeSet.count(i) && func.instructions[i]) {
-      newInstructions.push_back(std::move(func.instructions[i]));
+
+    if (auto* st = dynamic_cast<StoreInst*>(inst)) {
+      if (st->addr.isGlobal() || st->addr.isLocalVarAddr()) {
+        const std::string key = st->addr.isGlobal() ? st->addr.globalName
+                                                    : std::to_string(st->addr.immValue);
+        auto it = lastStoreIndex.find(key);
+        if (it != lastStoreIndex.end()) {
+          toRemove.insert(it->second);
+        }
+        lastStoreIndex[key] = i;
+      }
+      continue;
+    }
+
+    if (dynamic_cast<CallInst*>(inst) || dynamic_cast<LabelInst*>(inst) ||
+        dynamic_cast<BranchInst*>(inst) || dynamic_cast<JumpInst*>(inst)) {
+      flushOnBarrier();
     }
   }
-  
+
+  if (toRemove.empty()) return false;
+
+  std::vector<std::unique_ptr<Instruction>> newInstructions;
+  newInstructions.reserve(func.instructions.size() - toRemove.size());
+  for (size_t i = 0; i < func.instructions.size(); ++i) {
+    if (toRemove.count(i)) {
+      changed = true;
+      continue;
+    }
+    newInstructions.push_back(std::move(func.instructions[i]));
+  }
+
   func.instructions = std::move(newInstructions);
-  return true;
+  return changed;
 }
 
 // ================== Mod Simplification ==================

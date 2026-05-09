@@ -26,6 +26,15 @@ inline std::string trim(const std::string& s) {
   return s.substr(b, e - b);
 }
 
+inline bool parseIntStrict(const std::string& text, int& out) {
+  try {
+    out = std::stoi(text);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 inline bool isLabelLine(const std::string& line) {
   std::string t = trim(line);
   return !t.empty() && t.back() == ':';
@@ -209,10 +218,10 @@ std::vector<std::string> optimizeRedundantOps(const std::vector<std::string>& li
           if (rs == "x0") {
             std::string rd = trim(t.substr(5, comma1 - 5));
             std::string immStr = trim(rest.substr(comma2 + 1));
-            try {
-              int imm = std::stoi(immStr);
+            int imm = 0;
+            if (parseIntStrict(immStr, imm)) {
               knownValues[rd] = imm;
-            } catch (...) {}
+            }
           }
         }
       }
@@ -369,7 +378,7 @@ std::vector<std::string> optimizeSmallConstLoops(const std::vector<std::string>&
         if (c2 == std::string::npos) continue;
         std::string rs = trim(rest.substr(0, c2));
         std::string immS = trim(rest.substr(c2 + 1));
-        try { bound = std::stoi(immS); } catch (...) { continue; }
+        if (!parseIntStrict(immS, bound)) continue;
         if (bound <= 0 || bound > 16) continue;
         sltiIdx = k;
         condReg = rd;
@@ -422,7 +431,7 @@ std::vector<std::string> optimizeSmallConstLoops(const std::vector<std::string>&
             std::string pimm = trim(prest.substr(pc2 + 1));
             
             if (prd == rs2 && prs == "x0") {
-              try { bound = std::stoi(pimm); } catch (...) { continue; }
+              if (!parseIntStrict(pimm, bound)) continue;
               if (bound <= 0 || bound > 16) { bound = -1; continue; }
               
               sltiIdx = k;
