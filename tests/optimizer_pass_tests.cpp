@@ -74,6 +74,22 @@ IRFunction buildDeadStoreFunction() {
   return fn;
 }
 
+IRFunction buildIndependentAddressDeadStoreFunction() {
+  IRFunction fn("dead_store_independent_addr");
+  fn.returnType = ValueType::I32;
+  fn.nextVReg = 3;
+  fn.append<LabelInst>("entry");
+  fn.append<StoreInst>(ValueType::I32, Operand::Imm(1), Operand::LocalVarAddr(0));
+  fn.append<StoreInst>(ValueType::I32, Operand::Imm(7), Operand::LocalVarAddr(4));
+  fn.append<StoreInst>(ValueType::I32, Operand::Imm(2), Operand::LocalVarAddr(0));
+  fn.append<LoadInst>(ValueType::I32, 0, Operand::LocalVarAddr(4));
+  fn.append<LoadInst>(ValueType::I32, 1, Operand::LocalVarAddr(0));
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 2,
+                        Operand::VReg(0), Operand::VReg(1));
+  fn.append<ReturnInst>(ValueType::I32, Operand::VReg(2));
+  return fn;
+}
+
 IRFunction buildFloatBlockGvnFunction() {
   IRFunction fn("float_gvn");
   fn.returnType = ValueType::F32;
@@ -144,6 +160,21 @@ IRFunction buildFloatCopyPropagationFunction() {
   return fn;
 }
 
+IRFunction buildLocalChainCopyPropagationFunction() {
+  IRFunction fn("local_chain_copy_prop");
+  fn.returnType = ValueType::I32;
+  fn.nextVReg = 5;
+
+  fn.append<LabelInst>("entry");
+  fn.append<CopyInst>(ValueType::I32, 1, Operand::Imm(9));
+  fn.append<CopyInst>(ValueType::I32, 2, Operand::VReg(1));
+  fn.append<CopyInst>(ValueType::I32, 3, Operand::VReg(2));
+  fn.append<BinaryInst>(BinaryOp::Add, ValueType::I32, ValueType::I32, 4,
+                        Operand::VReg(3), Operand::Imm(1));
+  fn.append<ReturnInst>(ValueType::I32, Operand::VReg(4));
+  return fn;
+}
+
 }  // namespace
 
 int main() {
@@ -204,6 +235,34 @@ int main() {
   }
 
   {
+    IRFunction fn = buildIndependentAddressDeadStoreFunction();
+    OptimizeFunction(fn, onlyPass(OptPass::DeadStoreElim));
+
+    int storeCount = 0;
+    int loadCount = 0;
+    bool sawLoadFromOffset4 = false;
+    bool sawLoadFromOffset0 = false;
+    for (const auto& inst : fn.instructions) {
+      if (auto* st = dynamic_cast<StoreInst*>(inst.get())) {
+        ++storeCount;
+        if (st->addr.isLocalVarAddr()) {
+          assert(st->addr.immValue != 0 || st->src.isImm());
+        }
+      }
+      if (auto* ld = dynamic_cast<LoadInst*>(inst.get())) {
+        ++loadCount;
+        if (ld->addr.isLocalVarAddr() && ld->addr.immValue == 4) sawLoadFromOffset4 = true;
+        if (ld->addr.isLocalVarAddr() && ld->addr.immValue == 0) sawLoadFromOffset0 = true;
+      }
+    }
+
+    assert(storeCount == 2);
+    assert(loadCount == 2);
+    assert(sawLoadFromOffset4);
+    assert(sawLoadFromOffset0);
+  }
+
+  {
     IRFunction fn = buildFloatCopyPropagationFunction();
     OptimizeFunction(fn, onlyPass(OptPass::CopyPropagate));
 
@@ -218,6 +277,56 @@ int main() {
     }
 
     assert(sawRewrittenUse);
+  }
+
+  {
+    IRFunction fn = buildFloatBlockGvnFunction();
+    OptimizeFunction(fn, onlyPass(OptPass::BlockGVN));
+
+    bool sawGvnCopy = false;
+    for (const auto& inst : fn.instructions) {
+      if (auto* cp = dynamic_cast<CopyInst*>(inst.get())) {
+        if (cp->dest == 2) {
+          sawGvnCopy = cp->src.isVReg() && cp->src.vregId == 1 &&
+                       cp->src.valueType == ValueType::F32;
+        }
+      }
+    }
+
+    assert(sawGvnCopy);
+  }
+
+  {
+    IRFunction fn = buildFloatCommonSubexprFunction();
+    OptimizeFunction(fn, onlyPass(OptPass::CommonSubexpr));
+
+    bool sawCseCopy = false;
+    for (const auto& inst : fn.instructions) {
+      if (auto* cp = dynamic_cast<CopyInst*>(inst.get())) {
+        if (cp->dest == 2) {
+          sawCseCopy = cp->src.isVReg() && cp->src.vregId == 1 &&
+                       cp->src.valueType == ValueType::F32;
+        }
+      }
+    }
+
+    assert(sawCseCopy);
+  }
+
+  {
+    IRFunction fn = buildLocalChainCopyPropagationFunction();
+    OptimizeFunction(fn, onlyPass(OptPass::CopyPropagate));
+
+    bool sawImmediateUse = false;
+    for (const auto& inst : fn.instructions) {
+      if (auto* bin = dynamic_cast<BinaryInst*>(inst.get())) {
+        if (bin->dest == 4) {
+          sawImmediateUse = bin->lhs.isImm() && bin->lhs.immValue == 9;
+        }
+      }
+    }
+
+    assert(sawImmediateUse);
   }
 
   {

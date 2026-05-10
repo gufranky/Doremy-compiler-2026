@@ -69,6 +69,8 @@ bool passSupportsFloat(OptPass pass) {
     case OptPass::DeadStoreElim:
     case OptPass::SimplifyCFG:
     case OptPass::CopyPropagate:
+    case OptPass::BlockGVN:
+    case OptPass::CommonSubexpr:
       return true;
     default:
       return false;
@@ -350,11 +352,52 @@ void killMappingsUsing(int vreg, std::unordered_map<int, Operand>& map) {
 
 bool sameOperandValue(const Operand& lhs, const Operand& rhs) {
   return lhs.kind == rhs.kind && lhs.valueType == rhs.valueType &&
-         lhs.immValue == rhs.immValue && lhs.vregId == rhs.vregId &&
-         lhs.globalName == rhs.globalName;
+         lhs.immValue == rhs.immValue &&
+         lhs.immFloatValue == rhs.immFloatValue &&
+         lhs.vregId == rhs.vregId && lhs.globalName == rhs.globalName;
 }
 
 using CopyMap = std::unordered_map<int, Operand>;
+
+struct StoreAddressKey {
+  enum class Kind { Global, Local };
+
+  Kind kind = Kind::Local;
+  int localOffset = 0;
+  std::string globalName;
+
+  bool operator==(const StoreAddressKey& other) const {
+    return kind == other.kind && localOffset == other.localOffset &&
+           globalName == other.globalName;
+  }
+};
+
+struct StoreAddressKeyHasher {
+  std::size_t operator()(const StoreAddressKey& key) const {
+    std::size_t h = static_cast<std::size_t>(key.kind);
+    h ^= static_cast<std::size_t>(key.localOffset + 0x9e3779b9) + (h << 6) +
+         (h >> 2);
+    h ^= std::hash<std::string>{}(key.globalName) + 0x9e3779b9 + (h << 6) +
+         (h >> 2);
+    return h;
+  }
+};
+
+bool tryGetTrackedStoreAddress(const Operand& addr, StoreAddressKey& key) {
+  if (addr.isGlobal()) {
+    key.kind = StoreAddressKey::Kind::Global;
+    key.localOffset = 0;
+    key.globalName = addr.globalName;
+    return true;
+  }
+  if (addr.isLocalVarAddr()) {
+    key.kind = StoreAddressKey::Kind::Local;
+    key.localOffset = addr.immValue;
+    key.globalName.clear();
+    return true;
+  }
+  return false;
+}
 
 bool sameCopyState(const CopyMap& lhs, const CopyMap& rhs) {
   if (lhs.size() != rhs.size()) return false;
@@ -493,8 +536,7 @@ bool copyPropagate(IRFunction& func) {
       } else if (auto* cp = dynamic_cast<CopyInst*>(inst)) {
         rewriteOperand(cp->src, state);
         killMappingsUsing(cp->dest, state);
-        if (cp->destType == cp->src.valueType &&
-            isSafeCopyPropagationSource(func, cp->src)) {
+        if (cp->destType == cp->src.valueType) {
           state[cp->dest] = cp->src;
         }
       } else if (auto* ld = dynamic_cast<LoadInst*>(inst)) {
@@ -1251,7 +1293,8 @@ bool globalVarConst(IRFunction& func) {
 // is never loaded in the entire function.
 bool deadStoreElim(IRFunction& func) {
   bool changed = false;
-  std::unordered_map<std::string, size_t> lastStoreIndex;
+  std::unordered_map<StoreAddressKey, size_t, StoreAddressKeyHasher>
+      lastStoreIndex;
   std::unordered_set<size_t> toRemove;
 
   auto flushOnBarrier = [&]() {
@@ -1263,21 +1306,25 @@ bool deadStoreElim(IRFunction& func) {
     if (!inst) continue;
 
     if (auto* ld = dynamic_cast<LoadInst*>(inst)) {
-      if (ld->addr.isGlobal() || ld->addr.isLocalVarAddr()) {
+      StoreAddressKey key;
+      if (tryGetTrackedStoreAddress(ld->addr, key)) {
+        lastStoreIndex.erase(key);
+      } else {
         flushOnBarrier();
       }
       continue;
     }
 
     if (auto* st = dynamic_cast<StoreInst*>(inst)) {
-      if (st->addr.isGlobal() || st->addr.isLocalVarAddr()) {
-        const std::string key = st->addr.isGlobal() ? st->addr.globalName
-                                                    : std::to_string(st->addr.immValue);
+      StoreAddressKey key;
+      if (tryGetTrackedStoreAddress(st->addr, key)) {
         auto it = lastStoreIndex.find(key);
         if (it != lastStoreIndex.end()) {
           toRemove.insert(it->second);
         }
         lastStoreIndex[key] = i;
+      } else {
+        flushOnBarrier();
       }
       continue;
     }
