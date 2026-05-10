@@ -1,7 +1,11 @@
 # ToyC Compiler Makefile
 
 # Compiler and flags
-CXX = C:/mingw64/bin/g++.exe
+ifeq ($(shell uname -s),Linux)
+CXX ?= g++
+else
+CXX ?= C:/mingw64/bin/g++.exe
+endif
 CXXFLAGS = -std=c++17 -Wall -g -Iinclude -Isrc/frontend
 LDFLAGS =
 
@@ -14,6 +18,7 @@ BUILD_DIR = build
 FRONTEND_SRCS = $(FRONTEND_DIR)/ast.cpp $(FRONTEND_DIR)/semantic_analyzer.cpp $(FRONTEND_DIR)/preprocessor.cpp $(FRONTEND_DIR)/parse_driver.cpp
 FRONTEND_GEN_SRCS = $(FRONTEND_DIR)/lex.yy.c $(FRONTEND_DIR)/parser.tab.c
 IR_SRCS = $(wildcard src/ir/*.cpp)
+MIDIR_SRCS = $(wildcard src/midir/*.cpp)
 BACKEND_SRCS = $(wildcard src/backend/*.cpp)
 MAIN_SRC = main.cpp
 
@@ -21,6 +26,7 @@ MAIN_SRC = main.cpp
 FRONTEND_OBJS = $(patsubst $(FRONTEND_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(FRONTEND_SRCS))
 FRONTEND_GEN_OBJS = $(patsubst $(FRONTEND_DIR)/%.c,$(BUILD_DIR)/%.o,$(FRONTEND_GEN_SRCS))
 IR_OBJS = $(patsubst src/ir/%.cpp,$(BUILD_DIR)/%.o,$(IR_SRCS))
+MIDIR_OBJS = $(patsubst src/midir/%.cpp,$(BUILD_DIR)/%.o,$(MIDIR_SRCS))
 BACKEND_OBJS = $(patsubst src/backend/%.cpp,$(BUILD_DIR)/%.o,$(BACKEND_SRCS))
 MAIN_OBJ = $(BUILD_DIR)/main.o
 # Target executable
@@ -43,6 +49,9 @@ $(FRONTEND_GEN_OBJS): $(BUILD_DIR)/%.o: $(FRONTEND_DIR)/%.c | $(BUILD_DIR)
 $(IR_OBJS): $(BUILD_DIR)/%.o: src/ir/%.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(MIDIR_OBJS): $(BUILD_DIR)/%.o: src/midir/%.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 $(BACKEND_OBJS): $(BUILD_DIR)/%.o: src/backend/%.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
@@ -51,7 +60,7 @@ $(MAIN_OBJ): $(MAIN_SRC) $(FRONTEND_DIR)/parser.tab.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $(MAIN_SRC) -o $(MAIN_OBJ)
 
 # Link executable
-$(TARGET): $(FRONTEND_OBJS) $(FRONTEND_GEN_OBJS) $(IR_OBJS) $(BACKEND_OBJS) $(MAIN_OBJ)
+$(TARGET): $(FRONTEND_OBJS) $(FRONTEND_GEN_OBJS) $(IR_OBJS) $(MIDIR_OBJS) $(BACKEND_OBJS) $(MAIN_OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $(TARGET) $(LDFLAGS)
 
 # Test with functional test cases
