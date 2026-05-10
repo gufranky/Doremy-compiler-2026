@@ -17,11 +17,13 @@ struct PassResult {
 class AnalysisManager {
  public:
   const DominatorTree& getDominatorTree(Function& function);
+  const LoopInfo& getLoopInfo(Function& function);
   void invalidate(Function& function);
   void invalidateAll();
 
  private:
   std::unordered_map<Function*, DominatorTree> dominator_trees_;
+  std::unordered_map<Function*, LoopInfo> loop_infos_;
 };
 
 class FunctionPass {
@@ -32,6 +34,48 @@ class FunctionPass {
 };
 
 class VerifySSAPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
+class SimplifyCFGPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
+class LoopSimplifyPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
+class LICMPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
+class IndVarSimplifyPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
+class InstCombinePass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
+class EarlyCSEPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
+class ADCEPass : public FunctionPass {
  public:
   std::string name() const override;
   PassResult run(Function& function, AnalysisManager& analysisManager) override;

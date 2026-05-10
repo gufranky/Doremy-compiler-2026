@@ -145,6 +145,16 @@ int main(int argc, char** argv) {
     if (!options.lowerOnly) {
       midir::PassManager passManager;
       passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
+      passManager.addFunctionPass(std::make_unique<midir::SimplifyCFGPass>());
+      passManager.addFunctionPass(std::make_unique<midir::LoopSimplifyPass>());
+      passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
+      passManager.addFunctionPass(std::make_unique<midir::LICMPass>());
+      passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
+      passManager.addFunctionPass(std::make_unique<midir::IndVarSimplifyPass>());
+      passManager.addFunctionPass(std::make_unique<midir::InstCombinePass>());
+      passManager.addFunctionPass(std::make_unique<midir::EarlyCSEPass>());
+      passManager.addFunctionPass(std::make_unique<midir::ADCEPass>());
+      passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
       try {
         passManager.run(midirModule);
       } catch (const std::exception& ex) {
