@@ -145,6 +145,8 @@ int main(int argc, char** argv) {
     if (!options.lowerOnly) {
       midir::PassManager passManager;
       passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
+      passManager.addFunctionPass(std::make_unique<midir::InlinePass>(&midirModule));
+      passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
       passManager.addFunctionPass(std::make_unique<midir::SimplifyCFGPass>());
       passManager.addFunctionPass(std::make_unique<midir::LoopSimplifyPass>());
       passManager.addFunctionPass(std::make_unique<midir::LoopRotatePass>());

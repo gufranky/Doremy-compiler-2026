@@ -39,6 +39,17 @@ class VerifySSAPass : public FunctionPass {
   PassResult run(Function& function, AnalysisManager& analysisManager) override;
 };
 
+class InlinePass : public FunctionPass {
+ public:
+  explicit InlinePass(Module* module) : module_(module) {}
+
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+
+ private:
+  Module* module_ = nullptr;
+};
+
 class SimplifyCFGPass : public FunctionPass {
  public:
   std::string name() const override;
