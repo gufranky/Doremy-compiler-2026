@@ -1,5 +1,7 @@
 #include "optimizer_pipeline.h"
 
+#include <cstdlib>
+#include <iostream>
 #include <utility>
 
 namespace midir {
@@ -40,10 +42,19 @@ void PassManager::addFunctionPass(std::unique_ptr<FunctionPass> pass) {
 }
 
 bool PassManager::run(Module& module) {
+  const bool debug_passes = std::getenv("SYS2026_DEBUG_PASSES") != nullptr;
   bool changed = false;
   for (auto& function : module.functions) {
     for (const auto& pass : function_passes_) {
+      if (debug_passes) {
+        std::cerr << "[pass] begin " << function.name << " :: " << pass->name()
+                  << "\n";
+      }
       PassResult result = pass->run(function, analysis_manager_);
+      if (debug_passes) {
+        std::cerr << "[pass] end   " << function.name << " :: " << pass->name()
+                  << " changed=" << (result.changed ? 1 : 0) << "\n";
+      }
       changed = changed || result.changed;
       if (result.changed) {
         analysis_manager_.invalidate(function);

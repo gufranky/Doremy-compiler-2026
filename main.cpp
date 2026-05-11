@@ -147,6 +147,7 @@ int main(int argc, char** argv) {
       passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
       passManager.addFunctionPass(std::make_unique<midir::SimplifyCFGPass>());
       passManager.addFunctionPass(std::make_unique<midir::LoopSimplifyPass>());
+      passManager.addFunctionPass(std::make_unique<midir::LCSSAPass>());
       passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
       passManager.addFunctionPass(std::make_unique<midir::LICMPass>());
       passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());

@@ -53,6 +53,33 @@ bool loopContainsBlock(const Loop& loop, int block) {
          loop.blocks.end();
 }
 
+std::vector<int> collectExitBlocks(const Function& function, const Loop& loop) {
+  std::vector<int> exits;
+  for (int block : loop.blocks) {
+    for (int succ : function.blocks[block].succs) {
+      if (loopContainsBlock(loop, succ)) continue;
+      if (std::find(exits.begin(), exits.end(), succ) == exits.end()) {
+        exits.push_back(succ);
+      }
+    }
+  }
+  std::sort(exits.begin(), exits.end());
+  return exits;
+}
+
+std::vector<int> collectExitingBlocks(const Function& function, const Loop& loop) {
+  std::vector<int> exiting;
+  for (int block : loop.blocks) {
+    const auto& succs = function.blocks[block].succs;
+    if (std::any_of(succs.begin(), succs.end(),
+                    [&](int succ) { return !loopContainsBlock(loop, succ); })) {
+      exiting.push_back(block);
+    }
+  }
+  std::sort(exiting.begin(), exiting.end());
+  return exiting;
+}
+
 }  // namespace
 
 DominatorTree buildDominatorTree(const Function& function) {
@@ -170,6 +197,9 @@ LoopInfo buildLoopInfo(const Function& function, const DominatorTree& domTree) {
         loop.header = succ;
         loop.blocks = std::move(blocks);
         loop.latches.push_back(tail);
+        loop.preheader = getLoopPreheader(function, loop);
+        loop.exiting_blocks = collectExitingBlocks(function, loop);
+        loop.exit_blocks = collectExitBlocks(function, loop);
         info.loops.push_back(std::move(loop));
         continue;
       }
@@ -184,6 +214,9 @@ LoopInfo buildLoopInfo(const Function& function, const DominatorTree& domTree) {
         }
       }
       std::sort(loop.blocks.begin(), loop.blocks.end());
+      loop.preheader = getLoopPreheader(function, loop);
+      loop.exiting_blocks = collectExitingBlocks(function, loop);
+      loop.exit_blocks = collectExitBlocks(function, loop);
     }
   }
 
@@ -229,7 +262,11 @@ LoopInfo buildLoopInfo(const Function& function, const DominatorTree& domTree) {
 
   std::vector<int> sorted_loops(order.rbegin(), order.rend());
   for (int loop_index : sorted_loops) {
-    for (int block : info.loops[loop_index].blocks) {
+    Loop& loop = info.loops[loop_index];
+    loop.preheader = getLoopPreheader(function, loop);
+    loop.exiting_blocks = collectExitingBlocks(function, loop);
+    loop.exit_blocks = collectExitBlocks(function, loop);
+    for (int block : loop.blocks) {
       if (block >= 0 && block < static_cast<int>(info.block_loop.size()) &&
           info.block_loop[block] == -1) {
         info.block_loop[block] = loop_index;

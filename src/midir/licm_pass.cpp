@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <numeric>
+#include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -10,10 +12,240 @@ namespace midir {
 
 namespace {
 
+struct MemoryLocation {
+  enum class BaseKind { Invalid, Global, Frame, Stack, Param, Unknown };
+
+  BaseKind base_kind = BaseKind::Invalid;
+  std::string symbol;
+  int frame_offset = 0;
+  int param_index = -1;
+  bool offset_known = false;
+  int offset = 0;
+  int access_size = 0;
+
+  bool isIdentifiable() const {
+    return base_kind != BaseKind::Invalid && base_kind != BaseKind::Unknown;
+  }
+
+  bool sameBase(const MemoryLocation& other) const {
+    if (base_kind != other.base_kind) return false;
+    switch (base_kind) {
+      case BaseKind::Global:
+        return symbol == other.symbol;
+      case BaseKind::Frame:
+        return frame_offset == other.frame_offset;
+      case BaseKind::Stack:
+        return true;
+      case BaseKind::Param:
+        return param_index == other.param_index;
+      case BaseKind::Invalid:
+      case BaseKind::Unknown:
+        return false;
+    }
+    return false;
+  }
+};
+
 bool loopContainsBlock(const Loop& loop, int block) {
   return std::binary_search(loop.blocks.begin(), loop.blocks.end(), block);
 }
 
+int typeStoreSize(Type type) {
+  switch (type.kind) {
+    case TypeKind::I1:
+      return 1;
+    case TypeKind::I32:
+    case TypeKind::F32:
+      return 4;
+    case TypeKind::Ptr:
+      return 8;
+    case TypeKind::Void:
+      return 0;
+  }
+  return 0;
+}
+
+bool rangesOverlap(const MemoryLocation& lhs, const MemoryLocation& rhs) {
+  if (!lhs.offset_known || !rhs.offset_known || lhs.access_size <= 0 ||
+      rhs.access_size <= 0) {
+    return true;
+  }
+  const int lhs_end = lhs.offset + lhs.access_size;
+  const int rhs_end = rhs.offset + rhs.access_size;
+  return lhs.offset < rhs_end && rhs.offset < lhs_end;
+}
+
+bool computeConstantOffset(const ValueRef& value, const std::vector<int>& defBlock,
+                           const std::unordered_map<int, Instruction>& defs,
+                           int& offset) {
+  if (value.kind == ValueRef::Kind::ImmediateInt) {
+    offset = value.int_value;
+    return true;
+  }
+  if (!value.isSSA() || value.value_id < 0 ||
+      value.value_id >= static_cast<int>(defBlock.size())) {
+    return false;
+  }
+
+  auto it = defs.find(value.value_id);
+  if (it == defs.end()) return false;
+  const Instruction& inst = it->second;
+  if (!inst.has_result || inst.result_id != value.value_id ||
+      inst.kind != InstKind::Binary || inst.operands.size() != 2) {
+    return false;
+  }
+
+  int lhs = 0;
+  int rhs = 0;
+  switch (inst.binary_op) {
+    case ir::BinaryOp::Add:
+      if (computeConstantOffset(inst.operands[0], defBlock, defs, lhs) &&
+          computeConstantOffset(inst.operands[1], defBlock, defs, rhs)) {
+        offset = lhs + rhs;
+        return true;
+      }
+      return false;
+    case ir::BinaryOp::Sub:
+      if (computeConstantOffset(inst.operands[0], defBlock, defs, lhs) &&
+          computeConstantOffset(inst.operands[1], defBlock, defs, rhs)) {
+        offset = lhs - rhs;
+        return true;
+      }
+      return false;
+    default:
+      return false;
+  }
+}
+
+
+int findPointerParamIndex(const Function& function, int value_id) {
+  for (size_t i = 0; i < function.params.size(); ++i) {
+    if (function.params[i] != value_id) continue;
+    if (i >= function.param_types.size()) return -1;
+    if (function.param_types[i] == Type::Ptr()) return static_cast<int>(i);
+    if (i < function.param_is_array.size() && function.param_is_array[i]) {
+      return static_cast<int>(i);
+    }
+    return -1;
+  }
+  return -1;
+}
+
+MemoryLocation analyzeMemoryLocation(const Function& function, const ValueRef& value,
+                                     const std::vector<int>& defBlock,
+                                     const std::unordered_map<int, Instruction>& defs) {
+  MemoryLocation location;
+  switch (value.kind) {
+    case ValueRef::Kind::GlobalSymbol:
+      location.base_kind = MemoryLocation::BaseKind::Global;
+      location.symbol = value.symbol;
+      location.offset_known = true;
+      location.offset = 0;
+      return location;
+    case ValueRef::Kind::FrameAddress:
+      location.base_kind = MemoryLocation::BaseKind::Frame;
+      location.frame_offset = value.frame_offset;
+      location.offset_known = true;
+      location.offset = 0;
+      return location;
+    case ValueRef::Kind::StackPointer:
+      location.base_kind = MemoryLocation::BaseKind::Stack;
+      location.offset_known = true;
+      location.offset = 0;
+      return location;
+    case ValueRef::Kind::SSA:
+      break;
+    default:
+      location.base_kind = MemoryLocation::BaseKind::Unknown;
+      return location;
+  }
+
+  int param_index = findPointerParamIndex(function, value.value_id);
+  if (param_index >= 0) {
+    location.base_kind = MemoryLocation::BaseKind::Param;
+    location.param_index = param_index;
+    location.offset_known = true;
+    location.offset = 0;
+    return location;
+  }
+
+  if (value.value_id < 0 || value.value_id >= static_cast<int>(defBlock.size())) {
+    location.base_kind = MemoryLocation::BaseKind::Unknown;
+    return location;
+  }
+  auto it = defs.find(value.value_id);
+  if (it == defs.end()) {
+    location.base_kind = MemoryLocation::BaseKind::Unknown;
+    return location;
+  }
+
+  const Instruction& inst = it->second;
+  if (inst.kind != InstKind::Binary || inst.operands.size() != 2) {
+    location.base_kind = MemoryLocation::BaseKind::Unknown;
+    return location;
+  }
+
+  const ValueRef* base_operand = nullptr;
+  const ValueRef* offset_operand = nullptr;
+  int sign = 1;
+  switch (inst.binary_op) {
+    case ir::BinaryOp::Add:
+      if (inst.operands[0].isPointerLike()) {
+        base_operand = &inst.operands[0];
+        offset_operand = &inst.operands[1];
+      } else if (inst.operands[1].isPointerLike()) {
+        base_operand = &inst.operands[1];
+        offset_operand = &inst.operands[0];
+      }
+      break;
+    case ir::BinaryOp::Sub:
+      if (inst.operands[0].isPointerLike()) {
+        base_operand = &inst.operands[0];
+        offset_operand = &inst.operands[1];
+        sign = -1;
+      }
+      break;
+    default:
+      break;
+  }
+  if (base_operand == nullptr) {
+    location.base_kind = MemoryLocation::BaseKind::Unknown;
+    return location;
+  }
+
+  location = analyzeMemoryLocation(function, *base_operand, defBlock, defs);
+  if (!location.isIdentifiable()) return location;
+  if (offset_operand == nullptr) return location;
+
+  int constant_offset = 0;
+  if (!computeConstantOffset(*offset_operand, defBlock, defs, constant_offset)) {
+    location.offset_known = false;
+    location.offset = 0;
+    return location;
+  }
+
+  if (!location.offset_known) {
+    location.offset = sign * constant_offset;
+    location.offset_known = true;
+    return location;
+  }
+
+  location.offset += sign * constant_offset;
+  return location;
+}
+
+std::unordered_map<int, Instruction> buildDefs(const Function& function) {
+  std::unordered_map<int, Instruction> defs;
+  defs.reserve(function.next_value_id);
+  for (const auto& block : function.blocks) {
+    for (const auto& inst : block.instructions) {
+      if (inst.has_result && inst.result_id >= 0) {
+        defs.emplace(inst.result_id, inst);
+      }
+    }
+  }
+  return defs;
+}
 
 bool dominatesAllLoopUses(const Function& function, const Loop& loop,
                           const DominatorTree& domTree, int valueId,
@@ -65,12 +297,45 @@ bool isHoistableInstruction(const Instruction& inst) {
   if (!inst.has_result) return false;
   if (inst.kind == InstKind::Phi) return false;
   if (!isPureComputingInstruction(inst) || hasSideEffects(inst)) return false;
-  if (inst.kind == InstKind::Load || inst.kind == InstKind::Call ||
-      inst.kind == InstKind::Store) {
-    return false;
-  }
+  if (inst.kind == InstKind::Call || inst.kind == InstKind::Store) return false;
   return inst.kind == InstKind::Binary || inst.kind == InstKind::Unary ||
-         inst.kind == InstKind::Copy;
+         inst.kind == InstKind::Copy || inst.kind == InstKind::Load;
+}
+
+bool isInvariantLoadSafe(const Function& function, const Loop& loop,
+                         const std::vector<int>& defBlock,
+                         const std::unordered_set<int>& hoistedValues,
+                         const std::unordered_map<int, Instruction>& defs,
+                         const Instruction& inst) {
+  if (inst.kind != InstKind::Load || inst.operands.size() != 1) return false;
+  const ValueRef& addr = inst.operands[0];
+  if (!isLoopInvariantOperand(addr, loop, defBlock, hoistedValues)) return false;
+
+  MemoryLocation load_location = analyzeMemoryLocation(function, addr, defBlock, defs);
+  if (!load_location.isIdentifiable()) return false;
+  load_location.access_size = typeStoreSize(inst.result_type);
+  if (load_location.access_size <= 0) return false;
+
+  for (int blockIndex : loop.blocks) {
+    const auto& block = function.blocks[blockIndex];
+    for (const auto& other : block.instructions) {
+      if (other.kind == InstKind::Store) {
+        if (other.operands.size() != 2) return false;
+        MemoryLocation store_location =
+            analyzeMemoryLocation(function, other.operands[1], defBlock, defs);
+        if (!store_location.isIdentifiable()) return false;
+        store_location.access_size = typeStoreSize(other.operands[0].type);
+        if (store_location.access_size <= 0) return false;
+        if (!load_location.sameBase(store_location)) continue;
+        if (rangesOverlap(load_location, store_location)) return false;
+        continue;
+      }
+      if (other.kind == InstKind::Call) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 std::vector<int> buildDefBlocks(const Function& function) {
@@ -98,6 +363,7 @@ bool hoistLoop(Function& function, const Loop& loop, const DominatorTree& domTre
   if (preheader < 0) return false;
 
   std::vector<int> defBlock = buildDefBlocks(function);
+  std::unordered_map<int, Instruction> defs = buildDefs(function);
   std::unordered_set<int> hoistedValues;
   std::vector<Instruction> hoistedInstructions;
   bool changed = false;
@@ -117,6 +383,10 @@ bool hoistLoop(Function& function, const Loop& loop, const DominatorTree& domTre
                            return isLoopInvariantOperand(operand, loop, defBlock,
                                                          hoistedValues);
                          })) {
+          continue;
+        }
+        if (inst.kind == InstKind::Load &&
+            !isInvariantLoadSafe(function, loop, defBlock, hoistedValues, defs, inst)) {
           continue;
         }
         if (!dominatesAllLoopUses(function, loop, domTree, inst.result_id, preheader)) {

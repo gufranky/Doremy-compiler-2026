@@ -15,9 +15,12 @@ struct DominatorTree {
 
 struct Loop {
   int header = -1;
+  int preheader = -1;
   int parent = -1;
   int depth = 0;
   std::vector<int> latches;
+  std::vector<int> exiting_blocks;
+  std::vector<int> exit_blocks;
   std::vector<int> blocks;
   std::vector<int> children;
 };
