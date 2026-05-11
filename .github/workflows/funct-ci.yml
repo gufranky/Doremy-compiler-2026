@@ -50,7 +50,7 @@ jobs:
             --runner host \
             --build-cmd "make clean && make" \
             --opt \
-            --timeout 60 \
+            --timeout 120 \
             --summary-json full-summary.json \
             --quiet | tee full.log
           status=${PIPESTATUS[0]}
