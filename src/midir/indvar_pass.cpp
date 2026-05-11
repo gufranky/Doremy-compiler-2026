@@ -13,17 +13,6 @@ namespace midir {
 
 namespace {
 
-struct InductionVariableInfo {
-  int phi_value = -1;
-  int preheader_block = -1;
-  int header_block = -1;
-  int latch_block = -1;
-  int update_result = -1;
-  int step = 0;
-  ValueRef init_value = ValueRef::Invalid();
-  std::vector<int> latch_blocks;
-};
-
 struct AddressRecurrenceCandidate {
   int address_result = -1;
   Type result_type = Type::Ptr();
@@ -62,9 +51,6 @@ std::optional<int> getConstantInt(const ValueRef& value) {
   return std::nullopt;
 }
 
-const Instruction* findDefInstruction(const Function& function, int valueId,
-                                      int& blockIndexOut);
-
 bool loopContainsBlock(const Loop& loop, int blockIndex) {
   return std::find(loop.blocks.begin(), loop.blocks.end(), blockIndex) !=
          loop.blocks.end();
@@ -102,9 +88,24 @@ std::vector<int> buildDefBlocks(const Function& function) {
   return defBlock;
 }
 
+const Instruction* findDefInstruction(const Function& function, int valueId,
+                                      int& blockIndexOut) {
+  for (int blockIndex = 0; blockIndex < static_cast<int>(function.blocks.size());
+       ++blockIndex) {
+    for (const auto& inst : function.blocks[blockIndex].instructions) {
+      if (inst.has_result && inst.result_id == valueId) {
+        blockIndexOut = blockIndex;
+        return &inst;
+      }
+    }
+  }
+  blockIndexOut = -1;
+  return nullptr;
+}
+
 bool isLoopInvariantValue(const Function& function, const Loop& loop,
-                         const std::vector<int>& defBlock, int valueId,
-                         std::vector<char>& visiting) {
+                          const std::vector<int>& defBlock, int valueId,
+                          std::vector<char>& visiting) {
   if (valueId < 0 || valueId >= static_cast<int>(defBlock.size())) return false;
   const int blockIndex = defBlock[valueId];
   if (blockIndex < 0) return isParameterValue(function, valueId);
@@ -143,41 +144,6 @@ bool isLoopInvariantOperand(const Function& function, const Loop& loop,
   return isLoopInvariantValue(function, loop, defBlock, value.value_id, visiting);
 }
 
-const Instruction* findDefInstruction(const Function& function, int valueId,
-                                      int& blockIndexOut) {
-  for (int blockIndex = 0; blockIndex < static_cast<int>(function.blocks.size());
-       ++blockIndex) {
-    for (const auto& inst : function.blocks[blockIndex].instructions) {
-      if (inst.has_result && inst.result_id == valueId) {
-        blockIndexOut = blockIndex;
-        return &inst;
-      }
-    }
-  }
-  blockIndexOut = -1;
-  return nullptr;
-}
-
-ValueRef resolveTrivialCopies(const Function& function, ValueRef value,
-                              int& blockIndexOut,
-                              const Instruction*& defInstOut) {
-  blockIndexOut = -1;
-  defInstOut = nullptr;
-  while (value.isSSA()) {
-    int currentBlock = -1;
-    const Instruction* defInst =
-        findDefInstruction(function, value.value_id, currentBlock);
-    if (defInst == nullptr) break;
-    if (defInst->kind != InstKind::Copy || defInst->operands.size() != 1) {
-      blockIndexOut = currentBlock;
-      defInstOut = defInst;
-      return value;
-    }
-    value = defInst->operands[0];
-  }
-  return value;
-}
-
 Instruction makeBinaryInstruction(Type resultType, ir::BinaryOp op, Type operandType,
                                   int resultId, const ValueRef& lhs,
                                   const ValueRef& rhs) {
@@ -192,8 +158,6 @@ Instruction makeBinaryInstruction(Type resultType, ir::BinaryOp op, Type operand
   return inst;
 }
 
-
-
 int firstNonPhiIndex(const BasicBlock& block) {
   int index = 0;
   while (index < static_cast<int>(block.instructions.size()) &&
@@ -201,167 +165,6 @@ int firstNonPhiIndex(const BasicBlock& block) {
     ++index;
   }
   return index;
-}
-
-std::optional<int> matchInductionStep(const Instruction& updateInst, int phiValue) {
-  if (updateInst.kind != InstKind::Binary || !updateInst.has_result ||
-      updateInst.operands.size() != 2 || updateInst.operand_type != Type::I32() ||
-      updateInst.result_type != Type::I32()) {
-    return std::nullopt;
-  }
-
-  if (updateInst.binary_op == ir::BinaryOp::Add) {
-    if (updateInst.operands[0].isSSA() && updateInst.operands[0].value_id == phiValue) {
-      return getConstantInt(updateInst.operands[1]);
-    }
-    if (updateInst.operands[1].isSSA() && updateInst.operands[1].value_id == phiValue) {
-      return getConstantInt(updateInst.operands[0]);
-    }
-    return std::nullopt;
-  }
-
-  if (updateInst.binary_op == ir::BinaryOp::Sub) {
-    if (!(updateInst.operands[0].isSSA() && updateInst.operands[0].value_id == phiValue)) {
-      return std::nullopt;
-    }
-    auto constant = getConstantInt(updateInst.operands[1]);
-    if (!constant.has_value()) return std::nullopt;
-    return -*constant;
-  }
-
-  return std::nullopt;
-}
-
-std::optional<int> matchInductionStepForIncoming(const Function& function,
-                                                 const Loop& loop, int phiValue,
-                                                 const ValueRef& incomingValue,
-                                                 int incomingPred,
-                                                 std::vector<char>& visiting) {
-  if (!incomingValue.isSSA()) return std::nullopt;
-
-  int updateBlock = -1;
-  const Instruction* updateInst = nullptr;
-  ValueRef updateValue =
-      resolveTrivialCopies(function, incomingValue, updateBlock, updateInst);
-  if (!updateValue.isSSA() || updateInst == nullptr || updateBlock != incomingPred) {
-    return std::nullopt;
-  }
-
-  if (auto step = matchInductionStep(*updateInst, phiValue); step.has_value()) {
-    return step;
-  }
-
-  if (updateInst->kind != InstKind::Phi || updateInst->result_id < 0 ||
-      updateInst->result_id >= static_cast<int>(visiting.size())) {
-    return std::nullopt;
-  }
-  if (visiting[updateInst->result_id]) return std::nullopt;
-
-  visiting[updateInst->result_id] = 1;
-  std::optional<int> mergedStep;
-  for (const auto& incoming : updateInst->incomings) {
-    if (!loopContainsBlock(loop, incoming.pred_block)) {
-      visiting[updateInst->result_id] = 0;
-      return std::nullopt;
-    }
-    auto step = matchInductionStepForIncoming(function, loop, phiValue,
-                                              incoming.value, incoming.pred_block,
-                                              visiting);
-    if (!step.has_value()) {
-      visiting[updateInst->result_id] = 0;
-      return std::nullopt;
-    }
-    if (!mergedStep.has_value()) {
-      mergedStep = step;
-    } else if (*mergedStep != *step) {
-      visiting[updateInst->result_id] = 0;
-      return std::nullopt;
-    }
-  }
-  visiting[updateInst->result_id] = 0;
-  return mergedStep;
-}
-
-std::optional<InductionVariableInfo> matchInductionVariable(const Function& function,
-                                                            const Loop& loop) {
-  const int preheader = getLoopPreheader(function, loop);
-  if (preheader < 0) return std::nullopt;
-  const auto& header = function.blocks[loop.header];
-
-  for (const auto& inst : header.instructions) {
-    if (inst.kind != InstKind::Phi) break;
-    if (!inst.has_result || inst.result_id < 0 || inst.result_type != Type::I32()) {
-      continue;
-    }
-
-    const PhiIncoming* initIncoming = nullptr;
-    std::vector<int> latchBlocks;
-    int canonicalUpdateResult = -1;
-    std::optional<int> canonicalStep;
-    bool valid = true;
-    std::vector<char> visiting(function.next_value_id, 0);
-
-    for (const auto& incoming : inst.incomings) {
-      if (incoming.pred_block == preheader) {
-        if (initIncoming != nullptr) {
-          valid = false;
-          break;
-        }
-        initIncoming = &incoming;
-        continue;
-      }
-
-      if (!incoming.value.isSSA()) {
-        valid = false;
-        break;
-      }
-
-      int updateBlock = -1;
-      const Instruction* updateInst = nullptr;
-      ValueRef updateValue =
-          resolveTrivialCopies(function, incoming.value, updateBlock, updateInst);
-      if (!updateValue.isSSA() || updateInst == nullptr ||
-          updateBlock != incoming.pred_block) {
-        valid = false;
-        break;
-      }
-
-      auto step = matchInductionStepForIncoming(function, loop, inst.result_id,
-                                                incoming.value, incoming.pred_block,
-                                                visiting);
-      if (!step.has_value()) {
-        valid = false;
-        break;
-      }
-
-      if (!canonicalStep.has_value()) {
-        canonicalStep = step;
-        canonicalUpdateResult = updateInst->result_id;
-      } else if (*canonicalStep != *step) {
-        valid = false;
-        break;
-      }
-      latchBlocks.push_back(incoming.pred_block);
-    }
-
-    if (!valid || initIncoming == nullptr || latchBlocks.empty() ||
-        !canonicalStep.has_value() || *canonicalStep == 0) {
-      continue;
-    }
-
-    int canonicalLatch = latchBlocks.front();
-    if (std::find(loop.latches.begin(), loop.latches.end(), canonicalLatch) ==
-        loop.latches.end()) {
-      canonicalLatch = loop.latches.empty() ? canonicalLatch : loop.latches.front();
-    }
-
-    return InductionVariableInfo{inst.result_id,        preheader,
-                                 loop.header,           canonicalLatch,
-                                 canonicalUpdateResult, *canonicalStep,
-                                 initIncoming->value,   latchBlocks};
-  }
-
-  return std::nullopt;
 }
 
 void rewriteAsIvPlusConstant(Instruction& inst, int baseValue, int delta) {
@@ -381,7 +184,7 @@ void rewriteAsIvPlusConstant(Instruction& inst, int baseValue, int delta) {
 }
 
 bool simplifyDerivedUsers(Function& function, const Loop& loop,
-                          const InductionVariableInfo& info) {
+                          const CanonicalInductionVariable& info) {
   bool changed = false;
 
   for (int blockIndex : loop.blocks) {
@@ -515,7 +318,7 @@ MemoryBaseKey analyzeMemoryBase(const Function& function, const ValueRef& value,
 
 std::optional<AffineIvExpr> matchAffineIvExprImpl(
     const Function& function, const Loop& loop, const std::vector<int>& defBlock,
-    const InductionVariableInfo& info, const ValueRef& value,
+    const CanonicalInductionVariable& info, const ValueRef& value,
     AffineMatchCache& cache) {
   if (auto constant = getConstantInt(value); constant.has_value()) {
     return AffineIvExpr{0, *constant};
@@ -577,7 +380,7 @@ std::optional<AffineIvExpr> matchAffineIvExprImpl(
 std::optional<AffineIvExpr> matchAffineIvExpr(const Function& function,
                                             const Loop& loop,
                                             const std::vector<int>& defBlock,
-                                            const InductionVariableInfo& info,
+                                            const CanonicalInductionVariable& info,
                                             const ValueRef& value,
                                             AffineMatchCache& cache) {
   return matchAffineIvExprImpl(function, loop, defBlock, info, value, cache);
@@ -675,7 +478,7 @@ bool allUsesStayInsideLoopTree(const Function& function, const LoopInfo& loopInf
 
 std::optional<AddressRecurrenceCandidate> matchAddressRecurrenceCandidate(
     const Function& function, const Loop& loop, const std::vector<int>& defBlock,
-    const InductionVariableInfo& info, const Instruction& inst,
+    const CanonicalInductionVariable& info, const Instruction& inst,
     AffineMatchCache& affineCache) {
   if (inst.kind != InstKind::Binary || inst.binary_op != ir::BinaryOp::Add ||
       !inst.has_result || inst.result_id < 0 || inst.operands.size() != 2 ||
@@ -709,7 +512,7 @@ std::optional<AddressRecurrenceCandidate> matchAddressRecurrenceCandidate(
 ValueRef materializeInitialAddress(Function& function, int preheaderBlock,
                                    int& insertIndex,
                                    const AddressRecurrenceCandidate& candidate,
-                                   const InductionVariableInfo& info) {
+                                   const CanonicalInductionVariable& info) {
   if (auto initInt = getConstantInt(info.init_value); initInt.has_value()) {
     const int initialDelta = (*initInt) * candidate.stride + candidate.bias;
     if (initialDelta == 0) return candidate.invariant_base;
@@ -775,7 +578,7 @@ ValueRef materializeStepAddress(Function& function, int latchBlock, int& insertI
 }
 
 bool rewriteAddressRecurrences(Function& function, const Loop& loop,
-                               const InductionVariableInfo& info,
+                               const CanonicalInductionVariable& info,
                                const LoopInfo& loopInfo) {
   const std::vector<int> defBlock = buildDefBlocks(function);
   std::vector<AddressRecurrenceCandidate> candidates;
@@ -906,7 +709,7 @@ PassResult IndVarSimplifyPass::run(Function& function,
   bool changed = false;
   for (int loopIndex : order) {
     const Loop& loop = loopInfo.loops[loopIndex];
-    auto info = matchInductionVariable(function, loop);
+    auto info = matchCanonicalInductionVariable(function, loop);
     if (!info.has_value()) continue;
     bool loopChanged = false;
     loopChanged = simplifyDerivedUsers(function, loop, *info) || loopChanged;

@@ -2,12 +2,32 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <numeric>
+#include <optional>
 #include <unordered_map>
+#include <vector>
 
 namespace midir {
 
 namespace {
+
+ValueRef resolveTrivialCopies(const Function& function, ValueRef value,
+                              int& blockIndexOut,
+                              const Instruction*& defInstOut);
+
+std::optional<int> getConstantInt(const ValueRef& value) {
+  if (value.kind == ValueRef::Kind::ImmediateInt) return value.int_value;
+  return std::nullopt;
+}
+
+std::optional<int> getConstantInt(const Function& function, ValueRef value) {
+  int blockIndex = -1;
+  const Instruction* defInst = nullptr;
+  ValueRef resolved = resolveTrivialCopies(function, value, blockIndex, defInst);
+  if (resolved.kind == ValueRef::Kind::ImmediateInt) return resolved.int_value;
+  return std::nullopt;
+}
 
 std::vector<int> collectNaturalLoop(const Function& function, int header,
                                     int latch) {
@@ -78,6 +98,157 @@ std::vector<int> collectExitingBlocks(const Function& function, const Loop& loop
   }
   std::sort(exiting.begin(), exiting.end());
   return exiting;
+}
+
+const Instruction* findDefInstruction(const Function& function, int valueId,
+                                      int& blockIndexOut) {
+  for (int blockIndex = 0; blockIndex < static_cast<int>(function.blocks.size());
+       ++blockIndex) {
+    for (const auto& inst : function.blocks[blockIndex].instructions) {
+      if (inst.has_result && inst.result_id == valueId) {
+        blockIndexOut = blockIndex;
+        return &inst;
+      }
+    }
+  }
+  blockIndexOut = -1;
+  return nullptr;
+}
+
+ValueRef resolveTrivialCopies(const Function& function, ValueRef value,
+                              int& blockIndexOut,
+                              const Instruction*& defInstOut) {
+  blockIndexOut = -1;
+  defInstOut = nullptr;
+  while (value.isSSA()) {
+    int currentBlock = -1;
+    const Instruction* defInst =
+        findDefInstruction(function, value.value_id, currentBlock);
+    if (defInst == nullptr) break;
+    if (defInst->kind != InstKind::Copy || defInst->operands.size() != 1) {
+      blockIndexOut = currentBlock;
+      defInstOut = defInst;
+      return value;
+    }
+    value = defInst->operands[0];
+  }
+  return value;
+}
+
+std::optional<int> matchInductionStep(const Instruction& updateInst, int phiValue) {
+  if (updateInst.kind != InstKind::Binary || !updateInst.has_result ||
+      updateInst.operands.size() != 2 || updateInst.operand_type != Type::I32() ||
+      updateInst.result_type != Type::I32()) {
+    return std::nullopt;
+  }
+
+  if (updateInst.binary_op == ir::BinaryOp::Add) {
+    if (updateInst.operands[0].isSSA() && updateInst.operands[0].value_id == phiValue) {
+      return getConstantInt(updateInst.operands[1]);
+    }
+    if (updateInst.operands[1].isSSA() && updateInst.operands[1].value_id == phiValue) {
+      return getConstantInt(updateInst.operands[0]);
+    }
+    return std::nullopt;
+  }
+
+  if (updateInst.binary_op == ir::BinaryOp::Sub) {
+    if (!(updateInst.operands[0].isSSA() && updateInst.operands[0].value_id == phiValue)) {
+      return std::nullopt;
+    }
+    auto constant = getConstantInt(updateInst.operands[1]);
+    if (!constant.has_value()) return std::nullopt;
+    return -*constant;
+  }
+
+  return std::nullopt;
+}
+
+std::optional<int> matchInductionStepForIncoming(const Function& function,
+                                                 const Loop& loop, int phiValue,
+                                                 const ValueRef& incomingValue,
+                                                 int incomingPred,
+                                                 std::vector<char>& visiting) {
+  if (!incomingValue.isSSA()) return std::nullopt;
+
+  int updateBlock = -1;
+  const Instruction* updateInst = nullptr;
+  ValueRef updateValue =
+      resolveTrivialCopies(function, incomingValue, updateBlock, updateInst);
+  if (!updateValue.isSSA() || updateInst == nullptr || updateBlock != incomingPred) {
+    return std::nullopt;
+  }
+
+  if (auto step = matchInductionStep(*updateInst, phiValue); step.has_value()) {
+    return step;
+  }
+
+  if (updateInst->kind != InstKind::Phi || updateInst->result_id < 0 ||
+      updateInst->result_id >= static_cast<int>(visiting.size())) {
+    return std::nullopt;
+  }
+  if (visiting[updateInst->result_id]) return std::nullopt;
+
+  visiting[updateInst->result_id] = 1;
+  std::optional<int> mergedStep;
+  for (const auto& incoming : updateInst->incomings) {
+    if (!loopContainsBlock(loop, incoming.pred_block)) {
+      visiting[updateInst->result_id] = 0;
+      return std::nullopt;
+    }
+    auto step = matchInductionStepForIncoming(function, loop, phiValue,
+                                              incoming.value, incoming.pred_block,
+                                              visiting);
+    if (!step.has_value()) {
+      visiting[updateInst->result_id] = 0;
+      return std::nullopt;
+    }
+    if (!mergedStep.has_value()) {
+      mergedStep = step;
+    } else if (*mergedStep != *step) {
+      visiting[updateInst->result_id] = 0;
+      return std::nullopt;
+    }
+  }
+  visiting[updateInst->result_id] = 0;
+  return mergedStep;
+}
+
+std::optional<int64_t> computeTripCountForPredicate(ir::BinaryOp compareOp, int64_t init,
+                                                    int64_t step, int64_t bound) {
+  if (step == 0) return std::nullopt;
+
+  switch (compareOp) {
+    case ir::BinaryOp::Lt:
+      if (step > 0) {
+        if (init >= bound) return int64_t{0};
+        return ((bound - init - 1) / step) + 1;
+      }
+      return std::nullopt;
+    case ir::BinaryOp::Le:
+      if (step > 0) {
+        if (init > bound) return int64_t{0};
+        return ((bound - init) / step) + 1;
+      }
+      return std::nullopt;
+    case ir::BinaryOp::Gt:
+      if (step < 0) {
+        const int64_t stride = -step;
+        if (init <= bound) return int64_t{0};
+        return ((init - bound - 1) / stride) + 1;
+      }
+      return std::nullopt;
+    case ir::BinaryOp::Ge:
+      if (step < 0) {
+        const int64_t stride = -step;
+        if (init < bound) return int64_t{0};
+        return ((init - bound) / stride) + 1;
+      }
+      return std::nullopt;
+    default:
+      break;
+  }
+  return std::nullopt;
 }
 
 }  // namespace
@@ -307,6 +478,184 @@ std::vector<int> getLoopExitBlocks(const Function& function, const Loop& loop) {
     }
   }
   return exits;
+}
+
+std::optional<CanonicalInductionVariable> matchCanonicalInductionVariable(
+    const Function& function, const Loop& loop) {
+  const int preheader = getLoopPreheader(function, loop);
+  if (preheader < 0) return std::nullopt;
+  const auto& header = function.blocks[loop.header];
+
+  for (const auto& inst : header.instructions) {
+    if (inst.kind != InstKind::Phi) break;
+    if (!inst.has_result || inst.result_id < 0 || inst.result_type != Type::I32()) {
+      continue;
+    }
+
+    const PhiIncoming* initIncoming = nullptr;
+    std::vector<int> latchBlocks;
+    int canonicalUpdateResult = -1;
+    std::optional<int> canonicalStep;
+    bool valid = true;
+    std::vector<char> visiting(function.next_value_id, 0);
+
+    for (const auto& incoming : inst.incomings) {
+      if (incoming.pred_block == preheader) {
+        if (initIncoming != nullptr) {
+          valid = false;
+          break;
+        }
+        initIncoming = &incoming;
+        continue;
+      }
+
+      if (!incoming.value.isSSA()) {
+        valid = false;
+        break;
+      }
+
+      int updateBlock = -1;
+      const Instruction* updateInst = nullptr;
+      ValueRef updateValue =
+          resolveTrivialCopies(function, incoming.value, updateBlock, updateInst);
+      if (!updateValue.isSSA() || updateInst == nullptr ||
+          updateBlock != incoming.pred_block) {
+        valid = false;
+        break;
+      }
+
+      auto step = matchInductionStepForIncoming(function, loop, inst.result_id,
+                                                incoming.value, incoming.pred_block,
+                                                visiting);
+      if (!step.has_value()) {
+        valid = false;
+        break;
+      }
+
+      if (!canonicalStep.has_value()) {
+        canonicalStep = step;
+        canonicalUpdateResult = updateInst->result_id;
+      } else if (*canonicalStep != *step) {
+        valid = false;
+        break;
+      }
+      latchBlocks.push_back(incoming.pred_block);
+    }
+
+    if (!valid || initIncoming == nullptr || latchBlocks.empty() ||
+        !canonicalStep.has_value() || *canonicalStep == 0) {
+      continue;
+    }
+
+    int canonicalLatch = latchBlocks.front();
+    if (std::find(loop.latches.begin(), loop.latches.end(), canonicalLatch) ==
+        loop.latches.end()) {
+      canonicalLatch = loop.latches.empty() ? canonicalLatch : loop.latches.front();
+    }
+
+    return CanonicalInductionVariable{inst.result_id,        preheader,
+                                      loop.header,           canonicalLatch,
+                                      canonicalUpdateResult, *canonicalStep,
+                                      initIncoming->value,   latchBlocks};
+  }
+
+  return std::nullopt;
+}
+
+LoopTripCountInfo analyzeLoopTripCount(const Function& function, const Loop& loop) {
+  LoopTripCountInfo info;
+  auto iv = matchCanonicalInductionVariable(function, loop);
+  if (!iv.has_value()) return info;
+  if (loop.exiting_blocks.size() != 1 || loop.exit_blocks.size() != 1) return info;
+
+  const int exitingBlock = loop.exiting_blocks.front();
+  const int exitBlock = loop.exit_blocks.front();
+  if (exitingBlock < 0 || exitingBlock >= static_cast<int>(function.blocks.size()) ||
+      exitBlock < 0 || exitBlock >= static_cast<int>(function.blocks.size())) {
+    return info;
+  }
+
+  const auto& block = function.blocks[exitingBlock];
+  if (block.instructions.empty()) return info;
+  const auto& term = block.instructions.back();
+  if (term.kind != InstKind::Branch || term.operands.size() != 1) return info;
+  if (!term.operands[0].isSSA()) return info;
+
+  int condDefBlock = -1;
+  const Instruction* condInst = nullptr;
+  ValueRef resolvedCond =
+      resolveTrivialCopies(function, term.operands[0], condDefBlock, condInst);
+  if (!resolvedCond.isSSA() || condInst == nullptr || condDefBlock != exitingBlock ||
+      condInst->kind != InstKind::Binary || condInst->operands.size() != 2 ||
+      (condInst->result_type != Type::I32() && condInst->result_type != Type::I1()) ||
+      condInst->operand_type != Type::I32()) {
+    return info;
+  }
+
+  ValueRef ivOperand = ValueRef::Invalid();
+  ValueRef boundOperand = ValueRef::Invalid();
+  bool canonicalDirection = true;
+  if (condInst->operands[0].isSSA() && condInst->operands[0].value_id == iv->phi_value) {
+    ivOperand = condInst->operands[0];
+    boundOperand = condInst->operands[1];
+  } else if (condInst->operands[1].isSSA() &&
+             condInst->operands[1].value_id == iv->phi_value) {
+    ivOperand = condInst->operands[1];
+    boundOperand = condInst->operands[0];
+    canonicalDirection = false;
+  } else {
+    return info;
+  }
+
+  ir::BinaryOp compareOp = condInst->binary_op;
+  if (!canonicalDirection) {
+    switch (compareOp) {
+      case ir::BinaryOp::Lt:
+        compareOp = ir::BinaryOp::Gt;
+        break;
+      case ir::BinaryOp::Le:
+        compareOp = ir::BinaryOp::Ge;
+        break;
+      case ir::BinaryOp::Gt:
+        compareOp = ir::BinaryOp::Lt;
+        break;
+      case ir::BinaryOp::Ge:
+        compareOp = ir::BinaryOp::Le;
+        break;
+      default:
+        return info;
+    }
+  }
+
+  const bool continueOnTrue =
+      function.block_index_by_name.at(term.true_target) != exitBlock;
+  const auto init = getConstantInt(function, iv->init_value);
+  const auto bound = getConstantInt(function, boundOperand);
+
+  info.is_finite = false;
+  info.has_constant_trip_count = false;
+  info.trip_count = 0;
+  info.compare_block = exitingBlock;
+  info.exiting_block = exitingBlock;
+  info.exit_block = exitBlock;
+  info.condition_value = condInst->result_id;
+  info.bound_value = boundOperand;
+  info.compare_op = compareOp;
+  info.continue_on_true = continueOnTrue;
+
+  if (!continueOnTrue) return info;
+  if (!init.has_value() || !bound.has_value()) return info;
+
+  auto tripCount = computeTripCountForPredicate(compareOp, *init, iv->step, *bound);
+  if (!tripCount.has_value() || *tripCount < 0 ||
+      *tripCount > std::numeric_limits<int>::max()) {
+    return info;
+  }
+
+  info.is_finite = true;
+  info.has_constant_trip_count = true;
+  info.trip_count = static_cast<int>(*tripCount);
+  return info;
 }
 
 }  // namespace midir

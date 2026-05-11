@@ -2,6 +2,7 @@
 #include "optimizer_utils.h"
 
 #include <algorithm>
+#include <vector>
 
 namespace midir {
 
@@ -182,6 +183,58 @@ bool trySimplifyIdentity(Instruction& inst) {
   return false;
 }
 
+ValueRef resolveLocalReplacement(ValueRef value,
+                                 const std::vector<ValueRef>& replacements) {
+  while (value.isSSA() && value.value_id >= 0 &&
+         value.value_id < static_cast<int>(replacements.size()) &&
+         replacements[value.value_id].isValid()) {
+    ValueRef next = replacements[value.value_id];
+    if (next.type != value.type) break;
+    if (next.isSSA() && next.value_id == value.value_id) break;
+    value = next;
+  }
+  return value;
+}
+
+bool tryPropagateCopies(Function& function) {
+  bool changed = false;
+  std::vector<ValueRef> replacements(function.next_value_id, ValueRef::Invalid());
+  for (auto& block : function.blocks) {
+    for (auto& inst : block.instructions) {
+      for (auto& operand : inst.operands) {
+        ValueRef resolved = resolveLocalReplacement(operand, replacements);
+        if (!(resolved.kind == operand.kind && resolved.value_id == operand.value_id &&
+              resolved.int_value == operand.int_value &&
+              resolved.float_value == operand.float_value &&
+              resolved.symbol == operand.symbol &&
+              resolved.frame_offset == operand.frame_offset &&
+              resolved.type == operand.type)) {
+          operand = resolved;
+          changed = true;
+        }
+      }
+      for (auto& incoming : inst.incomings) {
+        ValueRef resolved = resolveLocalReplacement(incoming.value, replacements);
+        if (!(resolved.kind == incoming.value.kind &&
+              resolved.value_id == incoming.value.value_id &&
+              resolved.int_value == incoming.value.int_value &&
+              resolved.float_value == incoming.value.float_value &&
+              resolved.symbol == incoming.value.symbol &&
+              resolved.frame_offset == incoming.value.frame_offset &&
+              resolved.type == incoming.value.type)) {
+          incoming.value = resolved;
+          changed = true;
+        }
+      }
+      if (inst.has_result && inst.result_id >= 0 && inst.kind == InstKind::Copy &&
+          inst.operands.size() == 1) {
+        replacements[inst.result_id] = inst.operands[0];
+      }
+    }
+  }
+  return changed;
+}
+
 }  // namespace
 
 std::string InstCombinePass::name() const { return "instcombine"; }
@@ -189,6 +242,7 @@ std::string InstCombinePass::name() const { return "instcombine"; }
 PassResult InstCombinePass::run(Function& function,
                                 AnalysisManager& analysisManager) {
   bool changed = false;
+  changed = tryPropagateCopies(function) || changed;
   for (auto& block : function.blocks) {
     for (auto& inst : block.instructions) {
       changed = tryCanonicalizeCommutative(inst) || changed;
@@ -208,6 +262,7 @@ PassResult InstCombinePass::run(Function& function,
       }
     }
   }
+  changed = tryPropagateCopies(function) || changed;
   if (changed) {
     analysisManager.invalidate(function);
   }

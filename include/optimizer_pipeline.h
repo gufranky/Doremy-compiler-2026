@@ -51,6 +51,18 @@ class LoopSimplifyPass : public FunctionPass {
   PassResult run(Function& function, AnalysisManager& analysisManager) override;
 };
 
+class LoopRotatePass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
+class SimpleLoopUnrollPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
 class LCSSAPass : public FunctionPass {
  public:
   std::string name() const override;

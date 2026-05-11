@@ -129,7 +129,7 @@ int main(int argc, char** argv) {
     midir::MidIRBuilder midirBuilder;
     midir::Module midirModule = midirBuilder.build(root);
 
-    if (options.midirBuildOnly || options.stopAfterSSA) {
+    if (options.midirBuildOnly) {
       std::ofstream output(options.outputFile, std::ios::binary);
       if (!output) {
         std::cerr << "Error: Cannot open output file " << options.outputFile
@@ -147,11 +147,14 @@ int main(int argc, char** argv) {
       passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
       passManager.addFunctionPass(std::make_unique<midir::SimplifyCFGPass>());
       passManager.addFunctionPass(std::make_unique<midir::LoopSimplifyPass>());
+      passManager.addFunctionPass(std::make_unique<midir::LoopRotatePass>());
+      passManager.addFunctionPass(std::make_unique<midir::LoopSimplifyPass>());
       passManager.addFunctionPass(std::make_unique<midir::LCSSAPass>());
       passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
       passManager.addFunctionPass(std::make_unique<midir::LICMPass>());
       passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
       passManager.addFunctionPass(std::make_unique<midir::IndVarSimplifyPass>());
+      passManager.addFunctionPass(std::make_unique<midir::SimpleLoopUnrollPass>());
       passManager.addFunctionPass(std::make_unique<midir::InstCombinePass>());
       passManager.addFunctionPass(std::make_unique<midir::EarlyCSEPass>());
       passManager.addFunctionPass(std::make_unique<midir::ADCEPass>());
@@ -163,6 +166,19 @@ int main(int argc, char** argv) {
         delete root;
         return 1;
       }
+    }
+
+    if (options.stopAfterSSA) {
+      std::ofstream output(options.outputFile, std::ios::binary);
+      if (!output) {
+        std::cerr << "Error: Cannot open output file " << options.outputFile
+                  << "\n";
+        delete root;
+        return 1;
+      }
+      output << midir::dumpModule(midirModule);
+      delete root;
+      return 0;
     }
 
     midir::LowerMidIR lowerMidIR;
