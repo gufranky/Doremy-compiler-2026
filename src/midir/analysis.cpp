@@ -15,6 +15,9 @@ namespace {
 ValueRef resolveTrivialCopies(const Function& function, ValueRef value,
                               int& blockIndexOut,
                               const Instruction*& defInstOut);
+bool loopContainsBlock(const Loop& loop, int block);
+const Instruction* findDefInstruction(const Function& function, int valueId,
+                                      int& blockIndexOut);
 
 std::optional<int> getConstantInt(const ValueRef& value) {
   if (value.kind == ValueRef::Kind::ImmediateInt) return value.int_value;
@@ -27,6 +30,126 @@ std::optional<int> getConstantInt(const Function& function, ValueRef value) {
   ValueRef resolved = resolveTrivialCopies(function, value, blockIndex, defInst);
   if (resolved.kind == ValueRef::Kind::ImmediateInt) return resolved.int_value;
   return std::nullopt;
+}
+
+std::vector<int> buildDefBlocks(const Function& function) {
+  std::vector<int> defBlock(function.next_value_id, -1);
+  for (int blockIndex = 0; blockIndex < static_cast<int>(function.blocks.size());
+       ++blockIndex) {
+    for (const auto& inst : function.blocks[blockIndex].instructions) {
+      if (inst.has_result && inst.result_id >= 0 &&
+          inst.result_id < static_cast<int>(defBlock.size())) {
+        defBlock[inst.result_id] = blockIndex;
+      }
+    }
+  }
+  return defBlock;
+}
+
+bool isParameterValue(const Function& function, int valueId) {
+  return std::find(function.params.begin(), function.params.end(), valueId) !=
+         function.params.end();
+}
+
+bool isLoopInvariantValue(const Function& function, const Loop& loop,
+                          const std::vector<int>& defBlock, int valueId,
+                          std::vector<char>& visiting) {
+  if (valueId < 0 || valueId >= static_cast<int>(defBlock.size())) return false;
+  const int blockIndex = defBlock[valueId];
+  if (blockIndex < 0) return isParameterValue(function, valueId);
+  if (!loopContainsBlock(loop, blockIndex)) return true;
+  if (visiting[valueId]) return false;
+
+  int defBlockIndex = -1;
+  const Instruction* def = findDefInstruction(function, valueId, defBlockIndex);
+  if (def == nullptr) return false;
+  switch (def->kind) {
+    case InstKind::Binary:
+    case InstKind::Unary:
+    case InstKind::Copy:
+      break;
+    default:
+      return false;
+  }
+
+  visiting[valueId] = 1;
+  for (const auto& operand : def->operands) {
+    if (!operand.isSSA()) continue;
+    if (!isLoopInvariantValue(function, loop, defBlock, operand.value_id, visiting)) {
+      visiting[valueId] = 0;
+      return false;
+    }
+  }
+  visiting[valueId] = 0;
+  return true;
+}
+
+bool isLoopInvariantOperand(const Function& function, const Loop& loop,
+                            const std::vector<int>& defBlock,
+                            const ValueRef& value) {
+  if (!value.isSSA()) return true;
+  std::vector<char> visiting(function.next_value_id, 0);
+  return isLoopInvariantValue(function, loop, defBlock, value.value_id, visiting);
+}
+
+std::optional<int> foldConstantInt(const Function& function, const Loop& loop,
+                                   const std::vector<int>& defBlock,
+                                   const ValueRef& value,
+                                   std::vector<char>& visiting) {
+  auto constant = getConstantInt(function, value);
+  if (constant.has_value()) return constant;
+  if (!value.isSSA()) return std::nullopt;
+  if (value.value_id < 0 || value.value_id >= static_cast<int>(visiting.size())) {
+    return std::nullopt;
+  }
+  if (!isLoopInvariantOperand(function, loop, defBlock, value)) return std::nullopt;
+  if (visiting[value.value_id]) return std::nullopt;
+
+  int defBlockIndex = -1;
+  const Instruction* def = findDefInstruction(function, value.value_id, defBlockIndex);
+  if (def == nullptr) return std::nullopt;
+
+  visiting[value.value_id] = 1;
+  std::optional<int> result;
+  if (def->kind == InstKind::Copy && def->operands.size() == 1) {
+    result = foldConstantInt(function, loop, defBlock, def->operands[0], visiting);
+  } else if (def->kind == InstKind::Unary && def->operands.size() == 1 &&
+             def->operand_type == Type::I32() && def->result_type == Type::I32()) {
+    auto operand = foldConstantInt(function, loop, defBlock, def->operands[0], visiting);
+    if (operand.has_value()) {
+      switch (def->unary_op) {
+        case ir::UnaryOp::Plus:
+          result = *operand;
+          break;
+        case ir::UnaryOp::Neg:
+          result = -*operand;
+          break;
+        default:
+          break;
+      }
+    }
+  } else if (def->kind == InstKind::Binary && def->operands.size() == 2 &&
+             def->operand_type == Type::I32() && def->result_type == Type::I32()) {
+    auto lhs = foldConstantInt(function, loop, defBlock, def->operands[0], visiting);
+    auto rhs = foldConstantInt(function, loop, defBlock, def->operands[1], visiting);
+    if (lhs.has_value() && rhs.has_value()) {
+      switch (def->binary_op) {
+        case ir::BinaryOp::Add:
+          result = *lhs + *rhs;
+          break;
+        case ir::BinaryOp::Sub:
+          result = *lhs - *rhs;
+          break;
+        case ir::BinaryOp::Mul:
+          result = *lhs * *rhs;
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  visiting[value.value_id] = 0;
+  return result;
 }
 
 std::vector<int> collectNaturalLoop(const Function& function, int header,
@@ -629,8 +752,31 @@ LoopTripCountInfo analyzeLoopTripCount(const Function& function, const Loop& loo
 
   const bool continueOnTrue =
       function.block_index_by_name.at(term.true_target) != exitBlock;
-  const auto init = getConstantInt(function, iv->init_value);
-  const auto bound = getConstantInt(function, boundOperand);
+  if (!continueOnTrue) {
+    switch (compareOp) {
+      case ir::BinaryOp::Lt:
+        compareOp = ir::BinaryOp::Ge;
+        break;
+      case ir::BinaryOp::Le:
+        compareOp = ir::BinaryOp::Gt;
+        break;
+      case ir::BinaryOp::Gt:
+        compareOp = ir::BinaryOp::Le;
+        break;
+      case ir::BinaryOp::Ge:
+        compareOp = ir::BinaryOp::Lt;
+        break;
+      default:
+        return info;
+    }
+  }
+
+  const auto defBlock = buildDefBlocks(function);
+  std::vector<char> foldVisiting(function.next_value_id, 0);
+  const auto init = foldConstantInt(function, loop, defBlock, iv->init_value, foldVisiting);
+  std::fill(foldVisiting.begin(), foldVisiting.end(), 0);
+  const auto bound =
+      foldConstantInt(function, loop, defBlock, boundOperand, foldVisiting);
 
   info.is_finite = false;
   info.has_constant_trip_count = false;
