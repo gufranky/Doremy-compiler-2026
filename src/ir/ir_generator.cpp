@@ -102,6 +102,7 @@ IRProgram IRGenerator::generate(CompUnit* root) {
       declareLocalValue(paramPtr->name, binding);
       current_->params.push_back(reg);
       current_->paramTypes.push_back(toIRValueType(paramPtr->type));
+      current_->paramIsArray.push_back(paramPtr->type.isArray);
     }
 
     genBlock(func->body.get());
@@ -520,19 +521,32 @@ IRGenerator::ExprResult IRGenerator::genExprResult(
       return ExprResult{Type::Int(), genLogical(binary)};
     }
 
-    ExprResult lhs = genExprResult(binary->left.get(), debugNames);
-    ExprResult rhs = genExprResult(binary->right.get(), debugNames);
+    std::vector<BinaryExpr*> chain;
+    BinaryExpr* cur = binary;
+    while (true) {
+      chain.push_back(cur);
+      auto* leftBin = dynamic_cast<BinaryExpr*>(cur->left.get());
+      if (!leftBin) break;
+      cur = leftBin;
+    }
 
-    Type operandType = commonNumericType(lhs.type, rhs.type);
-    lhs = castExprResult(lhs, operandType);
-    rhs = castExprResult(rhs, operandType);
+    ExprResult lhs = genExprResult(cur->left.get(), debugNames);
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+      BinaryExpr* bin = *it;
+      ExprResult rhs = genExprResult(bin->right.get(), debugNames);
 
-    Type resultType = isRelationalOp(binary->op) ? Type::Int() : operandType;
-    int dest = newVReg();
-    current_->append<BinaryInst>(toBinaryOp(binary->op), toIRValueType(operandType),
-                                 toIRValueType(resultType), dest, lhs.operand,
-                                 rhs.operand);
-    return ExprResult{resultType, Operand::VReg(dest, toIRValueType(resultType))};
+      Type operandType = commonNumericType(lhs.type, rhs.type);
+      lhs = castExprResult(lhs, operandType);
+      rhs = castExprResult(rhs, operandType);
+
+      Type resultType = isRelationalOp(bin->op) ? Type::Int() : operandType;
+      int dest = newVReg();
+      current_->append<BinaryInst>(toBinaryOp(bin->op), toIRValueType(operandType),
+                                   toIRValueType(resultType), dest, lhs.operand,
+                                   rhs.operand);
+      lhs = ExprResult{resultType, Operand::VReg(dest, toIRValueType(resultType))};
+    }
+    return lhs;
   }
   return ExprResult{Type::Int(), Operand::Imm(0)};
 }

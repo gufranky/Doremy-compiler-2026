@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <unordered_set>
 #include <cstring>
 #include <set>
 #include <sstream>
@@ -23,6 +24,15 @@ inline std::string trim(const std::string& s) {
   size_t e = s.size();
   while (e > b && (s[e-1] == ' ' || s[e-1] == '\t')) e--;
   return s.substr(b, e - b);
+}
+
+inline bool parseIntStrict(const std::string& text, int& out) {
+  try {
+    out = std::stoi(text);
+    return true;
+  } catch (...) {
+    return false;
+  }
 }
 
 inline bool isLabelLine(const std::string& line) {
@@ -128,7 +138,7 @@ std::vector<std::string> optimizeMoveChains(const std::vector<std::string>& line
   return result;
 }
 
-// Remove store followed by load of same location to same register
+// Remove only trivial store/load pairs in the same straight-line block.
 std::vector<std::string> optimizeLoadStore(const std::vector<std::string>& lines) {
   std::vector<std::string> result;
   result.reserve(lines.size());
@@ -140,7 +150,8 @@ std::vector<std::string> optimizeLoadStore(const std::vector<std::string>& lines
       continue;
     }
 
-    // Pattern: sw rX, offset(base) followed by lw rX, offset(base)
+    // Pattern: sw rX, offset(base) followed immediately by lw rX, offset(base)
+    // Only safe for exact adjacent pair with no intervening control flow.
     if (startsWith(t, "sw ") && i + 1 < lines.size()) {
       std::string next = trim(lines[i + 1]);
       if (isFloatAsmLine(next)) {
@@ -207,10 +218,10 @@ std::vector<std::string> optimizeRedundantOps(const std::vector<std::string>& li
           if (rs == "x0") {
             std::string rd = trim(t.substr(5, comma1 - 5));
             std::string immStr = trim(rest.substr(comma2 + 1));
-            try {
-              int imm = std::stoi(immStr);
+            int imm = 0;
+            if (parseIntStrict(immStr, imm)) {
               knownValues[rd] = imm;
-            } catch (...) {}
+            }
           }
         }
       }
@@ -367,7 +378,7 @@ std::vector<std::string> optimizeSmallConstLoops(const std::vector<std::string>&
         if (c2 == std::string::npos) continue;
         std::string rs = trim(rest.substr(0, c2));
         std::string immS = trim(rest.substr(c2 + 1));
-        try { bound = std::stoi(immS); } catch (...) { continue; }
+        if (!parseIntStrict(immS, bound)) continue;
         if (bound <= 0 || bound > 16) continue;
         sltiIdx = k;
         condReg = rd;
@@ -420,7 +431,7 @@ std::vector<std::string> optimizeSmallConstLoops(const std::vector<std::string>&
             std::string pimm = trim(prest.substr(pc2 + 1));
             
             if (prd == rs2 && prs == "x0") {
-              try { bound = std::stoi(pimm); } catch (...) { continue; }
+              if (!parseIntStrict(pimm, bound)) continue;
               if (bound <= 0 || bound > 16) { bound = -1; continue; }
               
               sltiIdx = k;
@@ -1002,9 +1013,9 @@ std::string CodeGen::binOpMnemonic(BinaryOp op, ValueType type) const {
   std::string w = isW ? "w" : "";
   switch (op) {
     case BinaryOp::Add:
-      return "add";
+      return "add" + w;
     case BinaryOp::Sub:
-      return "sub";
+      return "sub" + w;
     case BinaryOp::Mul:
       return "mul" + w;
     case BinaryOp::Div:
@@ -1612,6 +1623,43 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
                                std::vector<std::string>& out) {
   (void)liveness;
   const std::vector<std::string> scratchRegs = {"t5", "t6"};
+  std::unordered_set<int> addressVRegs;
+  auto seedAddressOperand = [&](const Operand& op) -> bool {
+    if (op.isLocalVarAddr() || op.isGlobal() || op.isStackPtr()) return true;
+    if (!op.isVReg()) return false;
+    return addressVRegs.find(op.vregId) != addressVRegs.end();
+  };
+
+  for (size_t i = 0; i < fn.params.size(); ++i) {
+    if (i < fn.paramIsArray.size() && fn.paramIsArray[i]) {
+      addressVRegs.insert(fn.params[i]);
+    }
+  }
+  for (const auto& inst : fn.instructions) {
+    switch (inst->kind) {
+      case InstKind::Copy: {
+        auto* c = static_cast<const CopyInst*>(inst.get());
+        if (c->src.isLocalVarAddr()) {
+          addressVRegs.insert(c->dest);
+        } else if (c->src.isVReg() &&
+                   addressVRegs.find(c->src.vregId) != addressVRegs.end()) {
+          addressVRegs.insert(c->dest);
+        }
+        break;
+      }
+      case InstKind::Binary: {
+        auto* b = static_cast<const BinaryInst*>(inst.get());
+        bool lhsIsAddr = seedAddressOperand(b->lhs);
+        bool rhsIsAddr = seedAddressOperand(b->rhs);
+        if (b->op == BinaryOp::Add && (lhsIsAddr || rhsIsAddr)) {
+          addressVRegs.insert(b->dest);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
 
   auto mangleLabel = [&](const std::string& lbl) {
     return fn.name + "_" + lbl;
@@ -1625,6 +1673,10 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       }
     }
     return std::string("t6");
+  };
+
+  auto isAddressOperand = [&](const Operand& op) -> bool {
+    return seedAddressOperand(op);
   };
 
   auto loadOperandInto = [&](const Operand& op, const std::string& targetReg,
@@ -1813,6 +1865,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
     int scratchIdx = 0;
     std::vector<std::string> insns;
     ValueType paramType = i < fn.paramTypes.size() ? fn.paramTypes[i] : ValueType::I32;
+    bool paramIsAddr = i < fn.paramIsArray.size() && fn.paramIsArray[i];
     ArgLocation loc = classifyArgLocation(paramType, incomingIntRegCount,
                                           incomingFloatRegCount, incomingStackCount);
 
@@ -1840,7 +1893,13 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       if (it != allocation.end()) {
         std::string dst = RISCVRegMap::physicalRegName(it->second);
         if (dst != srcReg) {
-          insns.push_back("\taddi " + dst + ", " + srcReg + ", 0");
+          if (paramIsAddr) {
+            insns.push_back("\taddi " + dst + ", " + srcReg + ", 0");
+          } else if (paramType == ValueType::I32) {
+            insns.push_back("\taddiw " + dst + ", " + srcReg + ", 0");
+          } else {
+            insns.push_back("\taddi " + dst + ", " + srcReg + ", 0");
+          }
         }
       } else {
         storeIncomingParam(vreg, srcReg, insns, {srcReg});
@@ -1904,6 +1963,8 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           std::vector<std::string> reservedRegs{lhs, rhs};
           destReg = chooseScratch(reservedRegs);
         }
+        bool use64BitAddrMath = isAddressOperand(b->lhs) || isAddressOperand(b->rhs) ||
+                                addressVRegs.find(b->dest) != addressVRegs.end();
 
         switch (b->op) {
           case BinaryOp::Eq:
@@ -1927,24 +1988,33 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
             break;
           case BinaryOp::Add:
             if (b->rhs.isImm() && isInt12(b->rhs.immValue)) {
-              insns.push_back("\taddi " + destReg + ", " + lhs + ", " +
-                              std::to_string(b->rhs.immValue));
+              std::string addiOp =
+                  (b->operandType == ValueType::I32 && !use64BitAddrMath) ? "addiw" : "addi";
+              insns.push_back("\t" + addiOp + " " + destReg + ", " + lhs +
+                              ", " + std::to_string(b->rhs.immValue));
             } else if (b->lhs.isImm() && isInt12(b->lhs.immValue)) {
-              insns.push_back("\taddi " + destReg + ", " + rhs + ", " +
-                              std::to_string(b->lhs.immValue));
+              std::string addiOp =
+                  (b->operandType == ValueType::I32 && !use64BitAddrMath) ? "addiw" : "addi";
+              insns.push_back("\t" + addiOp + " " + destReg + ", " + rhs +
+                              ", " + std::to_string(b->lhs.immValue));
             } else {
-              insns.push_back("\tadd " + destReg + ", " + lhs + ", " + rhs);
+              std::string addOp =
+                  (b->operandType == ValueType::I32 && !use64BitAddrMath) ? "addw" : "add";
+              insns.push_back("\t" + addOp + " " + destReg + ", " + lhs +
+                              ", " + rhs);
             }
             break;
           case BinaryOp::Mul:
             if (b->rhs.isImm() && b->rhs.immValue > 0 &&
                 (b->rhs.immValue & (b->rhs.immValue - 1)) == 0) {
-              std::string shiftOp = b->operandType == ValueType::I32 ? "slliw" : "slli";
+              std::string shiftOp =
+                  (b->operandType == ValueType::I32 && !use64BitAddrMath) ? "slliw" : "slli";
               insns.push_back("\t" + shiftOp + " " + destReg + ", " + lhs + ", " +
                               std::to_string(__builtin_ctz(b->rhs.immValue)));
             } else if (b->lhs.isImm() && b->lhs.immValue > 0 &&
                        (b->lhs.immValue & (b->lhs.immValue - 1)) == 0) {
-              std::string shiftOp = b->operandType == ValueType::I32 ? "slliw" : "slli";
+              std::string shiftOp =
+                  (b->operandType == ValueType::I32 && !use64BitAddrMath) ? "slliw" : "slli";
               insns.push_back("\t" + shiftOp + " " + destReg + ", " + rhs + ", " +
                               std::to_string(__builtin_ctz(b->lhs.immValue)));
             } else {
@@ -2004,13 +2074,23 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
 
         switch (u->op) {
           case UnaryOp::Neg:
-            insns.push_back("\tsub " + destReg + ", x0, " + opnd);
+            if (u->operandType == ValueType::I32) {
+              insns.push_back("\tsubw " + destReg + ", x0, " + opnd);
+            } else {
+              insns.push_back("\tsub " + destReg + ", x0, " + opnd);
+            }
             break;
           case UnaryOp::Not:
             insns.push_back("\tsltiu " + destReg + ", " + opnd + ", 1");
             break;
           case UnaryOp::Plus:
-            insns.push_back("\taddi " + destReg + ", " + opnd + ", 0");
+            if (u->operandType == ValueType::I32 &&
+                addressVRegs.find(u->dest) == addressVRegs.end() &&
+                !isAddressOperand(u->operand)) {
+              insns.push_back("\taddiw " + destReg + ", " + opnd + ", 0");
+            } else {
+              insns.push_back("\taddi " + destReg + ", " + opnd + ", 0");
+            }
             break;
         }
         storeCurrentValue(u->dest, destReg, insns);
@@ -2039,7 +2119,13 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
         auto it = allocation.find(c->dest);
         if (it != allocation.end()) {
           std::string dst = RISCVRegMap::physicalRegName(it->second);
-          insns.push_back("\taddi " + dst + ", " + src + ", 0");
+          if (c->destType == ValueType::I32 &&
+              addressVRegs.find(c->dest) == addressVRegs.end() &&
+              !isAddressOperand(c->src)) {
+            insns.push_back("\taddiw " + dst + ", " + src + ", 0");
+          } else {
+            insns.push_back("\taddi " + dst + ", " + src + ", 0");
+          }
         } else {
           storeCurrentValue(c->dest, src, insns, {src});
         }
@@ -2123,7 +2209,13 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           if (loc.useIntReg) {
             std::string target = "a" + std::to_string(loc.regIndex);
             if (argReg != target) {
-              insns.push_back("\taddi " + target + ", " + argReg + ", 0");
+              if (isAddressOperand(c->args[ai])) {
+                insns.push_back("\taddi " + target + ", " + argReg + ", 0");
+              } else if (argType == ValueType::I32) {
+                insns.push_back("\taddiw " + target + ", " + argReg + ", 0");
+              } else {
+                insns.push_back("\taddi " + target + ", " + argReg + ", 0");
+              }
             }
           } else {
             int offset = frame.outgoingArgOffset + loc.stackIndex * 8;
@@ -2132,16 +2224,6 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
         }
 
         insns.push_back("\tcall " + c->callee);
-
-        for (const auto& reg : frame.callerSavedRegs) {
-          if (!destRegName.empty() && reg == destRegName) {
-            continue;
-          }
-          auto itSlot = frame.callerSavedSlots.find(reg);
-          if (itSlot != frame.callerSavedSlots.end()) {
-            emitStackLoad64(reg, itSlot->second, insns, reg);
-          }
-        }
 
         if (c->hasDest) {
           if (isFloatValueType(c->resultType)) {
@@ -2158,10 +2240,25 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
             auto it = allocation.find(c->dest);
             if (it != allocation.end()) {
               std::string dst = RISCVRegMap::physicalRegName(it->second);
-              insns.push_back("\taddi " + dst + ", a0, 0");
+              if (addressVRegs.find(c->dest) == addressVRegs.end() &&
+                  c->resultType == ValueType::I32) {
+                insns.push_back("\taddiw " + dst + ", a0, 0");
+              } else {
+                insns.push_back("\taddi " + dst + ", a0, 0");
+              }
             } else {
               storeCurrentValue(c->dest, "a0", insns, {"a0"});
             }
+          }
+        }
+
+        for (const auto& reg : frame.callerSavedRegs) {
+          if (!destRegName.empty() && reg == destRegName) {
+            continue;
+          }
+          auto itSlot = frame.callerSavedSlots.find(reg);
+          if (itSlot != frame.callerSavedSlots.end()) {
+            emitStackLoad64(reg, itSlot->second, insns, reg);
           }
         }
 
@@ -2175,7 +2272,11 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           } else {
             std::string valReg = loadOperand(r->value, scratchIdx, insns);
             if (valReg != "a0") {
-              insns.push_back("\taddi a0, " + valReg + ", 0");
+              if (r->valueType == ValueType::I32) {
+                insns.push_back("\taddiw a0, " + valReg + ", 0");
+              } else {
+                insns.push_back("\taddi a0, " + valReg + ", 0");
+              }
             }
           }
         }
