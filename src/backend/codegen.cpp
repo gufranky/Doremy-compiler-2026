@@ -913,40 +913,155 @@ std::vector<std::string> optimizeLiMv(const std::vector<std::string>& lines) {
 
   for (size_t i = 0; i < lines.size(); ++i) {
     std::string t = trim(lines[i]);
-    if (isFloatAsmLine(t)) {
+
+    // Pattern: li rd, imm; mv dst, rd -> li dst, imm
+    if (startsWith(t, "li ") && i + 1 < lines.size()) {
+      std::string next = trim(lines[i + 1]);
+      if (startsWith(next, "mv ")) {
+        std::string liRest = trim(t.substr(3));
+        size_t lc = liRest.find(',');
+        if (lc != std::string::npos) {
+          std::string rd = trim(liRest.substr(0, lc));
+          std::string imm = trim(liRest.substr(lc + 1));
+
+          std::string mvRest = trim(next.substr(3));
+          size_t mc = mvRest.find(',');
+          if (mc != std::string::npos) {
+            std::string mvDest = trim(mvRest.substr(0, mc));
+            std::string mvSrc = trim(mvRest.substr(mc + 1));
+
+            if (mvSrc == rd && mvDest != rd) {
+              result.push_back("\tli " + mvDest + ", " + imm);
+              i++;
+              continue;
+            }
+          }
+        }
+      }
+    }
+
+    result.push_back(lines[i]);
+  }
+
+  return result;
+}
+
+std::vector<std::string> optimizeCompareBranch(const std::vector<std::string>& lines) {
+  std::vector<std::string> result;
+  result.reserve(lines.size());
+
+  auto parseThreeRegs = [](const std::string& text, std::string& rd,
+                           std::string& rs1, std::string& rs2) -> bool {
+    size_t c1 = text.find(',');
+    if (c1 == std::string::npos) return false;
+    rd = trim(text.substr(0, c1));
+    std::string rest = trim(text.substr(c1 + 1));
+    size_t c2 = rest.find(',');
+    if (c2 == std::string::npos) return false;
+    rs1 = trim(rest.substr(0, c2));
+    rs2 = trim(rest.substr(c2 + 1));
+    return !rd.empty() && !rs1.empty() && !rs2.empty();
+  };
+
+  auto parseTwoRegsLabel = [](const std::string& text, std::string& rs1,
+                              std::string& rs2, std::string& label) -> bool {
+    size_t c1 = text.find(',');
+    if (c1 == std::string::npos) return false;
+    rs1 = trim(text.substr(0, c1));
+    std::string rest = trim(text.substr(c1 + 1));
+    size_t c2 = rest.find(',');
+    if (c2 == std::string::npos) return false;
+    rs2 = trim(rest.substr(0, c2));
+    label = trim(rest.substr(c2 + 1));
+    return !rs1.empty() && !rs2.empty() && !label.empty();
+  };
+
+  auto parseAddiMove = [](const std::string& text, std::string& dst,
+                          std::string& src) -> bool {
+    if (!startsWith(text, "addi ") && !startsWith(text, "addiw ")) return false;
+    std::string rest = trim(startsWith(text, "addi ") ? text.substr(5) : text.substr(6));
+    size_t c1 = rest.find(',');
+    if (c1 == std::string::npos) return false;
+    dst = trim(rest.substr(0, c1));
+    rest = trim(rest.substr(c1 + 1));
+    size_t c2 = rest.find(',');
+    if (c2 == std::string::npos) return false;
+    src = trim(rest.substr(0, c2));
+    std::string imm = trim(rest.substr(c2 + 1));
+    return imm == "0" && !dst.empty() && !src.empty();
+  };
+
+  auto emitBranch = [&](const std::string& cmpKind, const std::string& lhs,
+                        const std::string& rhs, const std::string& label) {
+    if (cmpKind == "lt") result.push_back("\tblt " + lhs + ", " + rhs + ", " + label);
+    else if (cmpKind == "ge") result.push_back("\tbge " + lhs + ", " + rhs + ", " + label);
+  };
+
+  for (size_t i = 0; i < lines.size(); ++i) {
+    std::string t = trim(lines[i]);
+    if (!startsWith(t, "slt ") || i + 1 >= lines.size()) {
       result.push_back(lines[i]);
       continue;
     }
 
-    // Look for li t0, imm followed by mv rd, t0
-    if (startsWith(t, "li ")) {
-      std::string rest = trim(t.substr(3));
-      size_t c = rest.find(',');
-      if (c != std::string::npos) {
-        std::string rd = trim(rest.substr(0, c));
-        std::string imm = trim(rest.substr(c + 1));
+    std::string rd, rs1, rs2;
+    if (!parseThreeRegs(trim(t.substr(4)), rd, rs1, rs2)) {
+      result.push_back(lines[i]);
+      continue;
+    }
 
-        // Check if rd is a temp and next is mv dest, rd
-        if ((rd == "t0" || rd == "t1" || rd == "t5") && i + 1 < lines.size()) {
-          std::string next = trim(lines[i + 1]);
-          if (isFloatAsmLine(next)) {
-            result.push_back(lines[i]);
+    auto tryDirectBranch = [&](const std::string& branchText, const std::string& expectedReg,
+                               const std::string& trueKind, const std::string& falseKind,
+                               size_t consume) -> bool {
+      std::string brRs1, brRs2, brLabel;
+      if (startsWith(branchText, "bne ") &&
+          parseTwoRegsLabel(trim(branchText.substr(4)), brRs1, brRs2, brLabel) &&
+          brRs1 == expectedReg && brRs2 == "x0") {
+        emitBranch(trueKind, rs1, rs2, brLabel);
+        i += consume;
+        return true;
+      }
+      if (startsWith(branchText, "beq ") &&
+          parseTwoRegsLabel(trim(branchText.substr(4)), brRs1, brRs2, brLabel) &&
+          brRs1 == expectedReg && brRs2 == "x0") {
+        emitBranch(falseKind, rs1, rs2, brLabel);
+        i += consume;
+        return true;
+      }
+      return false;
+    };
+
+    std::string next = trim(lines[i + 1]);
+    if (tryDirectBranch(next, rd, "lt", "ge", 1)) continue;
+
+    std::string copyDst, copySrc;
+    if (parseAddiMove(next, copyDst, copySrc) && copySrc == rd && i + 2 < lines.size()) {
+      if (tryDirectBranch(trim(lines[i + 2]), copyDst, "lt", "ge", 2)) continue;
+    }
+
+    if (startsWith(next, "xori ")) {
+      std::string xRd, xRs, xImm;
+      std::string xRest = trim(next.substr(5));
+      size_t c1 = xRest.find(',');
+      if (c1 != std::string::npos) {
+        xRd = trim(xRest.substr(0, c1));
+        xRest = trim(xRest.substr(c1 + 1));
+        size_t c2 = xRest.find(',');
+        if (c2 != std::string::npos) {
+          xRs = trim(xRest.substr(0, c2));
+          xImm = trim(xRest.substr(c2 + 1));
+        }
+      }
+
+      if (xRd == rd && xRs == rd && xImm == "1") {
+        if (i + 2 < lines.size() && tryDirectBranch(trim(lines[i + 2]), rd, "ge", "lt", 2)) {
+          continue;
+        }
+        if (i + 3 < lines.size()) {
+          std::string copy2Dst, copy2Src;
+          if (parseAddiMove(trim(lines[i + 2]), copy2Dst, copy2Src) && copy2Src == rd &&
+              tryDirectBranch(trim(lines[i + 3]), copy2Dst, "ge", "lt", 3)) {
             continue;
-          }
-          if (startsWith(next, "mv ")) {
-            std::string mvRest = trim(next.substr(3));
-            size_t mc = mvRest.find(',');
-            if (mc != std::string::npos) {
-              std::string mvDest = trim(mvRest.substr(0, mc));
-              std::string mvSrc = trim(mvRest.substr(mc + 1));
-
-              if (mvSrc == rd && mvDest != rd) {
-                // Replace with single li mvDest, imm
-                result.push_back("\tli " + mvDest + ", " + imm);
-                i++;  // Skip the mv
-                continue;
-              }
-            }
           }
         }
       }
@@ -977,6 +1092,10 @@ std::vector<std::string> peepholeOptimize(const std::vector<std::string>& asmLin
     
     prevSize = result.size();
     result = optimizeRedundantOps(result);
+    if (result.size() != prevSize) changed = true;
+
+    prevSize = result.size();
+    result = optimizeCompareBranch(result);
     if (result.size() != prevSize) changed = true;
     
     prevSize = result.size();
@@ -1955,6 +2074,75 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
         std::string lhs = loadOperand(b->lhs, scratchIdx, insns);
         std::string rhs = loadOperand(b->rhs, scratchIdx, insns, {lhs});
 
+        if (b->lhs.isImm() && b->rhs.isImm()) {
+          auto emitImmediateResult = [&](int value) {
+            auto itImm = allocation.find(b->dest);
+            std::string dstImm =
+                itImm != allocation.end() ? RISCVRegMap::physicalRegName(itImm->second)
+                                          : chooseScratch({});
+            insns.push_back("\tli " + dstImm + ", " + std::to_string(value));
+            storeCurrentValue(b->dest, dstImm, insns, {dstImm});
+          };
+
+          int lhsImm = b->lhs.immValue;
+          int rhsImm = b->rhs.immValue;
+          switch (b->op) {
+            case BinaryOp::Eq:
+              emitImmediateResult(lhsImm == rhsImm ? 1 : 0);
+              break;
+            case BinaryOp::Ne:
+              emitImmediateResult(lhsImm != rhsImm ? 1 : 0);
+              break;
+            case BinaryOp::Lt:
+              emitImmediateResult(lhsImm < rhsImm ? 1 : 0);
+              break;
+            case BinaryOp::Gt:
+              emitImmediateResult(lhsImm > rhsImm ? 1 : 0);
+              break;
+            case BinaryOp::Le:
+              emitImmediateResult(lhsImm <= rhsImm ? 1 : 0);
+              break;
+            case BinaryOp::Ge:
+              emitImmediateResult(lhsImm >= rhsImm ? 1 : 0);
+              break;
+            case BinaryOp::Add:
+              emitImmediateResult(lhsImm + rhsImm);
+              break;
+            case BinaryOp::Sub:
+              emitImmediateResult(lhsImm - rhsImm);
+              break;
+            case BinaryOp::Mul:
+              emitImmediateResult(lhsImm * rhsImm);
+              break;
+            case BinaryOp::And:
+              emitImmediateResult(lhsImm & rhsImm);
+              break;
+            case BinaryOp::Or:
+              emitImmediateResult(lhsImm | rhsImm);
+              break;
+            case BinaryOp::Div:
+              if (rhsImm != 0) {
+                emitImmediateResult(lhsImm / rhsImm);
+                break;
+              }
+              [[fallthrough]];
+            case BinaryOp::Mod:
+              if (b->op == BinaryOp::Mod && rhsImm != 0) {
+                emitImmediateResult(lhsImm % rhsImm);
+                break;
+              }
+              [[fallthrough]];
+            default:
+              break;
+          }
+          if (!insns.empty()) {
+            for (const auto& line : insns) {
+              out.push_back(line);
+            }
+            break;
+          }
+        }
+
         auto it = allocation.find(b->dest);
         std::string destReg;
         if (it != allocation.end()) {
@@ -2181,6 +2369,26 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           if (it != allocation.end()) {
             destRegName = RISCVRegMap::physicalRegName(it->second);
           }
+        }
+
+        if (c->callee == "idx" && c->hasDest && c->args.size() == 3 &&
+            c->resultType == ValueType::I32) {
+          std::string rowReg = loadOperandInto(c->args[0], "t0", insns, {"t1", "t2", "t3"});
+          std::string colReg = loadOperandInto(c->args[1], "t1", insns, {"t0", "t2", "t3"});
+          std::string strideReg = loadOperandInto(c->args[2], "t2", insns, {"t0", "t1", "t3"});
+          insns.push_back("\tmulw t3, " + rowReg + ", " + strideReg);
+          insns.push_back("\taddw t3, t3, " + colReg);
+
+          auto it = allocation.find(c->dest);
+          if (it != allocation.end()) {
+            std::string dst = RISCVRegMap::physicalRegName(it->second);
+            if (dst != "t3") {
+              insns.push_back("\taddiw " + dst + ", t3, 0");
+            }
+          } else {
+            storeCurrentValue(c->dest, "t3", insns, {"t3"});
+          }
+          break;
         }
 
         for (const auto& reg : frame.callerSavedRegs) {
