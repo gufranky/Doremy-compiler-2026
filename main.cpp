@@ -1,13 +1,18 @@
 #include <cstdio>
+#include <exception>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "ast.h"
 #include "backend_codegen.h"
 #include "ir_generator.h"
-#include "optimizer.h"
+#include "lower_midir.h"
+#include "midir.h"
+#include "midir_builder.h"
+#include "optimizer_pipeline.h"
 #include "parse_driver.h"
 #include "semantic_analyzer.h"
 
@@ -16,23 +21,37 @@ extern CompUnit* root;
 namespace {
 
 void printUsage(const char* prog) {
-  std::cerr << "Usage: " << prog << " -S -o <output.s> <input.sy> [-O1]\n";
+  std::cerr << "Usage: " << prog
+            << " -S -o <output.s> <input.sy> [-O1]"
+            << " [--disable-midir|--midir-build-only|--midir-stop-after-ssa|--midir-lower-only]\n";
 }
 
 struct CommandLineOptions {
   bool emitAssembly = false;
-  bool enableOpt = false;
+  bool enableMidIR = true;
+  bool midirBuildOnly = false;
+  bool stopAfterSSA = false;
+  bool lowerOnly = false;
   std::string inputFile;
   std::string outputFile;
 };
 
 bool parseCommandLine(int argc, char** argv, CommandLineOptions& options) {
+  bool sawOptimizationFlag = false;
   for (int i = 1; i < argc; ++i) {
     std::string arg(argv[i]);
     if (arg == "-S") {
       options.emitAssembly = true;
     } else if (arg == "-O1") {
-      options.enableOpt = true;
+      sawOptimizationFlag = true;
+    } else if (arg == "--disable-midir") {
+      options.enableMidIR = false;
+    } else if (arg == "--midir-build-only") {
+      options.midirBuildOnly = true;
+    } else if (arg == "--midir-stop-after-ssa") {
+      options.stopAfterSSA = true;
+    } else if (arg == "--midir-lower-only") {
+      options.lowerOnly = true;
     } else if (arg == "-o") {
       if (i + 1 >= argc) {
         std::cerr << "Error: missing output file after -o\n";
@@ -49,6 +68,13 @@ bool parseCommandLine(int argc, char** argv, CommandLineOptions& options) {
       }
       options.inputFile = arg;
     }
+  }
+
+  if (!sawOptimizationFlag) {
+    options.enableMidIR = false;
+    options.lowerOnly = false;
+    options.stopAfterSSA = false;
+    options.midirBuildOnly = false;
   }
 
   if (!options.emitAssembly) {
@@ -97,17 +123,58 @@ int main(int argc, char** argv) {
     delete root;
     return 1;
   }
-  // IR generation
-  IRGenerator generator;
-  ir::IRProgram program = generator.generate(root);
+  ir::IRProgram bridgeProgram;
 
-  if (options.enableOpt) {
-    ir::OptimizeProgram(program);
+  if (options.enableMidIR) {
+    midir::MidIRBuilder midirBuilder;
+    midir::Module midirModule = midirBuilder.build(root);
+
+    if (options.midirBuildOnly || options.stopAfterSSA) {
+      std::ofstream output(options.outputFile, std::ios::binary);
+      if (!output) {
+        std::cerr << "Error: Cannot open output file " << options.outputFile
+                  << "\n";
+        delete root;
+        return 1;
+      }
+      output << midir::dumpModule(midirModule);
+      delete root;
+      return 0;
+    }
+
+    if (!options.lowerOnly) {
+      midir::PassManager passManager;
+      passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
+      passManager.addFunctionPass(std::make_unique<midir::SimplifyCFGPass>());
+      passManager.addFunctionPass(std::make_unique<midir::LoopSimplifyPass>());
+      passManager.addFunctionPass(std::make_unique<midir::LCSSAPass>());
+      passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
+      passManager.addFunctionPass(std::make_unique<midir::LICMPass>());
+      passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
+      passManager.addFunctionPass(std::make_unique<midir::IndVarSimplifyPass>());
+      passManager.addFunctionPass(std::make_unique<midir::InstCombinePass>());
+      passManager.addFunctionPass(std::make_unique<midir::EarlyCSEPass>());
+      passManager.addFunctionPass(std::make_unique<midir::ADCEPass>());
+      passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
+      try {
+        passManager.run(midirModule);
+      } catch (const std::exception& ex) {
+        std::cerr << "MidIR verification failed: " << ex.what() << "\n";
+        delete root;
+        return 1;
+      }
+    }
+
+    midir::LowerMidIR lowerMidIR;
+    bridgeProgram = lowerMidIR.lower(midirModule);
+  } else {
+    IRGenerator generator;
+    bridgeProgram = generator.generate(root);
   }
 
   // Backend code generation (register allocation + assembly)
   CodeGen codegen;
-  std::vector<std::string> asmLines = codegen.generate(program);
+  std::vector<std::string> asmLines = codegen.generate(bridgeProgram);
 
   std::ofstream output(options.outputFile, std::ios::binary);
   if (!output) {

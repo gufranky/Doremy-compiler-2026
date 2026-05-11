@@ -19,7 +19,6 @@
 /* begin standard C headers. */
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
 #include <stdlib.h>
 
 /* end standard C headers. */
@@ -2143,5 +2142,4 @@ void yyfree (void * ptr )
 #define YYTABLES_NAME "yytables"
 
 #line 120 "grammar/lexer.l"
-
 

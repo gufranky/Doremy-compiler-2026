@@ -259,6 +259,7 @@ struct IRFunction {
   int nextVReg = 0;
   std::vector<int> params;
   std::vector<ValueType> paramTypes;
+  std::vector<bool> paramIsArray;
   ValueType returnType = ValueType::I32;
   int localArraySize = 0;  // 局部数组所需的总栈空间
 
