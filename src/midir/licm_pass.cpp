@@ -46,6 +46,13 @@ struct MemoryLocation {
   }
 };
 
+MemoryLocation analyzeMemoryLocation(const Function& function, const ValueRef& value,
+                                     const std::vector<int>& defBlock,
+                                     const std::unordered_map<int, Instruction>& defs);
+bool isLoopInvariantOperand(const ValueRef& operand, const Loop& loop,
+                            const std::vector<int>& defBlock,
+                            const std::unordered_set<int>& hoistedValues);
+
 bool loopContainsBlock(const Loop& loop, int block) {
   return std::binary_search(loop.blocks.begin(), loop.blocks.end(), block);
 }
@@ -63,6 +70,101 @@ int typeStoreSize(Type type) {
       return 0;
   }
   return 0;
+}
+
+bool sameValueRef(const ValueRef& lhs, const ValueRef& rhs) {
+  return lhs.kind == rhs.kind && lhs.type == rhs.type && lhs.value_id == rhs.value_id &&
+         lhs.int_value == rhs.int_value && lhs.float_value == rhs.float_value &&
+         lhs.frame_offset == rhs.frame_offset && lhs.symbol == rhs.symbol;
+}
+
+bool loopHasMemoryBarrier(const Function& function, const Loop& loop) {
+  for (int blockIndex : loop.blocks) {
+    const auto& block = function.blocks[blockIndex];
+    for (const auto& inst : block.instructions) {
+      if (inst.kind == InstKind::Store || inst.kind == InstKind::Call) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+std::string memoryLocationKey(const MemoryLocation& location) {
+  if (!location.isIdentifiable()) return {};
+  std::string key = std::to_string(static_cast<int>(location.base_kind));
+  key += ":";
+  switch (location.base_kind) {
+    case MemoryLocation::BaseKind::Global:
+      key += location.symbol;
+      break;
+    case MemoryLocation::BaseKind::Frame:
+      key += std::to_string(location.frame_offset);
+      break;
+    case MemoryLocation::BaseKind::Stack:
+      key += "sp";
+      break;
+    case MemoryLocation::BaseKind::Param:
+      key += std::to_string(location.param_index);
+      break;
+    case MemoryLocation::BaseKind::Invalid:
+    case MemoryLocation::BaseKind::Unknown:
+      return {};
+  }
+  key += ":";
+  key += location.offset_known ? std::to_string(location.offset) : "?";
+  key += ":";
+  key += std::to_string(location.access_size);
+  return key;
+}
+
+bool forwardInvariantLoadsInLoop(Function& function, const Loop& loop,
+                                 const std::vector<int>& defBlock,
+                                 const std::unordered_map<int, Instruction>& defs) {
+  if (loopHasMemoryBarrier(function, loop)) return false;
+
+  std::unordered_map<std::string, ValueRef> availableLoads;
+  bool changed = false;
+  const std::unordered_set<int> noHoistedValues;
+  for (int blockIndex : loop.blocks) {
+    auto& block = function.blocks[blockIndex];
+    for (auto it = block.instructions.begin(); it != block.instructions.end();) {
+      Instruction& inst = *it;
+      if (inst.kind != InstKind::Load || !inst.has_result || inst.result_id < 0 ||
+          inst.operands.size() != 1) {
+        ++it;
+        continue;
+      }
+      const ValueRef& addr = inst.operands[0];
+      if (!isLoopInvariantOperand(addr, loop, defBlock, noHoistedValues)) {
+        ++it;
+        continue;
+      }
+      MemoryLocation loadLocation = analyzeMemoryLocation(function, addr, defBlock, defs);
+      loadLocation.access_size = typeStoreSize(inst.result_type);
+      const std::string key = memoryLocationKey(loadLocation);
+      if (key.empty()) {
+        ++it;
+        continue;
+      }
+
+      auto available = availableLoads.find(key);
+      if (available == availableLoads.end()) {
+        availableLoads.emplace(key, ValueRef::SSA(inst.result_id, inst.result_type));
+        ++it;
+        continue;
+      }
+      if (sameValueRef(available->second, ValueRef::SSA(inst.result_id, inst.result_type))) {
+        ++it;
+        continue;
+      }
+
+      replaceAllUses(function, inst.result_id, available->second);
+      it = block.instructions.erase(it);
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 bool rangesOverlap(const MemoryLocation& lhs, const MemoryLocation& rhs) {
@@ -367,6 +469,7 @@ bool hoistLoop(Function& function, const Loop& loop, const DominatorTree& domTre
   std::unordered_set<int> hoistedValues;
   std::vector<Instruction> hoistedInstructions;
   bool changed = false;
+  changed = forwardInvariantLoadsInLoop(function, loop, defBlock, defs) || changed;
 
   bool localChanged = true;
   while (localChanged) {

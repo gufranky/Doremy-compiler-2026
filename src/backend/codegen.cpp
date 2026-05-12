@@ -3,6 +3,9 @@
 #include <cstring>
 #include <set>
 #include <sstream>
+#include <optional>
+#include <cstdint>
+#include <limits>
 
 #include "backend_codegen.h"
 
@@ -50,12 +53,101 @@ inline bool isFloatAsmLine(const std::string& line) {
          startsWith(t, "flw ") || startsWith(t, "fsw ");
 }
 
+inline bool parseMoveLike(const std::string& text, std::string& opcode,
+                          std::string& dst, std::string& src) {
+  if (startsWith(text, "mv ")) {
+    std::string rest = trim(text.substr(3));
+    size_t c = rest.find(',');
+    if (c == std::string::npos) return false;
+    opcode = "mv";
+    dst = trim(rest.substr(0, c));
+    src = trim(rest.substr(c + 1));
+    return !dst.empty() && !src.empty();
+  }
+  if (!startsWith(text, "addi ") && !startsWith(text, "addiw ")) return false;
+  opcode = startsWith(text, "addi ") ? "addi" : "addiw";
+  std::string rest = trim(opcode == "addi" ? text.substr(5) : text.substr(6));
+  size_t c1 = rest.find(',');
+  if (c1 == std::string::npos) return false;
+  dst = trim(rest.substr(0, c1));
+  rest = trim(rest.substr(c1 + 1));
+  size_t c2 = rest.find(',');
+  if (c2 == std::string::npos) return false;
+  src = trim(rest.substr(0, c2));
+  std::string imm = trim(rest.substr(c2 + 1));
+  return imm == "0" && !dst.empty() && !src.empty();
+}
+
+inline bool parseDestOnly(const std::string& text, const std::string& prefix,
+                          std::string& dst) {
+  if (!startsWith(text, prefix)) return false;
+  std::string rest = trim(text.substr(prefix.size()));
+  size_t c = rest.find(',');
+  if (c == std::string::npos) return false;
+  dst = trim(rest.substr(0, c));
+  return !dst.empty();
+}
+
+inline bool isI32NormalizedProducer(const std::string& text, std::string& dst) {
+  return parseDestOnly(text, "lw ", dst) || parseDestOnly(text, "addiw ", dst) ||
+         parseDestOnly(text, "addw ", dst) || parseDestOnly(text, "subw ", dst) ||
+         parseDestOnly(text, "mulw ", dst) || parseDestOnly(text, "divw ", dst) ||
+         parseDestOnly(text, "remw ", dst) || parseDestOnly(text, "slliw ", dst) ||
+         parseDestOnly(text, "srliw ", dst) || parseDestOnly(text, "sraiw ", dst) ||
+         parseDestOnly(text, "slt ", dst) || parseDestOnly(text, "sltu ", dst) ||
+         parseDestOnly(text, "sltiu ", dst) || parseDestOnly(text, "xori ", dst);
+}
+
 struct ArgLocation {
   bool useFloatReg = false;
   bool useIntReg = false;
   int regIndex = -1;
   int stackIndex = -1;
 };
+
+struct SignedDivMagic {
+  int32_t magic = 0;
+  int shift = 0;
+};
+
+std::optional<SignedDivMagic> computeSignedDivMagic(int divisor) {
+  if (divisor <= 1) return std::nullopt;
+
+  const uint64_t two31 = 1ULL << 31;
+  const uint64_t ad = static_cast<uint64_t>(divisor);
+  const uint64_t anc = two31 - 1 - (two31 % ad);
+
+  uint64_t p = 31;
+  uint64_t q1 = two31 / anc;
+  uint64_t r1 = two31 - q1 * anc;
+  uint64_t q2 = two31 / ad;
+  uint64_t r2 = two31 - q2 * ad;
+  uint64_t delta = 0;
+
+  do {
+    ++p;
+    q1 <<= 1;
+    r1 <<= 1;
+    if (r1 >= anc) {
+      ++q1;
+      r1 -= anc;
+    }
+
+    q2 <<= 1;
+    r2 <<= 1;
+    if (r2 >= ad) {
+      ++q2;
+      r2 -= ad;
+    }
+
+    delta = ad - r2;
+  } while (q1 < delta || (q1 == delta && r1 == 0));
+
+  SignedDivMagic info;
+  info.magic = static_cast<int32_t>(static_cast<uint32_t>(q2 + 1));
+  info.shift = static_cast<int>(p - 32);
+  return info;
+}
 
 inline ArgLocation classifyArgLocation(ValueType type, int& intRegCount,
                                        int& floatRegCount, int& stackCount) {
@@ -78,63 +170,62 @@ inline ArgLocation classifyArgLocation(ValueType type, int& intRegCount,
 std::vector<std::string> optimizeMoveChains(const std::vector<std::string>& lines) {
   std::vector<std::string> result;
   result.reserve(lines.size());
-  
+
   std::string prevDest, prevSrc;
-  
+  bool prevFullWidth = false;
+
   for (const auto& line : lines) {
     std::string t = trim(line);
-    
-    // Check for "mv x, x" (self-move) - remove it
-    if (startsWith(t, "addi ")) {
-      // addi rd, rs, 0 is a move
-      size_t comma1 = t.find(',');
-      if (comma1 != std::string::npos) {
-        std::string rest = t.substr(comma1 + 1);
-        size_t comma2 = rest.find(',');
-        if (comma2 != std::string::npos) {
-          std::string rd = trim(t.substr(5, comma1 - 5));
-          std::string rs = trim(rest.substr(0, comma2));
-          std::string imm = trim(rest.substr(comma2 + 1));
-          
-          if (imm == "0" && rd == rs) {
-            // Self-move, skip
-            continue;
-          }
-          
-          // Check for move chain optimization
-          if (imm == "0" && !prevDest.empty() && rs == prevDest) {
-            // Current: addi rd, prevDest, 0
-            // Replace with: addi rd, prevSrc, 0
-            result.push_back("\taddi " + rd + ", " + prevSrc + ", 0");
-            prevDest = rd;
-            // prevSrc stays the same
-            continue;
-          }
-          
-          if (imm == "0") {
-            prevDest = rd;
-            prevSrc = rs;
-          } else {
-            prevDest.clear();
-            prevSrc.clear();
-          }
+
+    std::string producedReg;
+    if (isI32NormalizedProducer(t, producedReg)) {
+      prevDest.clear();
+      prevSrc.clear();
+      prevFullWidth = false;
+      result.push_back(line);
+      continue;
+    }
+
+    std::string opcode, dst, src;
+    if (parseMoveLike(t, opcode, dst, src)) {
+      if (opcode != "addiw" && dst == src) {
+        continue;
+      }
+
+      std::string rewrittenSrc = src;
+      if (!prevDest.empty() && src == prevDest) {
+        if (opcode == "addiw" || prevFullWidth) {
+          rewrittenSrc = prevSrc;
         }
       }
-    } else if (isLabelLine(line) || startsWith(t, "j ") || startsWith(t, "jal ") ||
-               startsWith(t, "bne ") || startsWith(t, "beq ") || 
-               startsWith(t, "call ") || startsWith(t, "ret")) {
-      // Control flow breaks the chain
-      prevDest.clear();
-      prevSrc.clear();
-    } else {
-      // Other instructions may define registers, conservatively clear
-      prevDest.clear();
-      prevSrc.clear();
+
+      if (opcode == "addiw") {
+        result.push_back("\taddiw " + dst + ", " + rewrittenSrc + ", 0");
+        prevFullWidth = false;
+      } else {
+        result.push_back("\tmv " + dst + ", " + rewrittenSrc);
+        prevFullWidth = true;
+      }
+      prevDest = dst;
+      prevSrc = rewrittenSrc;
+      continue;
     }
-    
+
+    if (isLabelLine(line) || startsWith(t, "j ") || startsWith(t, "jal ") ||
+        startsWith(t, "bne ") || startsWith(t, "beq ") || startsWith(t, "bge ") ||
+        startsWith(t, "blt ") || startsWith(t, "call ") || startsWith(t, "ret")) {
+      prevDest.clear();
+      prevSrc.clear();
+      prevFullWidth = false;
+    } else {
+      prevDest.clear();
+      prevSrc.clear();
+      prevFullWidth = false;
+    }
+
     result.push_back(line);
   }
-  
+
   return result;
 }
 
@@ -193,8 +284,8 @@ std::vector<std::string> optimizeRedundantOps(const std::vector<std::string>& li
   std::vector<std::string> result;
   result.reserve(lines.size());
 
-  // Track known values for simple constant propagation
   std::unordered_map<std::string, int> knownValues;
+  std::unordered_set<std::string> normalizedI32Regs = {"x0"};
 
   for (const auto& line : lines) {
     std::string t = trim(line);
@@ -202,13 +293,47 @@ std::vector<std::string> optimizeRedundantOps(const std::vector<std::string>& li
 
     if (isFloatAsmLine(t)) {
       knownValues.clear();
+      normalizedI32Regs = {"x0"};
       result.push_back(line);
       continue;
     }
 
-    // Track li instructions
+    std::string producedReg;
+    if (isI32NormalizedProducer(t, producedReg)) {
+      normalizedI32Regs.insert(producedReg);
+    }
+
+    std::string moveOpcode, moveDst, moveSrc;
+    if (parseMoveLike(t, moveOpcode, moveDst, moveSrc)) {
+      if (moveOpcode == "addiw" && normalizedI32Regs.count(moveSrc)) {
+        if (moveDst == moveSrc) {
+          continue;
+        }
+        result.push_back("\tmv " + moveDst + ", " + moveSrc);
+        normalizedI32Regs.insert(moveDst);
+        if (knownValues.count(moveSrc)) {
+          knownValues[moveDst] = knownValues[moveSrc];
+        } else {
+          knownValues.erase(moveDst);
+        }
+        continue;
+      }
+      if (moveOpcode != "addiw" && moveDst == moveSrc) {
+        continue;
+      }
+      if (normalizedI32Regs.count(moveSrc)) {
+        normalizedI32Regs.insert(moveDst);
+      } else {
+        normalizedI32Regs.erase(moveDst);
+      }
+      if (knownValues.count(moveSrc)) {
+        knownValues[moveDst] = knownValues[moveSrc];
+      } else {
+        knownValues.erase(moveDst);
+      }
+    }
+
     if (startsWith(t, "addi ") && t.find("x0") != std::string::npos) {
-      // addi rd, x0, imm is li rd, imm
       size_t comma1 = t.find(',');
       if (comma1 != std::string::npos) {
         std::string rest = t.substr(comma1 + 1);
@@ -221,24 +346,43 @@ std::vector<std::string> optimizeRedundantOps(const std::vector<std::string>& li
             int imm = 0;
             if (parseIntStrict(immStr, imm)) {
               knownValues[rd] = imm;
+              if (imm == 0) normalizedI32Regs.insert(rd);
             }
           }
         }
       }
     }
 
-    // Check for add with known zero
-    if (startsWith(t, "add ")) {
+    if (startsWith(t, "add ") || startsWith(t, "addw ")) {
+      size_t prefixLen = startsWith(t, "addw ") ? 5 : 4;
       size_t comma1 = t.find(',');
       if (comma1 != std::string::npos) {
         std::string rest = t.substr(comma1 + 1);
         size_t comma2 = rest.find(',');
         if (comma2 != std::string::npos) {
-          std::string dest = trim(t.substr(4, comma1 - 4));
+          std::string dest = trim(t.substr(prefixLen, comma1 - prefixLen));
           std::string src1 = trim(rest.substr(0, comma2));
           std::string src2 = trim(rest.substr(comma2 + 1));
+          if (knownValues.count(src2) && knownValues[src2] == 0 && dest == src1) {
+            skip = true;
+          }
+          if (knownValues.count(src1) && knownValues[src1] == 0 && dest == src2) {
+            skip = true;
+          }
+        }
+      }
+    }
 
-          // add dest, src1, src2 where src2 is known 0 and dest == src1
+    if (startsWith(t, "sub ") || startsWith(t, "subw ")) {
+      size_t prefixLen = startsWith(t, "subw ") ? 5 : 4;
+      size_t comma1 = t.find(',');
+      if (comma1 != std::string::npos) {
+        std::string rest = t.substr(comma1 + 1);
+        size_t comma2 = rest.find(',');
+        if (comma2 != std::string::npos) {
+          std::string dest = trim(t.substr(prefixLen, comma1 - prefixLen));
+          std::string src1 = trim(rest.substr(0, comma2));
+          std::string src2 = trim(rest.substr(comma2 + 1));
           if (knownValues.count(src2) && knownValues[src2] == 0 && dest == src1) {
             skip = true;
           }
@@ -246,7 +390,6 @@ std::vector<std::string> optimizeRedundantOps(const std::vector<std::string>& li
       }
     }
 
-    // Check for mul with known 1
     if (startsWith(t, "mul ")) {
       size_t comma1 = t.find(',');
       if (comma1 != std::string::npos) {
@@ -264,12 +407,11 @@ std::vector<std::string> optimizeRedundantOps(const std::vector<std::string>& li
       }
     }
 
-    // Clear known values on control flow, memory traffic, or redefinition.
     if (isLabelLine(line) || startsWith(t, "j ") || startsWith(t, "jal ") ||
-        startsWith(t, "call ") || startsWith(t, "ret") ||
-        startsWith(t, "bne ") || startsWith(t, "beq ") ||
-        startsWith(t, "lw ") || startsWith(t, "sw ")) {
+        startsWith(t, "call ") || startsWith(t, "ret") || startsWith(t, "bne ") ||
+        startsWith(t, "beq ") || startsWith(t, "bge ") || startsWith(t, "blt ")) {
       knownValues.clear();
+      normalizedI32Regs = {"x0"};
     }
 
     if (!skip) {
@@ -760,7 +902,21 @@ std::vector<std::string> optimizeDeadCodeAfterJump(const std::vector<std::string
 
 // Remove unused labels and redundant jumps
 std::vector<std::string> optimizeUnusedLabels(const std::vector<std::string>& lines) {
-  // Collect all referenced labels
+  auto collectBranchTarget = [](const std::string& text, std::string& target) {
+    size_t space = text.find(' ');
+    if (space == std::string::npos) return false;
+    std::string opcode = text.substr(0, space);
+    static const std::unordered_set<std::string> kBranchOpcodes = {
+        "beqz", "bnez", "beq", "bne", "blt", "bge", "bltu", "bgeu",
+        "ble", "bgt", "bleu", "bgtu"};
+    if (kBranchOpcodes.find(opcode) == kBranchOpcodes.end()) return false;
+    std::string rest = trim(text.substr(space + 1));
+    size_t comma = rest.rfind(',');
+    if (comma == std::string::npos) return false;
+    target = trim(rest.substr(comma + 1));
+    return !target.empty();
+  };
+
   std::set<std::string> refs;
   std::set<std::string> globalSymbols;
   for (const auto& line : lines) {
@@ -773,35 +929,31 @@ std::vector<std::string> optimizeUnusedLabels(const std::vector<std::string>& li
       refs.insert(trim(t.substr(2)));
     } else if (startsWith(t, "jal x0, ")) {
       refs.insert(trim(t.substr(8)));
-    } else if (startsWith(t, "beqz ") || startsWith(t, "bne ") || startsWith(t, "beq ")) {
-      size_t c = t.find(',');
-      if (c != std::string::npos) {
-        std::string rest = trim(t.substr(c + 1));
-        size_t c2 = rest.find(',');
-        if (c2 != std::string::npos) rest = trim(rest.substr(c2 + 1));
-        refs.insert(rest);
-      }
-    } else if (startsWith(t, "jal ra, ") || startsWith(t, "jal ")) {
-      // Function calls - keep the target
-      size_t space = t.find(' ');
-      if (space != std::string::npos) {
-        std::string rest = trim(t.substr(space + 1));
-        size_t c = rest.find(',');
-        if (c != std::string::npos) rest = trim(rest.substr(c + 1));
-        refs.insert(rest);
+    } else {
+      std::string branchTarget;
+      if (collectBranchTarget(t, branchTarget)) {
+        refs.insert(branchTarget);
+      } else if (startsWith(t, "jal ra, ") || startsWith(t, "jal ")) {
+        size_t space = t.find(' ');
+        if (space != std::string::npos) {
+          std::string rest = trim(t.substr(space + 1));
+          size_t c = rest.find(',');
+          if (c != std::string::npos) rest = trim(rest.substr(c + 1));
+          refs.insert(rest);
+        }
       }
     }
   }
-  
+
   std::vector<std::string> result;
   result.reserve(lines.size());
-  
+
   for (size_t i = 0; i < lines.size(); ++i) {
     std::string lab;
     if (isLabelLine(lines[i])) {
       std::string t = trim(lines[i]);
       lab = t.substr(0, t.size() - 1);
-      
+
       // Keep exported symbols and referenced labels.
       if (globalSymbols.find(lab) != globalSymbols.end()) {
         result.push_back(lines[i]);
@@ -816,15 +968,15 @@ std::vector<std::string> optimizeUnusedLabels(const std::vector<std::string>& li
                     (lab.find("_if_false") != std::string::npos) ||
                     (lab.find("_if_end") != std::string::npos) ||
                     (lab.find("_for_") != std::string::npos);
-      
+
       if (isAuto && refs.find(lab) == refs.end()) {
         continue;  // Drop unreferenced auto labels
       }
     }
-    
+
     result.push_back(lines[i]);
   }
-  
+
   return result;
 }
 
@@ -978,17 +1130,8 @@ std::vector<std::string> optimizeCompareBranch(const std::vector<std::string>& l
 
   auto parseAddiMove = [](const std::string& text, std::string& dst,
                           std::string& src) -> bool {
-    if (!startsWith(text, "addi ") && !startsWith(text, "addiw ")) return false;
-    std::string rest = trim(startsWith(text, "addi ") ? text.substr(5) : text.substr(6));
-    size_t c1 = rest.find(',');
-    if (c1 == std::string::npos) return false;
-    dst = trim(rest.substr(0, c1));
-    rest = trim(rest.substr(c1 + 1));
-    size_t c2 = rest.find(',');
-    if (c2 == std::string::npos) return false;
-    src = trim(rest.substr(0, c2));
-    std::string imm = trim(rest.substr(c2 + 1));
-    return imm == "0" && !dst.empty() && !src.empty();
+    std::string opcode;
+    return parseMoveLike(text, opcode, dst, src);
   };
 
   auto emitBranch = [&](const std::string& cmpKind, const std::string& lhs,
@@ -1934,6 +2077,131 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
     storeCurrentValue(vreg, valueReg, insns, liveRegs);
   };
 
+  auto emitConstSignedDivRem = [&](const BinaryInst* b, const std::string& lhsReg,
+                                   int divisor, const std::string& destReg,
+                                   std::vector<std::string>& insns,
+                                   const std::vector<std::string>& reservedRegs) -> bool {
+    if (b->operandType != ValueType::I32 || b->resultType != ValueType::I32 || divisor == 0) {
+      return false;
+    }
+
+    int absDivisor = divisor;
+    bool negateQuotient = false;
+    if (divisor < 0) {
+      if (divisor == std::numeric_limits<int>::min()) return false;
+      absDivisor = -divisor;
+      negateQuotient = true;
+    }
+
+    std::vector<std::string> local;
+    std::vector<std::string> reserved = reservedRegs;
+    reserved.push_back(lhsReg);
+    auto pickScratch = [&](const std::vector<std::string>& extra = std::vector<std::string>())
+        -> std::optional<std::string> {
+      std::vector<std::string> all = reserved;
+      all.push_back(destReg);
+      all.insert(all.end(), extra.begin(), extra.end());
+      for (const auto& reg : scratchRegs) {
+        if (std::find(all.begin(), all.end(), reg) == all.end()) return reg;
+      }
+      return std::nullopt;
+    };
+    auto emitMoveI32 = [&](const std::string& dst, const std::string& src) {
+      if (dst != src) local.push_back("\tmv " + dst + ", " + src);
+    };
+
+    if (absDivisor == 1) {
+      if (b->op == BinaryOp::Mod) {
+        local.push_back("\taddi " + destReg + ", x0, 0");
+      } else if (negateQuotient) {
+        local.push_back("\tsubw " + destReg + ", x0, " + lhsReg);
+      } else {
+        emitMoveI32(destReg, lhsReg);
+      }
+      insns.insert(insns.end(), local.begin(), local.end());
+      return true;
+    }
+
+    const bool isPowerOfTwo = (absDivisor & (absDivisor - 1)) == 0;
+    std::string qReg = destReg;
+    if ((b->op == BinaryOp::Mod && destReg == lhsReg) ||
+        (!isPowerOfTwo && destReg == lhsReg)) {
+      auto qScratch = pickScratch();
+      if (!qScratch.has_value()) return false;
+      qReg = *qScratch;
+    }
+
+    if (isPowerOfTwo) {
+      std::string biasReg = qReg;
+      if (biasReg == lhsReg) {
+        auto scratch = pickScratch({qReg});
+        if (!scratch.has_value()) return false;
+        biasReg = *scratch;
+      }
+      const int shift = __builtin_ctz(static_cast<unsigned>(absDivisor));
+      local.push_back("\tsrliw " + biasReg + ", " + lhsReg + ", 31");
+      if (shift > 1) {
+        local.push_back("\tslli " + biasReg + ", " + biasReg + ", " +
+                        std::to_string(32 - shift));
+        local.push_back("\tsrliw " + biasReg + ", " + biasReg + ", " +
+                        std::to_string(32 - shift));
+      }
+      local.push_back("\taddw " + qReg + ", " + lhsReg + ", " + biasReg);
+      if (shift > 0) {
+        local.push_back("\tsraiw " + qReg + ", " + qReg + ", " +
+                        std::to_string(shift));
+      }
+
+      if (b->op == BinaryOp::Div) {
+        if (negateQuotient) {
+          local.push_back("\tsubw " + destReg + ", x0, " + qReg);
+        } else {
+          emitMoveI32(destReg, qReg);
+        }
+        insns.insert(insns.end(), local.begin(), local.end());
+        return true;
+      }
+
+      local.push_back("\tslliw " + qReg + ", " + qReg + ", " + std::to_string(shift));
+      local.push_back("\tsubw " + destReg + ", " + lhsReg + ", " + qReg);
+      insns.insert(insns.end(), local.begin(), local.end());
+      return true;
+    }
+
+    auto scratch = pickScratch({qReg});
+    if (!scratch.has_value()) return false;
+    auto magic = computeSignedDivMagic(absDivisor);
+    if (!magic.has_value()) return false;
+    emitLoadImmediate(*scratch, magic->magic, local);
+    local.push_back("\tmul " + qReg + ", " + lhsReg + ", " + *scratch);
+    local.push_back("\tsrli " + qReg + ", " + qReg + ", 32");
+    if (magic->magic < 0) {
+      local.push_back("\taddw " + qReg + ", " + qReg + ", " + lhsReg);
+    }
+    if (magic->shift > 0) {
+      local.push_back("\tsraiw " + qReg + ", " + qReg + ", " +
+                      std::to_string(magic->shift));
+    }
+    local.push_back("\tsraiw " + *scratch + ", " + lhsReg + ", 31");
+    local.push_back("\tsubw " + qReg + ", " + qReg + ", " + *scratch);
+
+    if (b->op == BinaryOp::Div) {
+      if (negateQuotient) {
+        local.push_back("\tsubw " + destReg + ", x0, " + qReg);
+      } else {
+        emitMoveI32(destReg, qReg);
+      }
+      insns.insert(insns.end(), local.begin(), local.end());
+      return true;
+    }
+
+    emitLoadImmediate(*scratch, absDivisor, local);
+    local.push_back("\tmulw " + *scratch + ", " + qReg + ", " + *scratch);
+    local.push_back("\tsubw " + destReg + ", " + lhsReg + ", " + *scratch);
+    insns.insert(insns.end(), local.begin(), local.end());
+    return true;
+  };
+
   auto storeFloatResult = [&](int vreg, const std::string& srcFReg,
                               std::vector<std::string>& insns) {
     auto it = allocation.find(vreg);
@@ -2015,7 +2283,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           if (paramIsAddr) {
             insns.push_back("\taddi " + dst + ", " + srcReg + ", 0");
           } else if (paramType == ValueType::I32) {
-            insns.push_back("\taddiw " + dst + ", " + srcReg + ", 0");
+            insns.push_back("\tmv " + dst + ", " + srcReg);
           } else {
             insns.push_back("\taddi " + dst + ", " + srcReg + ", 0");
           }
@@ -2072,7 +2340,6 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
         }
 
         std::string lhs = loadOperand(b->lhs, scratchIdx, insns);
-        std::string rhs = loadOperand(b->rhs, scratchIdx, insns, {lhs});
 
         if (b->lhs.isImm() && b->rhs.isImm()) {
           auto emitImmediateResult = [&](int value) {
@@ -2148,11 +2415,20 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
         if (it != allocation.end()) {
           destReg = RISCVRegMap::physicalRegName(it->second);
         } else {
-          std::vector<std::string> reservedRegs{lhs, rhs};
+          std::vector<std::string> reservedRegs{lhs};
           destReg = chooseScratch(reservedRegs);
         }
         bool use64BitAddrMath = isAddressOperand(b->lhs) || isAddressOperand(b->rhs) ||
                                 addressVRegs.find(b->dest) != addressVRegs.end();
+
+        if ((b->op == BinaryOp::Div || b->op == BinaryOp::Mod) && b->rhs.isImm() &&
+            !use64BitAddrMath &&
+            emitConstSignedDivRem(b, lhs, b->rhs.immValue, destReg, insns, {lhs})) {
+          storeCurrentValue(b->dest, destReg, insns);
+          break;
+        }
+
+        std::string rhs = loadOperand(b->rhs, scratchIdx, insns, {lhs, destReg});
 
         switch (b->op) {
           case BinaryOp::Eq:
@@ -2210,6 +2486,24 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
                               lhs + ", " + rhs);
             }
             break;
+          case BinaryOp::Div:
+          case BinaryOp::Mod: {
+            std::optional<int> divisor;
+            std::string dividend = lhs;
+            if (b->rhs.isImm()) {
+              divisor = b->rhs.immValue;
+              dividend = lhs;
+            } else if (b->lhs.isImm()) {
+              divisor = std::nullopt;
+            }
+            if (divisor.has_value() && !use64BitAddrMath &&
+                emitConstSignedDivRem(b, dividend, *divisor, destReg, insns, {lhs, rhs})) {
+              break;
+            }
+            insns.push_back("\t" + binOpMnemonic(b->op, b->operandType) + " " + destReg + ", " +
+                            lhs + ", " + rhs);
+            break;
+          }
           default:
             insns.push_back("\t" + binOpMnemonic(b->op, b->operandType) + " " + destReg + ", " +
                             lhs + ", " + rhs);
@@ -2275,7 +2569,9 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
             if (u->operandType == ValueType::I32 &&
                 addressVRegs.find(u->dest) == addressVRegs.end() &&
                 !isAddressOperand(u->operand)) {
-              insns.push_back("\taddiw " + destReg + ", " + opnd + ", 0");
+              if (opnd != destReg) {
+                insns.push_back("\tmv " + destReg + ", " + opnd);
+              }
             } else {
               insns.push_back("\taddi " + destReg + ", " + opnd + ", 0");
             }
@@ -2310,7 +2606,9 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           if (c->destType == ValueType::I32 &&
               addressVRegs.find(c->dest) == addressVRegs.end() &&
               !isAddressOperand(c->src)) {
-            insns.push_back("\taddiw " + dst + ", " + src + ", 0");
+            if (dst != src) {
+              insns.push_back("\tmv " + dst + ", " + src);
+            }
           } else {
             insns.push_back("\taddi " + dst + ", " + src + ", 0");
           }
@@ -2383,7 +2681,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
           if (it != allocation.end()) {
             std::string dst = RISCVRegMap::physicalRegName(it->second);
             if (dst != "t3") {
-              insns.push_back("\taddiw " + dst + ", t3, 0");
+              insns.push_back("\tmv " + dst + ", t3");
             }
           } else {
             storeCurrentValue(c->dest, "t3", insns, {"t3"});
@@ -2420,7 +2718,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
               if (isAddressOperand(c->args[ai])) {
                 insns.push_back("\taddi " + target + ", " + argReg + ", 0");
               } else if (argType == ValueType::I32) {
-                insns.push_back("\taddiw " + target + ", " + argReg + ", 0");
+                insns.push_back("\tmv " + target + ", " + argReg);
               } else {
                 insns.push_back("\taddi " + target + ", " + argReg + ", 0");
               }
@@ -2450,7 +2748,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
               std::string dst = RISCVRegMap::physicalRegName(it->second);
               if (addressVRegs.find(c->dest) == addressVRegs.end() &&
                   c->resultType == ValueType::I32) {
-                insns.push_back("\taddiw " + dst + ", a0, 0");
+                insns.push_back("\tmv " + dst + ", a0");
               } else {
                 insns.push_back("\taddi " + dst + ", a0, 0");
               }
@@ -2481,7 +2779,7 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
             std::string valReg = loadOperand(r->value, scratchIdx, insns);
             if (valReg != "a0") {
               if (r->valueType == ValueType::I32) {
-                insns.push_back("\taddiw a0, " + valReg + ", 0");
+                insns.push_back("\tmv a0, " + valReg);
               } else {
                 insns.push_back("\taddi a0, " + valReg + ", 0");
               }

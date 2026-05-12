@@ -10,14 +10,33 @@ namespace {
 bool simplifyBranchOnConstant(BasicBlock& block) {
   if (block.instructions.empty()) return false;
   auto& term = block.instructions.back();
+  if (term.kind == InstKind::Branch && term.true_target == term.false_target) {
+    Instruction jump;
+    jump.kind = InstKind::Jump;
+    jump.jump_target = term.true_target;
+    block.instructions.back() = std::move(jump);
+    return true;
+  }
   if (term.kind != InstKind::Branch || term.operands.size() != 1) return false;
-  const ValueRef& cond = term.operands.front();
-  if (cond.kind != ValueRef::Kind::ImmediateInt) return false;
+  ValueRef cond = term.operands.front();
+  if (cond.kind == ValueRef::Kind::ImmediateInt) {
+    Instruction jump;
+    jump.kind = InstKind::Jump;
+    jump.jump_target = cond.int_value ? term.true_target : term.false_target;
+    block.instructions.back() = std::move(jump);
+    return true;
+  }
 
-  Instruction jump;
-  jump.kind = InstKind::Jump;
-  jump.jump_target = cond.int_value ? term.true_target : term.false_target;
-  block.instructions.back() = std::move(jump);
+  if (block.instructions.size() < 2 || !cond.isSSA()) return false;
+  const Instruction& producer = block.instructions[block.instructions.size() - 2];
+  if (!producer.has_result || producer.result_id != cond.value_id ||
+      producer.kind != InstKind::Unary || producer.unary_op != ir::UnaryOp::Not ||
+      producer.operands.size() != 1) {
+    return false;
+  }
+
+  term.operands[0] = producer.operands[0];
+  std::swap(term.true_target, term.false_target);
   return true;
 }
 

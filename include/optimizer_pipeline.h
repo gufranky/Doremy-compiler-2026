@@ -98,6 +98,17 @@ class InstCombinePass : public FunctionPass {
   PassResult run(Function& function, AnalysisManager& analysisManager) override;
 };
 
+class ConstDivRemPass : public FunctionPass {
+ public:
+  explicit ConstDivRemPass(Module* module) : module_(module) {}
+
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+
+ private:
+  Module* module_ = nullptr;
+};
+
 class EarlyCSEPass : public FunctionPass {
  public:
   std::string name() const override;

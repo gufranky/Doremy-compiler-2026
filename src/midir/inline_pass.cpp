@@ -18,6 +18,8 @@ constexpr int kAlwaysInlineBlockLimit = 3;
 constexpr int kHotInlineInstLimit = 128;
 constexpr int kHotInlineBlockLimit = 16;
 constexpr int kHotInlineCallsiteLimit = 2;
+constexpr int kSingleCallsiteInstLimit = 160;
+constexpr int kSingleCallsiteBlockLimit = 40;
 
 struct InlineCandidate {
   Function* callee = nullptr;
@@ -110,8 +112,8 @@ bool isLegalCallsite(const Function& caller, const Instruction& call, const Func
   if (!isLeafFunction(callee)) return false;
   if (call.operands.size() != callee.param_types.size()) return false;
   if (call.call_arg_types.size() != callee.param_types.size()) return false;
-  if (callee.return_type != Type::Void()) return false;
-  if (call.has_result) return false;
+  if (call.has_result != (callee.return_type != Type::Void())) return false;
+  if (call.has_result && call.result_type != callee.return_type) return false;
   for (size_t i = 0; i < call.operands.size(); ++i) {
     if (call.call_arg_types[i] != callee.param_types[i]) return false;
     if (call.operands[i].type != callee.param_types[i]) return false;
@@ -125,8 +127,12 @@ bool isProfitableInline(const Function& callee, int callsiteCount) {
   if (instCount <= kAlwaysInlineInstLimit || blockCount <= kAlwaysInlineBlockLimit) {
     return true;
   }
-  return blockCount <= kHotInlineBlockLimit && instCount <= kHotInlineInstLimit &&
-         callsiteCount <= kHotInlineCallsiteLimit;
+  if (blockCount <= kHotInlineBlockLimit && instCount <= kHotInlineInstLimit &&
+      callsiteCount <= kHotInlineCallsiteLimit) {
+    return true;
+  }
+  return callsiteCount == 1 && blockCount <= kSingleCallsiteBlockLimit &&
+         instCount <= kSingleCallsiteInstLimit;
 }
 
 std::optional<InlineCandidate> analyzeCandidate(Module& module, const Function& caller,
@@ -239,10 +245,13 @@ bool inlineCallsite(Function& caller, Module& module, int blockIndex, int instIn
     for (const auto& oldInst : oldBlock.instructions) {
       if (oldInst.kind == InstKind::Return) {
         if (oldInst.has_value) {
-          if (oldInst.operands.size() != 1) return false;
+          if (!callInst.has_result || oldInst.operands.size() != 1) return false;
           ValueRef returnValue = oldInst.operands[0];
           remapValue(returnValue, valueMap);
+          if (returnValue.type != callInst.result_type) return false;
           returnIncomings.push_back(PhiIncoming{newIndex, returnValue});
+        } else if (callInst.has_result) {
+          return false;
         }
         clonedBlock.instructions.push_back(makeJumpInstruction(caller.blocks[contBlockIndex].name));
         continue;

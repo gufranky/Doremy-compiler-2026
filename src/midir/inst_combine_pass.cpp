@@ -8,6 +8,12 @@ namespace midir {
 
 namespace {
 
+bool sameValue(const ValueRef& lhs, const ValueRef& rhs) {
+  return lhs.kind == rhs.kind && lhs.type == rhs.type && lhs.value_id == rhs.value_id &&
+         lhs.int_value == rhs.int_value && lhs.float_value == rhs.float_value &&
+         lhs.frame_offset == rhs.frame_offset && lhs.symbol == rhs.symbol;
+}
+
 bool isZeroValue(const ValueRef& value) {
   return (value.kind == ValueRef::Kind::ImmediateInt && value.int_value == 0) ||
          (value.kind == ValueRef::Kind::ImmediateFloat && value.float_value == 0.0f);
@@ -132,6 +138,17 @@ bool trySimplifyIdentity(Instruction& inst) {
     inst.operands[0] = ValueRef::Undef(inst.result_type);
     return true;
   }
+  if (inst.kind == InstKind::Unary && inst.operands.size() == 1) {
+    if (inst.unary_op == ir::UnaryOp::Plus) {
+      inst = makeCopyInstruction(inst, inst.operands[0]);
+      return true;
+    }
+    if (inst.unary_op == ir::UnaryOp::Not && inst.operands[0].kind == ValueRef::Kind::ImmediateInt) {
+      inst = makeCopyInstruction(inst, ValueRef::ImmediateInt(!inst.operands[0].int_value));
+      return true;
+    }
+    return false;
+  }
   if (inst.kind != InstKind::Binary || inst.operands.size() != 2) return false;
 
   const ValueRef& lhs = inst.operands[0];
@@ -150,6 +167,10 @@ bool trySimplifyIdentity(Instruction& inst) {
     case ir::BinaryOp::Sub:
       if (isZeroValue(rhs)) {
         inst = makeCopyInstruction(inst, lhs);
+        return true;
+      }
+      if (sameValue(lhs, rhs)) {
+        inst = makeCopyInstruction(inst, ValueRef::ImmediateInt(0));
         return true;
       }
       break;
@@ -174,6 +195,91 @@ bool trySimplifyIdentity(Instruction& inst) {
     case ir::BinaryOp::Div:
       if (isOneValue(rhs)) {
         inst = makeCopyInstruction(inst, lhs);
+        return true;
+      }
+      if (sameValue(lhs, rhs)) {
+        inst = makeCopyInstruction(inst, ValueRef::ImmediateInt(1));
+        return true;
+      }
+      break;
+    case ir::BinaryOp::And:
+      if (isZeroValue(lhs)) {
+        inst = makeCopyInstruction(inst, lhs);
+        return true;
+      }
+      if (isZeroValue(rhs)) {
+        inst = makeCopyInstruction(inst, rhs);
+        return true;
+      }
+      if (isOneValue(lhs)) {
+        inst = makeCopyInstruction(inst, rhs);
+        return true;
+      }
+      if (isOneValue(rhs)) {
+        inst = makeCopyInstruction(inst, lhs);
+        return true;
+      }
+      if (sameValue(lhs, rhs)) {
+        inst = makeCopyInstruction(inst, lhs);
+        return true;
+      }
+      break;
+    case ir::BinaryOp::Or:
+      if (isZeroValue(lhs)) {
+        inst = makeCopyInstruction(inst, rhs);
+        return true;
+      }
+      if (isZeroValue(rhs)) {
+        inst = makeCopyInstruction(inst, lhs);
+        return true;
+      }
+      if (isOneValue(lhs)) {
+        inst = makeCopyInstruction(inst, lhs);
+        return true;
+      }
+      if (isOneValue(rhs)) {
+        inst = makeCopyInstruction(inst, rhs);
+        return true;
+      }
+      if (sameValue(lhs, rhs)) {
+        inst = makeCopyInstruction(inst, lhs);
+        return true;
+      }
+      break;
+    case ir::BinaryOp::Eq:
+      if (sameValue(lhs, rhs)) {
+        inst = makeCopyInstruction(inst, ValueRef::ImmediateInt(1));
+        return true;
+      }
+      break;
+    case ir::BinaryOp::Ne:
+      if (sameValue(lhs, rhs)) {
+        inst = makeCopyInstruction(inst, ValueRef::ImmediateInt(0));
+        return true;
+      }
+      break;
+    case ir::BinaryOp::Le:
+      if (sameValue(lhs, rhs)) {
+        inst = makeCopyInstruction(inst, ValueRef::ImmediateInt(1));
+        return true;
+      }
+      break;
+    case ir::BinaryOp::Ge:
+      if (sameValue(lhs, rhs)) {
+        inst = makeCopyInstruction(inst, ValueRef::ImmediateInt(1));
+        return true;
+      }
+      break;
+    case ir::BinaryOp::Lt:
+    case ir::BinaryOp::Gt:
+      if (sameValue(lhs, rhs)) {
+        inst = makeCopyInstruction(inst, ValueRef::ImmediateInt(0));
+        return true;
+      }
+      break;
+    case ir::BinaryOp::Mod:
+      if (sameValue(lhs, rhs)) {
+        inst = makeCopyInstruction(inst, ValueRef::ImmediateInt(0));
         return true;
       }
       break;
@@ -203,31 +309,25 @@ bool tryPropagateCopies(Function& function) {
     for (auto& inst : block.instructions) {
       for (auto& operand : inst.operands) {
         ValueRef resolved = resolveLocalReplacement(operand, replacements);
-        if (!(resolved.kind == operand.kind && resolved.value_id == operand.value_id &&
-              resolved.int_value == operand.int_value &&
-              resolved.float_value == operand.float_value &&
-              resolved.symbol == operand.symbol &&
-              resolved.frame_offset == operand.frame_offset &&
-              resolved.type == operand.type)) {
+        if (!sameValue(resolved, operand)) {
           operand = resolved;
           changed = true;
         }
       }
       for (auto& incoming : inst.incomings) {
         ValueRef resolved = resolveLocalReplacement(incoming.value, replacements);
-        if (!(resolved.kind == incoming.value.kind &&
-              resolved.value_id == incoming.value.value_id &&
-              resolved.int_value == incoming.value.int_value &&
-              resolved.float_value == incoming.value.float_value &&
-              resolved.symbol == incoming.value.symbol &&
-              resolved.frame_offset == incoming.value.frame_offset &&
-              resolved.type == incoming.value.type)) {
+        if (!sameValue(resolved, incoming.value)) {
           incoming.value = resolved;
           changed = true;
         }
       }
       if (inst.has_result && inst.result_id >= 0 && inst.kind == InstKind::Copy &&
           inst.operands.size() == 1) {
+        ValueRef resolved = resolveLocalReplacement(inst.operands[0], replacements);
+        if (!sameValue(resolved, inst.operands[0])) {
+          inst.operands[0] = resolved;
+          changed = true;
+        }
         replacements[inst.result_id] = inst.operands[0];
       }
     }
