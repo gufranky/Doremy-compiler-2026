@@ -1134,6 +1134,75 @@ std::vector<std::string> optimizeCompareBranch(const std::vector<std::string>& l
     return parseMoveLike(text, opcode, dst, src);
   };
 
+  auto mentionsRegister = [](const std::string& text, const std::string& reg) {
+    if (reg.empty()) return false;
+    size_t pos = text.find(reg);
+    while (pos != std::string::npos) {
+      const bool leftOk = pos == 0 ||
+                          !(std::isalnum(static_cast<unsigned char>(text[pos - 1])) ||
+                            text[pos - 1] == '_');
+      const size_t end = pos + reg.size();
+      const bool rightOk = end >= text.size() ||
+                           !(std::isalnum(static_cast<unsigned char>(text[end])) ||
+                             text[end] == '_');
+      if (leftOk && rightOk) return true;
+      pos = text.find(reg, pos + 1);
+    }
+    return false;
+  };
+
+  auto instructionWritesRegister = [&](const std::string& text, const std::string& reg,
+                                      bool* readsOldValue) {
+    if (readsOldValue != nullptr) *readsOldValue = false;
+    if (reg.empty() || text.empty() || text.back() == ':' || text[0] == '.') return false;
+
+    size_t space = text.find_first_of(" \t");
+    std::string opcode = space == std::string::npos ? text : text.substr(0, space);
+    std::string rest = space == std::string::npos ? std::string() : trim(text.substr(space + 1));
+    if (rest.empty()) return false;
+
+    auto hasNoDest = [&](const std::string& op) {
+      return op == "beq" || op == "bne" || op == "blt" || op == "bge" ||
+             op == "bltu" || op == "bgeu" || op == "bgt" || op == "ble" ||
+             op == "bgtu" || op == "bleu" || op == "j" || op == "jr" ||
+             op == "ret" || op == "call" || op == "tail" || op == "sw" ||
+             op == "sh" || op == "sb" || op == "sd" || op == "fsw" ||
+             op == "fsd";
+    };
+    if (hasNoDest(opcode)) return false;
+
+    size_t comma = rest.find(',');
+    std::string dst = trim(comma == std::string::npos ? rest : rest.substr(0, comma));
+    if (dst != reg) return false;
+    if (readsOldValue != nullptr && comma != std::string::npos) {
+      *readsOldValue = mentionsRegister(rest.substr(comma + 1), reg);
+    }
+    return true;
+  };
+
+  auto isRegisterDeadAfter = [&](size_t startIndex,
+                                 const std::vector<std::string>& regs) {
+    std::vector<char> dead(regs.size(), 0);
+    size_t liveCount = regs.size();
+    for (size_t j = startIndex; j < lines.size(); ++j) {
+      std::string text = trim(lines[j]);
+      if (text.empty()) continue;
+      for (size_t idx = 0; idx < regs.size(); ++idx) {
+        if (dead[idx] || regs[idx].empty()) continue;
+        bool readsOldValue = false;
+        if (instructionWritesRegister(text, regs[idx], &readsOldValue)) {
+          if (readsOldValue) return false;
+          dead[idx] = 1;
+          --liveCount;
+          continue;
+        }
+        if (mentionsRegister(text, regs[idx])) return false;
+      }
+      if (liveCount == 0) return true;
+    }
+    return true;
+  };
+
   auto emitBranch = [&](const std::string& cmpKind, const std::string& lhs,
                         const std::string& rhs, const std::string& label) {
     if (cmpKind == "lt") result.push_back("\tblt " + lhs + ", " + rhs + ", " + label);
@@ -1155,11 +1224,12 @@ std::vector<std::string> optimizeCompareBranch(const std::vector<std::string>& l
 
     auto tryDirectBranch = [&](const std::string& branchText, const std::string& expectedReg,
                                const std::string& trueKind, const std::string& falseKind,
-                               size_t consume) -> bool {
+                               size_t consume, const std::vector<std::string>& liveRegs) -> bool {
       std::string brRs1, brRs2, brLabel;
       if (startsWith(branchText, "bne ") &&
           parseTwoRegsLabel(trim(branchText.substr(4)), brRs1, brRs2, brLabel) &&
           brRs1 == expectedReg && brRs2 == "x0") {
+        if (!isRegisterDeadAfter(i + consume + 1, liveRegs)) return false;
         emitBranch(trueKind, rs1, rs2, brLabel);
         i += consume;
         return true;
@@ -1167,6 +1237,7 @@ std::vector<std::string> optimizeCompareBranch(const std::vector<std::string>& l
       if (startsWith(branchText, "beq ") &&
           parseTwoRegsLabel(trim(branchText.substr(4)), brRs1, brRs2, brLabel) &&
           brRs1 == expectedReg && brRs2 == "x0") {
+        if (!isRegisterDeadAfter(i + consume + 1, liveRegs)) return false;
         emitBranch(falseKind, rs1, rs2, brLabel);
         i += consume;
         return true;
@@ -1175,11 +1246,13 @@ std::vector<std::string> optimizeCompareBranch(const std::vector<std::string>& l
     };
 
     std::string next = trim(lines[i + 1]);
-    if (tryDirectBranch(next, rd, "lt", "ge", 1)) continue;
+    if (tryDirectBranch(next, rd, "lt", "ge", 1, {rd})) continue;
 
     std::string copyDst, copySrc;
     if (parseAddiMove(next, copyDst, copySrc) && copySrc == rd && i + 2 < lines.size()) {
-      if (tryDirectBranch(trim(lines[i + 2]), copyDst, "lt", "ge", 2)) continue;
+      if (tryDirectBranch(trim(lines[i + 2]), copyDst, "lt", "ge", 2, {rd, copyDst})) {
+        continue;
+      }
     }
 
     if (startsWith(next, "xori ")) {
@@ -1197,13 +1270,15 @@ std::vector<std::string> optimizeCompareBranch(const std::vector<std::string>& l
       }
 
       if (xRd == rd && xRs == rd && xImm == "1") {
-        if (i + 2 < lines.size() && tryDirectBranch(trim(lines[i + 2]), rd, "ge", "lt", 2)) {
+        if (i + 2 < lines.size() &&
+            tryDirectBranch(trim(lines[i + 2]), rd, "ge", "lt", 2, {rd})) {
           continue;
         }
         if (i + 3 < lines.size()) {
           std::string copy2Dst, copy2Src;
           if (parseAddiMove(trim(lines[i + 2]), copy2Dst, copy2Src) && copy2Src == rd &&
-              tryDirectBranch(trim(lines[i + 3]), copy2Dst, "ge", "lt", 3)) {
+              tryDirectBranch(trim(lines[i + 3]), copy2Dst, "ge", "lt", 3,
+                              {rd, copy2Dst})) {
             continue;
           }
         }
@@ -1211,6 +1286,85 @@ std::vector<std::string> optimizeCompareBranch(const std::vector<std::string>& l
     }
 
     result.push_back(lines[i]);
+  }
+
+  return result;
+}
+
+std::vector<std::string> optimizeBranchFallthrough(const std::vector<std::string>& lines) {
+  std::vector<std::string> result;
+  result.reserve(lines.size());
+
+  auto parseTwoRegsLabelLocal = [](const std::string& text, std::string& rs1,
+                                   std::string& rs2, std::string& label) -> bool {
+    size_t c1 = text.find(',');
+    if (c1 == std::string::npos) return false;
+    rs1 = trim(text.substr(0, c1));
+    std::string rest = trim(text.substr(c1 + 1));
+    size_t c2 = rest.find(',');
+    if (c2 == std::string::npos) return false;
+    rs2 = trim(rest.substr(0, c2));
+    label = trim(rest.substr(c2 + 1));
+    return !rs1.empty() && !rs2.empty() && !label.empty();
+  };
+
+  auto isBranchOp = [](const std::string& op) {
+    return op == "beq" || op == "bne" || op == "blt" || op == "bge" ||
+           op == "bltu" || op == "bgeu";
+  };
+
+  auto invertBranchOp = [](const std::string& op) -> std::string {
+    if (op == "beq") return "bne";
+    if (op == "bne") return "beq";
+    if (op == "blt") return "bge";
+    if (op == "bge") return "blt";
+    if (op == "bltu") return "bgeu";
+    if (op == "bgeu") return "bltu";
+    return {};
+  };
+
+  for (size_t i = 0; i < lines.size(); ++i) {
+    std::string t = trim(lines[i]);
+    size_t space = t.find(' ');
+    std::string opcode = space == std::string::npos ? t : t.substr(0, space);
+    if (!isBranchOp(opcode) || i + 2 >= lines.size()) {
+      result.push_back(lines[i]);
+      continue;
+    }
+
+    std::string rs1, rs2, trueLabel;
+    if (!parseTwoRegsLabelLocal(trim(t.substr(space + 1)), rs1, rs2, trueLabel)) {
+      result.push_back(lines[i]);
+      continue;
+    }
+
+    std::string next = trim(lines[i + 1]);
+    if (!startsWith(next, "jal x0, ")) {
+      result.push_back(lines[i]);
+      continue;
+    }
+    std::string falseLabel = trim(next.substr(8));
+
+    std::string nextLabelLine = trim(lines[i + 2]);
+    if (!isLabelLine(nextLabelLine)) {
+      result.push_back(lines[i]);
+      continue;
+    }
+    std::string fallthroughLabel = trim(nextLabelLine.substr(0, nextLabelLine.size() - 1));
+
+    if (fallthroughLabel != trueLabel || fallthroughLabel == falseLabel) {
+      result.push_back(lines[i]);
+      continue;
+    }
+
+    std::string inverted = invertBranchOp(opcode);
+    if (inverted.empty()) {
+      result.push_back(lines[i]);
+      continue;
+    }
+
+    result.push_back("\t" + inverted + " " + rs1 + ", " + rs2 + ", " + falseLabel);
+    ++i;
   }
 
   return result;
@@ -1240,7 +1394,11 @@ std::vector<std::string> peepholeOptimize(const std::vector<std::string>& asmLin
     prevSize = result.size();
     result = optimizeCompareBranch(result);
     if (result.size() != prevSize) changed = true;
-    
+
+    prevSize = result.size();
+    result = optimizeBranchFallthrough(result);
+    if (result.size() != prevSize) changed = true;
+
     prevSize = result.size();
     result = optimizeJumpToNext(result);
     if (result.size() != prevSize) changed = true;
@@ -2015,6 +2173,12 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
                          const std::vector<std::string>& reservedRegs =
                              std::vector<std::string>()) -> std::string {
     (void)scratchIdx;
+    if (op.isVReg()) {
+      auto it = allocation.find(op.vregId);
+      if (it != allocation.end()) {
+        return RISCVRegMap::physicalRegName(it->second);
+      }
+    }
     std::string reg = chooseScratch(reservedRegs);
     return loadOperandInto(op, reg, insns, reservedRegs);
   };
@@ -2516,16 +2680,8 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
         auto* u = static_cast<const UnaryInst*>(inst.get());
         if (isFloatValueType(u->operandType)) {
           if (u->op == UnaryOp::Plus) {
-            std::string src = loadOperand(u->operand, scratchIdx, insns);
-            auto it = allocation.find(u->dest);
-            if (it != allocation.end()) {
-              std::string dst = RISCVRegMap::physicalRegName(it->second);
-              if (dst != src) {
-                insns.push_back("\taddi " + dst + ", " + src + ", 0");
-              }
-            } else {
-              storeCurrentValue(u->dest, src, insns, {src});
-            }
+            std::string srcF = loadFloatOperand(u->operand, "ft0", insns);
+            storeFloatResult(u->dest, srcF, insns);
             break;
           }
 
@@ -2582,6 +2738,11 @@ void CodeGen::emitFunctionBody(const IRFunction& fn,
       }
       case InstKind::Copy: {
         auto* c = static_cast<const CopyInst*>(inst.get());
+        if (isFloatValueType(c->destType) && isFloatValueType(c->src.valueType)) {
+          std::string srcF = loadFloatOperand(c->src, "ft0", insns);
+          storeFloatResult(c->dest, srcF, insns);
+          break;
+        }
         if (isFloatValueType(c->destType) && !isFloatValueType(c->src.valueType)) {
           std::string src = loadOperand(c->src, scratchIdx, insns);
           insns.push_back("\tfcvt.s.w ft0, " + src);
