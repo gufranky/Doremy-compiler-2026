@@ -1,15 +1,395 @@
 #include "analysis.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <numeric>
 #include <optional>
-#include <cstdint>
 #include <unordered_map>
 #include <vector>
 
 namespace midir {
+
+bool MemoryLocation::isIdentifiable() const {
+  return base_kind != BaseKind::Invalid && base_kind != BaseKind::Unknown;
+}
+
+bool MemoryLocation::sameBase(const MemoryLocation& other) const {
+  if (base_kind != other.base_kind) return false;
+  switch (base_kind) {
+    case BaseKind::Global:
+      return symbol == other.symbol;
+    case BaseKind::Frame:
+      return frame_offset == other.frame_offset;
+    case BaseKind::Stack:
+      return true;
+    case BaseKind::Param:
+      return param_index == other.param_index;
+    case BaseKind::Invalid:
+    case BaseKind::Unknown:
+      return false;
+  }
+  return false;
+}
+
+int typeStoreSize(Type type) {
+  switch (type.kind) {
+    case TypeKind::I1:
+      return 1;
+    case TypeKind::I32:
+    case TypeKind::F32:
+      return 4;
+    case TypeKind::Ptr:
+      return 8;
+    case TypeKind::Void:
+      return 0;
+  }
+  return 0;
+}
+
+std::string memoryLocationKey(const MemoryLocation& location) {
+  if (!location.isIdentifiable()) return {};
+  std::string key = std::to_string(static_cast<int>(location.base_kind));
+  key += ":";
+  switch (location.base_kind) {
+    case MemoryLocation::BaseKind::Global:
+      key += location.symbol;
+      break;
+    case MemoryLocation::BaseKind::Frame:
+      key += std::to_string(location.frame_offset);
+      break;
+    case MemoryLocation::BaseKind::Stack:
+      key += "sp";
+      break;
+    case MemoryLocation::BaseKind::Param:
+      key += std::to_string(location.param_index);
+      break;
+    case MemoryLocation::BaseKind::Invalid:
+    case MemoryLocation::BaseKind::Unknown:
+      return {};
+  }
+  key += ":";
+  key += location.offset_known ? std::to_string(location.offset) : "?";
+  key += ":";
+  key += std::to_string(location.access_size);
+  return key;
+}
+
+bool rangesOverlap(const MemoryLocation& lhs, const MemoryLocation& rhs) {
+  if (!lhs.offset_known || !rhs.offset_known || lhs.access_size <= 0 ||
+      rhs.access_size <= 0) {
+    return true;
+  }
+  const int lhs_end = lhs.offset + lhs.access_size;
+  const int rhs_end = rhs.offset + rhs.access_size;
+  return lhs.offset < rhs_end && rhs.offset < lhs_end;
+}
+
+std::vector<int> buildDefBlocks(const Function& function) {
+  std::vector<int> defBlock(function.next_value_id, -1);
+  for (int blockIndex = 0; blockIndex < static_cast<int>(function.blocks.size());
+       ++blockIndex) {
+    for (const auto& inst : function.blocks[blockIndex].instructions) {
+      if (inst.has_result && inst.result_id >= 0 &&
+          inst.result_id < static_cast<int>(defBlock.size())) {
+        defBlock[inst.result_id] = blockIndex;
+      }
+    }
+  }
+  for (int param : function.params) {
+    if (param >= 0 && param < static_cast<int>(defBlock.size()) &&
+        function.entry_block >= 0) {
+      defBlock[param] = function.entry_block;
+    }
+  }
+  return defBlock;
+}
+
+std::unordered_map<int, Instruction> buildInstructionDefs(const Function& function) {
+  std::unordered_map<int, Instruction> defs;
+  defs.reserve(function.next_value_id);
+  for (const auto& block : function.blocks) {
+    for (const auto& inst : block.instructions) {
+      if (inst.has_result && inst.result_id >= 0) {
+        defs.emplace(inst.result_id, inst);
+      }
+    }
+  }
+  return defs;
+}
+
+int findPointerParamIndex(const Function& function, int valueId) {
+  for (size_t i = 0; i < function.params.size(); ++i) {
+    if (function.params[i] != valueId) continue;
+    if (i >= function.param_types.size()) return -1;
+    if (function.param_types[i] == Type::Ptr()) return static_cast<int>(i);
+    if (i < function.param_is_array.size() && function.param_is_array[i]) {
+      return static_cast<int>(i);
+    }
+    return -1;
+  }
+  return -1;
+}
+
+bool computeConstantOffset(const ValueRef& value,
+                           const std::vector<int>& defBlock,
+                           const std::unordered_map<int, Instruction>& defs,
+                           int& offset) {
+  return computeConstantOffset(value, defBlock, defs, offset, nullptr);
+}
+
+bool computeConstantOffset(const ValueRef& value,
+                           const std::vector<int>& defBlock,
+                           const std::unordered_map<int, Instruction>& defs,
+                           int& offset,
+                           MemoryAnalysisCache* cache) {
+  if (value.kind == ValueRef::Kind::ImmediateInt) {
+    offset = value.int_value;
+    return true;
+  }
+  if (!value.isSSA() || value.value_id < 0 ||
+      value.value_id >= static_cast<int>(defBlock.size())) {
+    return false;
+  }
+
+  if (cache != nullptr && value.value_id < static_cast<int>(cache->constant_offset_known.size())) {
+    if (cache->constant_offset_known[value.value_id]) {
+      offset = cache->constant_offset_values[value.value_id];
+      return true;
+    }
+    if (cache->constant_offset_in_progress[value.value_id]) {
+      return false;
+    }
+    cache->constant_offset_in_progress[value.value_id] = 1;
+  }
+
+  auto it = defs.find(value.value_id);
+  if (it == defs.end()) {
+    if (cache != nullptr && value.value_id < static_cast<int>(cache->constant_offset_in_progress.size())) {
+      cache->constant_offset_in_progress[value.value_id] = 0;
+    }
+    return false;
+  }
+  const Instruction& inst = it->second;
+  if (!inst.has_result || inst.result_id != value.value_id ||
+      inst.kind != InstKind::Binary || inst.operands.size() != 2) {
+    if (cache != nullptr && value.value_id < static_cast<int>(cache->constant_offset_in_progress.size())) {
+      cache->constant_offset_in_progress[value.value_id] = 0;
+    }
+    return false;
+  }
+
+  int lhs = 0;
+  int rhs = 0;
+  bool success = false;
+  switch (inst.binary_op) {
+    case ir::BinaryOp::Add:
+      if (computeConstantOffset(inst.operands[0], defBlock, defs, lhs, cache) &&
+          computeConstantOffset(inst.operands[1], defBlock, defs, rhs, cache)) {
+        offset = lhs + rhs;
+        success = true;
+      }
+      break;
+    case ir::BinaryOp::Sub:
+      if (computeConstantOffset(inst.operands[0], defBlock, defs, lhs, cache) &&
+          computeConstantOffset(inst.operands[1], defBlock, defs, rhs, cache)) {
+        offset = lhs - rhs;
+        success = true;
+      }
+      break;
+    default:
+      break;
+  }
+
+  if (cache != nullptr && value.value_id < static_cast<int>(cache->constant_offset_in_progress.size())) {
+    cache->constant_offset_in_progress[value.value_id] = 0;
+    if (success) {
+      cache->constant_offset_known[value.value_id] = 1;
+      cache->constant_offset_values[value.value_id] = offset;
+    }
+  }
+  return success;
+}
+
+MemoryLocation analyzeMemoryLocation(
+    const Function& function, const ValueRef& value,
+    const std::vector<int>& defBlock,
+    const std::unordered_map<int, Instruction>& defs) {
+  return analyzeMemoryLocation(function, value, defBlock, defs, nullptr);
+}
+
+MemoryLocation analyzeMemoryLocation(
+    const Function& function, const ValueRef& value,
+    const std::vector<int>& defBlock,
+    const std::unordered_map<int, Instruction>& defs,
+    MemoryAnalysisCache* cache) {
+  MemoryLocation location;
+  switch (value.kind) {
+    case ValueRef::Kind::GlobalSymbol:
+      location.base_kind = MemoryLocation::BaseKind::Global;
+      location.symbol = value.symbol;
+      location.offset_known = true;
+      location.offset = 0;
+      return location;
+    case ValueRef::Kind::FrameAddress:
+      location.base_kind = MemoryLocation::BaseKind::Frame;
+      location.frame_offset = value.frame_offset;
+      location.offset_known = true;
+      location.offset = 0;
+      return location;
+    case ValueRef::Kind::StackPointer:
+      location.base_kind = MemoryLocation::BaseKind::Stack;
+      location.offset_known = true;
+      location.offset = 0;
+      return location;
+    case ValueRef::Kind::SSA:
+      break;
+    default:
+      location.base_kind = MemoryLocation::BaseKind::Unknown;
+      return location;
+  }
+
+  if (cache != nullptr && value.kind == ValueRef::Kind::SSA && value.value_id >= 0 &&
+      value.value_id < static_cast<int>(cache->location_known.size())) {
+    if (cache->location_known[value.value_id]) {
+      return cache->locations[value.value_id];
+    }
+    if (cache->location_in_progress[value.value_id]) {
+      location.base_kind = MemoryLocation::BaseKind::Unknown;
+      return location;
+    }
+    cache->location_in_progress[value.value_id] = 1;
+  }
+
+  int param_index = findPointerParamIndex(function, value.value_id);
+  if (param_index >= 0) {
+    location.base_kind = MemoryLocation::BaseKind::Param;
+    location.param_index = param_index;
+    location.offset_known = true;
+    location.offset = 0;
+    if (cache != nullptr && value.value_id < static_cast<int>(cache->location_in_progress.size())) {
+      cache->location_in_progress[value.value_id] = 0;
+      cache->location_known[value.value_id] = 1;
+      cache->locations[value.value_id] = location;
+    }
+    return location;
+  }
+
+  if (value.value_id < 0 || value.value_id >= static_cast<int>(defBlock.size())) {
+    location.base_kind = MemoryLocation::BaseKind::Unknown;
+    if (cache != nullptr && value.value_id >= 0 &&
+        value.value_id < static_cast<int>(cache->location_in_progress.size())) {
+      cache->location_in_progress[value.value_id] = 0;
+      cache->location_known[value.value_id] = 1;
+      cache->locations[value.value_id] = location;
+    }
+    return location;
+  }
+  auto it = defs.find(value.value_id);
+  if (it == defs.end()) {
+    location.base_kind = MemoryLocation::BaseKind::Unknown;
+    if (cache != nullptr && value.value_id < static_cast<int>(cache->location_in_progress.size())) {
+      cache->location_in_progress[value.value_id] = 0;
+      cache->location_known[value.value_id] = 1;
+      cache->locations[value.value_id] = location;
+    }
+    return location;
+  }
+
+  const Instruction& inst = it->second;
+  if (inst.kind != InstKind::Binary || inst.operands.size() != 2) {
+    location.base_kind = MemoryLocation::BaseKind::Unknown;
+    if (cache != nullptr && value.value_id < static_cast<int>(cache->location_in_progress.size())) {
+      cache->location_in_progress[value.value_id] = 0;
+      cache->location_known[value.value_id] = 1;
+      cache->locations[value.value_id] = location;
+    }
+    return location;
+  }
+
+  const ValueRef* base_operand = nullptr;
+  const ValueRef* offset_operand = nullptr;
+  int sign = 1;
+  switch (inst.binary_op) {
+    case ir::BinaryOp::Add:
+      if (inst.operands[0].isPointerLike()) {
+        base_operand = &inst.operands[0];
+        offset_operand = &inst.operands[1];
+      } else if (inst.operands[1].isPointerLike()) {
+        base_operand = &inst.operands[1];
+        offset_operand = &inst.operands[0];
+      }
+      break;
+    case ir::BinaryOp::Sub:
+      if (inst.operands[0].isPointerLike()) {
+        base_operand = &inst.operands[0];
+        offset_operand = &inst.operands[1];
+        sign = -1;
+      }
+      break;
+    default:
+      break;
+  }
+  if (base_operand == nullptr) {
+    location.base_kind = MemoryLocation::BaseKind::Unknown;
+    if (cache != nullptr && value.value_id < static_cast<int>(cache->location_in_progress.size())) {
+      cache->location_in_progress[value.value_id] = 0;
+      cache->location_known[value.value_id] = 1;
+      cache->locations[value.value_id] = location;
+    }
+    return location;
+  }
+
+  location = analyzeMemoryLocation(function, *base_operand, defBlock, defs, cache);
+  if (!location.isIdentifiable()) {
+    if (cache != nullptr && value.value_id < static_cast<int>(cache->location_in_progress.size())) {
+      cache->location_in_progress[value.value_id] = 0;
+      cache->location_known[value.value_id] = 1;
+      cache->locations[value.value_id] = location;
+    }
+    return location;
+  }
+  if (offset_operand == nullptr) {
+    if (cache != nullptr && value.value_id < static_cast<int>(cache->location_in_progress.size())) {
+      cache->location_in_progress[value.value_id] = 0;
+      cache->location_known[value.value_id] = 1;
+      cache->locations[value.value_id] = location;
+    }
+    return location;
+  }
+
+  int constant_offset = 0;
+  if (!computeConstantOffset(*offset_operand, defBlock, defs, constant_offset, cache)) {
+    location.offset_known = false;
+    location.offset = 0;
+    if (cache != nullptr && value.value_id < static_cast<int>(cache->location_in_progress.size())) {
+      cache->location_in_progress[value.value_id] = 0;
+      cache->location_known[value.value_id] = 1;
+      cache->locations[value.value_id] = location;
+    }
+    return location;
+  }
+
+  if (!location.offset_known) {
+    location.offset = sign * constant_offset;
+    location.offset_known = true;
+    if (cache != nullptr && value.value_id < static_cast<int>(cache->location_in_progress.size())) {
+      cache->location_in_progress[value.value_id] = 0;
+      cache->location_known[value.value_id] = 1;
+      cache->locations[value.value_id] = location;
+    }
+    return location;
+  }
+
+  location.offset += sign * constant_offset;
+  if (cache != nullptr && value.value_id < static_cast<int>(cache->location_in_progress.size())) {
+    cache->location_in_progress[value.value_id] = 0;
+    cache->location_known[value.value_id] = 1;
+    cache->locations[value.value_id] = location;
+  }
+  return location;
+}
 
 namespace {
 
@@ -31,20 +411,6 @@ std::optional<int> getConstantInt(const Function& function, ValueRef value) {
   ValueRef resolved = resolveTrivialCopies(function, value, blockIndex, defInst);
   if (resolved.kind == ValueRef::Kind::ImmediateInt) return resolved.int_value;
   return std::nullopt;
-}
-
-std::vector<int> buildDefBlocks(const Function& function) {
-  std::vector<int> defBlock(function.next_value_id, -1);
-  for (int blockIndex = 0; blockIndex < static_cast<int>(function.blocks.size());
-       ++blockIndex) {
-    for (const auto& inst : function.blocks[blockIndex].instructions) {
-      if (inst.has_result && inst.result_id >= 0 &&
-          inst.result_id < static_cast<int>(defBlock.size())) {
-        defBlock[inst.result_id] = blockIndex;
-      }
-    }
-  }
-  return defBlock;
 }
 
 bool isParameterValue(const Function& function, int valueId) {

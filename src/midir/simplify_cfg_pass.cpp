@@ -78,6 +78,12 @@ bool mergeTrivialJumpBlock(Function& function, int blockIndex) {
   int targetIndex = targetIt->second;
   if (targetIndex == blockIndex) return false;
 
+  const auto& targetBlock = function.blocks[targetIndex];
+  if (!targetBlock.instructions.empty() &&
+      targetBlock.instructions.front().kind == InstKind::Phi) {
+    return false;
+  }
+
   std::vector<int> preds = block.preds;
   for (int predIndex : preds) {
     if (wouldCreateAmbiguousParallelEdge(function, predIndex, blockIndex, targetIndex)) {

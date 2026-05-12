@@ -115,6 +115,18 @@ class EarlyCSEPass : public FunctionPass {
   PassResult run(Function& function, AnalysisManager& analysisManager) override;
 };
 
+class DSEPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
+class GVNPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
 class ADCEPass : public FunctionPass {
  public:
   std::string name() const override;
