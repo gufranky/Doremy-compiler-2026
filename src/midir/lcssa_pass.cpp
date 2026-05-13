@@ -48,26 +48,6 @@ bool valueRefsEqual(const ValueRef& lhs, const ValueRef& rhs) {
          lhs.frame_offset == rhs.frame_offset && lhs.symbol == rhs.symbol;
 }
 
-std::vector<int> buildDefBlocks(const Function& function) {
-  std::vector<int> def_block(function.next_value_id, -1);
-  for (int block_index = 0; block_index < static_cast<int>(function.blocks.size());
-       ++block_index) {
-    for (const auto& inst : function.blocks[block_index].instructions) {
-      if (inst.has_result && inst.result_id >= 0 &&
-          inst.result_id < static_cast<int>(def_block.size())) {
-        def_block[inst.result_id] = block_index;
-      }
-    }
-  }
-  for (int param : function.params) {
-    if (param >= 0 && param < static_cast<int>(def_block.size()) &&
-        function.entry_block >= 0) {
-      def_block[param] = function.entry_block;
-    }
-  }
-  return def_block;
-}
-
 std::vector<std::vector<UseSite>> buildUseIndex(const Function& function) {
   std::vector<std::vector<UseSite>> uses(function.next_value_id);
   for (int block_index = 0; block_index < static_cast<int>(function.blocks.size());

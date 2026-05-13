@@ -13,28 +13,21 @@ namespace midir {
 
 namespace {
 
-struct InductionVariableInfo {
-  int phi_value = -1;
-  int preheader_block = -1;
-  int header_block = -1;
-  int latch_block = -1;
-  int update_result = -1;
-  int step = 0;
-  ValueRef init_value = ValueRef::Invalid();
-  std::vector<int> latch_blocks;
-};
-
 struct AddressRecurrenceCandidate {
   int address_result = -1;
   Type result_type = Type::Ptr();
   Type operand_type = Type::I32();
   ValueRef invariant_base = ValueRef::Invalid();
+  ValueRef invariant_offset = ValueRef::Invalid();
+  int invariant_offset_scale = 0;
   int stride = 0;
   int bias = 0;
 };
 
 struct AffineIvExpr {
   int scale = 0;
+  ValueRef invariant = ValueRef::Invalid();
+  int invariant_scale = 0;
   int bias = 0;
 };
 
@@ -43,6 +36,8 @@ struct AffineMatchCache {
   std::vector<char> visiting;
   std::vector<char> known_miss;
 };
+
+using UseLists = std::vector<std::vector<int>>;
 
 struct MemoryBaseKey {
   enum class Kind { Invalid, Global, Frame, Param, Stack, Unknown };
@@ -62,8 +57,61 @@ std::optional<int> getConstantInt(const ValueRef& value) {
   return std::nullopt;
 }
 
-const Instruction* findDefInstruction(const Function& function, int valueId,
-                                      int& blockIndexOut);
+bool sameValueRef(const ValueRef& lhs, const ValueRef& rhs) {
+  return lhs.kind == rhs.kind && lhs.type == rhs.type && lhs.value_id == rhs.value_id &&
+         lhs.int_value == rhs.int_value && lhs.float_value == rhs.float_value &&
+         lhs.frame_offset == rhs.frame_offset && lhs.symbol == rhs.symbol;
+}
+
+std::optional<AffineIvExpr> combineAffineAdd(const AffineIvExpr& lhs,
+                                             const AffineIvExpr& rhs) {
+  if (lhs.invariant_scale != 0 && rhs.invariant_scale != 0 &&
+      !sameValueRef(lhs.invariant, rhs.invariant)) {
+    return std::nullopt;
+  }
+  AffineIvExpr result;
+  result.scale = lhs.scale + rhs.scale;
+  result.bias = lhs.bias + rhs.bias;
+  if (lhs.invariant_scale != 0) {
+    result.invariant = lhs.invariant;
+    result.invariant_scale = lhs.invariant_scale;
+  }
+  if (rhs.invariant_scale != 0) {
+    result.invariant = rhs.invariant;
+    result.invariant_scale += rhs.invariant_scale;
+  }
+  return result;
+}
+
+std::optional<AffineIvExpr> combineAffineSub(const AffineIvExpr& lhs,
+                                             const AffineIvExpr& rhs) {
+  if (lhs.invariant_scale != 0 && rhs.invariant_scale != 0 &&
+      !sameValueRef(lhs.invariant, rhs.invariant)) {
+    return std::nullopt;
+  }
+  AffineIvExpr result;
+  result.scale = lhs.scale - rhs.scale;
+  result.bias = lhs.bias - rhs.bias;
+  if (lhs.invariant_scale != 0) {
+    result.invariant = lhs.invariant;
+    result.invariant_scale = lhs.invariant_scale;
+  }
+  if (rhs.invariant_scale != 0) {
+    result.invariant = rhs.invariant;
+    result.invariant_scale -= rhs.invariant_scale;
+  }
+  return result;
+}
+
+std::optional<AffineIvExpr> multiplyAffineByConstant(const AffineIvExpr& expr,
+                                                     int constant) {
+  AffineIvExpr result;
+  result.scale = expr.scale * constant;
+  result.bias = expr.bias * constant;
+  result.invariant = expr.invariant;
+  result.invariant_scale = expr.invariant_scale * constant;
+  return result;
+}
 
 bool loopContainsBlock(const Loop& loop, int blockIndex) {
   return std::find(loop.blocks.begin(), loop.blocks.end(), blockIndex) !=
@@ -75,44 +123,83 @@ bool isParameterValue(const Function& function, int valueId) {
          function.params.end();
 }
 
-int findPointerParamIndex(const Function& function, int valueId) {
-  for (size_t i = 0; i < function.params.size(); ++i) {
-    if (function.params[i] != valueId) continue;
-    if (i >= function.param_types.size()) return -1;
-    if (function.param_types[i] == Type::Ptr()) return static_cast<int>(i);
-    if (i < function.param_is_array.size() && function.param_is_array[i]) {
-      return static_cast<int>(i);
-    }
-    return -1;
+const Instruction* findDefInstruction(const std::vector<int>& defBlock,
+                                      const std::unordered_map<int, Instruction>& defs,
+                                      int valueId, int& blockIndexOut) {
+  if (valueId < 0 || valueId >= static_cast<int>(defBlock.size())) {
+    blockIndexOut = -1;
+    return nullptr;
   }
-  return -1;
+  blockIndexOut = defBlock[valueId];
+  auto it = defs.find(valueId);
+  if (it == defs.end()) return nullptr;
+  return &it->second;
 }
 
-std::vector<int> buildDefBlocks(const Function& function) {
-  std::vector<int> defBlock(function.next_value_id, -1);
-  for (int blockIndex = 0; blockIndex < static_cast<int>(function.blocks.size());
-       ++blockIndex) {
-    for (const auto& inst : function.blocks[blockIndex].instructions) {
-      if (inst.has_result && inst.result_id >= 0 &&
-          inst.result_id < static_cast<int>(defBlock.size())) {
-        defBlock[inst.result_id] = blockIndex;
+UseLists buildUseLists(const Function& function) {
+  UseLists uses(function.next_value_id);
+  for (int blockIndex = 0; blockIndex < static_cast<int>(function.blocks.size()); ++blockIndex) {
+    const auto& block = function.blocks[blockIndex];
+    for (const auto& inst : block.instructions) {
+      for (const auto& operand : inst.operands) {
+        if (!operand.isSSA() || operand.value_id < 0 ||
+            operand.value_id >= static_cast<int>(uses.size())) {
+          continue;
+        }
+        uses[operand.value_id].push_back(blockIndex);
+      }
+      for (const auto& incoming : inst.incomings) {
+        if (!incoming.value.isSSA() || incoming.value.value_id < 0 ||
+            incoming.value.value_id >= static_cast<int>(uses.size())) {
+          continue;
+        }
+        uses[incoming.value.value_id].push_back(blockIndex);
       }
     }
   }
-  return defBlock;
+  return uses;
 }
 
-bool isLoopInvariantValue(const Function& function, const Loop& loop,
-                         const std::vector<int>& defBlock, int valueId,
-                         std::vector<char>& visiting) {
+bool isPreheaderAvailableValue(const Function& function, const Loop& loop,
+                              const std::vector<int>& defBlock,
+                              const DominatorTree& domTree, int valueId) {
   if (valueId < 0 || valueId >= static_cast<int>(defBlock.size())) return false;
   const int blockIndex = defBlock[valueId];
   if (blockIndex < 0) return isParameterValue(function, valueId);
-  if (!loopContainsBlock(loop, blockIndex)) return true;
+  if (loopContainsBlock(loop, blockIndex)) return false;
+  if (loop.header >= 0 && !dominates(domTree, blockIndex, loop.header)) return false;
+  return true;
+}
+
+bool isPreheaderAvailableOperand(const Function& function, const Loop& loop,
+                                const std::vector<int>& defBlock,
+                                const DominatorTree& domTree,
+                                const ValueRef& value) {
+  if (!value.isSSA()) return true;
+  return isPreheaderAvailableValue(function, loop, defBlock, domTree,
+                                   value.value_id);
+}
+
+bool isLoopInvariantValue(const Function& function, const Loop& loop,
+                          const std::vector<int>& defBlock,
+                          const std::unordered_map<int, Instruction>& defs,
+                          int valueId,
+                          std::vector<char>& visiting,
+                          const DominatorTree* domTree = nullptr) {
+  if (valueId < 0 || valueId >= static_cast<int>(defBlock.size())) return false;
+  const int blockIndex = defBlock[valueId];
+  if (blockIndex < 0) return isParameterValue(function, valueId);
+  if (!loopContainsBlock(loop, blockIndex)) {
+    if (domTree != nullptr && loop.header >= 0 &&
+        !dominates(*domTree, blockIndex, loop.header)) {
+      return false;
+    }
+    return true;
+  }
   if (visiting[valueId]) return false;
 
   int defBlockIndex = -1;
-  const Instruction* def = findDefInstruction(function, valueId, defBlockIndex);
+  const Instruction* def = findDefInstruction(defBlock, defs, valueId, defBlockIndex);
   if (def == nullptr) return false;
   switch (def->kind) {
     case InstKind::Binary:
@@ -126,56 +213,14 @@ bool isLoopInvariantValue(const Function& function, const Loop& loop,
   visiting[valueId] = 1;
   for (const auto& operand : def->operands) {
     if (!operand.isSSA()) continue;
-    if (!isLoopInvariantValue(function, loop, defBlock, operand.value_id, visiting)) {
+    if (!isLoopInvariantValue(function, loop, defBlock, defs, operand.value_id,
+                              visiting, domTree)) {
       visiting[valueId] = 0;
       return false;
     }
   }
   visiting[valueId] = 0;
   return true;
-}
-
-bool isLoopInvariantOperand(const Function& function, const Loop& loop,
-                            const std::vector<int>& defBlock,
-                            const ValueRef& value) {
-  if (!value.isSSA()) return true;
-  std::vector<char> visiting(function.next_value_id, 0);
-  return isLoopInvariantValue(function, loop, defBlock, value.value_id, visiting);
-}
-
-const Instruction* findDefInstruction(const Function& function, int valueId,
-                                      int& blockIndexOut) {
-  for (int blockIndex = 0; blockIndex < static_cast<int>(function.blocks.size());
-       ++blockIndex) {
-    for (const auto& inst : function.blocks[blockIndex].instructions) {
-      if (inst.has_result && inst.result_id == valueId) {
-        blockIndexOut = blockIndex;
-        return &inst;
-      }
-    }
-  }
-  blockIndexOut = -1;
-  return nullptr;
-}
-
-ValueRef resolveTrivialCopies(const Function& function, ValueRef value,
-                              int& blockIndexOut,
-                              const Instruction*& defInstOut) {
-  blockIndexOut = -1;
-  defInstOut = nullptr;
-  while (value.isSSA()) {
-    int currentBlock = -1;
-    const Instruction* defInst =
-        findDefInstruction(function, value.value_id, currentBlock);
-    if (defInst == nullptr) break;
-    if (defInst->kind != InstKind::Copy || defInst->operands.size() != 1) {
-      blockIndexOut = currentBlock;
-      defInstOut = defInst;
-      return value;
-    }
-    value = defInst->operands[0];
-  }
-  return value;
 }
 
 Instruction makeBinaryInstruction(Type resultType, ir::BinaryOp op, Type operandType,
@@ -192,8 +237,6 @@ Instruction makeBinaryInstruction(Type resultType, ir::BinaryOp op, Type operand
   return inst;
 }
 
-
-
 int firstNonPhiIndex(const BasicBlock& block) {
   int index = 0;
   while (index < static_cast<int>(block.instructions.size()) &&
@@ -201,167 +244,6 @@ int firstNonPhiIndex(const BasicBlock& block) {
     ++index;
   }
   return index;
-}
-
-std::optional<int> matchInductionStep(const Instruction& updateInst, int phiValue) {
-  if (updateInst.kind != InstKind::Binary || !updateInst.has_result ||
-      updateInst.operands.size() != 2 || updateInst.operand_type != Type::I32() ||
-      updateInst.result_type != Type::I32()) {
-    return std::nullopt;
-  }
-
-  if (updateInst.binary_op == ir::BinaryOp::Add) {
-    if (updateInst.operands[0].isSSA() && updateInst.operands[0].value_id == phiValue) {
-      return getConstantInt(updateInst.operands[1]);
-    }
-    if (updateInst.operands[1].isSSA() && updateInst.operands[1].value_id == phiValue) {
-      return getConstantInt(updateInst.operands[0]);
-    }
-    return std::nullopt;
-  }
-
-  if (updateInst.binary_op == ir::BinaryOp::Sub) {
-    if (!(updateInst.operands[0].isSSA() && updateInst.operands[0].value_id == phiValue)) {
-      return std::nullopt;
-    }
-    auto constant = getConstantInt(updateInst.operands[1]);
-    if (!constant.has_value()) return std::nullopt;
-    return -*constant;
-  }
-
-  return std::nullopt;
-}
-
-std::optional<int> matchInductionStepForIncoming(const Function& function,
-                                                 const Loop& loop, int phiValue,
-                                                 const ValueRef& incomingValue,
-                                                 int incomingPred,
-                                                 std::vector<char>& visiting) {
-  if (!incomingValue.isSSA()) return std::nullopt;
-
-  int updateBlock = -1;
-  const Instruction* updateInst = nullptr;
-  ValueRef updateValue =
-      resolveTrivialCopies(function, incomingValue, updateBlock, updateInst);
-  if (!updateValue.isSSA() || updateInst == nullptr || updateBlock != incomingPred) {
-    return std::nullopt;
-  }
-
-  if (auto step = matchInductionStep(*updateInst, phiValue); step.has_value()) {
-    return step;
-  }
-
-  if (updateInst->kind != InstKind::Phi || updateInst->result_id < 0 ||
-      updateInst->result_id >= static_cast<int>(visiting.size())) {
-    return std::nullopt;
-  }
-  if (visiting[updateInst->result_id]) return std::nullopt;
-
-  visiting[updateInst->result_id] = 1;
-  std::optional<int> mergedStep;
-  for (const auto& incoming : updateInst->incomings) {
-    if (!loopContainsBlock(loop, incoming.pred_block)) {
-      visiting[updateInst->result_id] = 0;
-      return std::nullopt;
-    }
-    auto step = matchInductionStepForIncoming(function, loop, phiValue,
-                                              incoming.value, incoming.pred_block,
-                                              visiting);
-    if (!step.has_value()) {
-      visiting[updateInst->result_id] = 0;
-      return std::nullopt;
-    }
-    if (!mergedStep.has_value()) {
-      mergedStep = step;
-    } else if (*mergedStep != *step) {
-      visiting[updateInst->result_id] = 0;
-      return std::nullopt;
-    }
-  }
-  visiting[updateInst->result_id] = 0;
-  return mergedStep;
-}
-
-std::optional<InductionVariableInfo> matchInductionVariable(const Function& function,
-                                                            const Loop& loop) {
-  const int preheader = getLoopPreheader(function, loop);
-  if (preheader < 0) return std::nullopt;
-  const auto& header = function.blocks[loop.header];
-
-  for (const auto& inst : header.instructions) {
-    if (inst.kind != InstKind::Phi) break;
-    if (!inst.has_result || inst.result_id < 0 || inst.result_type != Type::I32()) {
-      continue;
-    }
-
-    const PhiIncoming* initIncoming = nullptr;
-    std::vector<int> latchBlocks;
-    int canonicalUpdateResult = -1;
-    std::optional<int> canonicalStep;
-    bool valid = true;
-    std::vector<char> visiting(function.next_value_id, 0);
-
-    for (const auto& incoming : inst.incomings) {
-      if (incoming.pred_block == preheader) {
-        if (initIncoming != nullptr) {
-          valid = false;
-          break;
-        }
-        initIncoming = &incoming;
-        continue;
-      }
-
-      if (!incoming.value.isSSA()) {
-        valid = false;
-        break;
-      }
-
-      int updateBlock = -1;
-      const Instruction* updateInst = nullptr;
-      ValueRef updateValue =
-          resolveTrivialCopies(function, incoming.value, updateBlock, updateInst);
-      if (!updateValue.isSSA() || updateInst == nullptr ||
-          updateBlock != incoming.pred_block) {
-        valid = false;
-        break;
-      }
-
-      auto step = matchInductionStepForIncoming(function, loop, inst.result_id,
-                                                incoming.value, incoming.pred_block,
-                                                visiting);
-      if (!step.has_value()) {
-        valid = false;
-        break;
-      }
-
-      if (!canonicalStep.has_value()) {
-        canonicalStep = step;
-        canonicalUpdateResult = updateInst->result_id;
-      } else if (*canonicalStep != *step) {
-        valid = false;
-        break;
-      }
-      latchBlocks.push_back(incoming.pred_block);
-    }
-
-    if (!valid || initIncoming == nullptr || latchBlocks.empty() ||
-        !canonicalStep.has_value() || *canonicalStep == 0) {
-      continue;
-    }
-
-    int canonicalLatch = latchBlocks.front();
-    if (std::find(loop.latches.begin(), loop.latches.end(), canonicalLatch) ==
-        loop.latches.end()) {
-      canonicalLatch = loop.latches.empty() ? canonicalLatch : loop.latches.front();
-    }
-
-    return InductionVariableInfo{inst.result_id,        preheader,
-                                 loop.header,           canonicalLatch,
-                                 canonicalUpdateResult, *canonicalStep,
-                                 initIncoming->value,   latchBlocks};
-  }
-
-  return std::nullopt;
 }
 
 void rewriteAsIvPlusConstant(Instruction& inst, int baseValue, int delta) {
@@ -381,7 +263,7 @@ void rewriteAsIvPlusConstant(Instruction& inst, int baseValue, int delta) {
 }
 
 bool simplifyDerivedUsers(Function& function, const Loop& loop,
-                          const InductionVariableInfo& info) {
+                          const CanonicalInductionVariable& info) {
   bool changed = false;
 
   for (int blockIndex : loop.blocks) {
@@ -450,7 +332,8 @@ bool simplifyDerivedUsers(Function& function, const Loop& loop,
 }
 
 MemoryBaseKey analyzeMemoryBase(const Function& function, const ValueRef& value,
-                               const std::vector<int>& defBlock) {
+                               const std::vector<int>& defBlock,
+                               const std::unordered_map<int, Instruction>& defs) {
   MemoryBaseKey key;
   switch (value.kind) {
     case ValueRef::Kind::GlobalSymbol:
@@ -484,7 +367,7 @@ MemoryBaseKey analyzeMemoryBase(const Function& function, const ValueRef& value,
   }
 
   int blockIndex = -1;
-  const Instruction* def = findDefInstruction(function, value.value_id, blockIndex);
+  const Instruction* def = findDefInstruction(defBlock, defs, value.value_id, blockIndex);
   if (def == nullptr || def->kind != InstKind::Binary || def->operands.size() != 2) {
     key.kind = MemoryBaseKey::Kind::Unknown;
     return key;
@@ -510,18 +393,25 @@ MemoryBaseKey analyzeMemoryBase(const Function& function, const ValueRef& value,
     key.kind = MemoryBaseKey::Kind::Unknown;
     return key;
   }
-  return analyzeMemoryBase(function, *baseOperand, defBlock);
+  return analyzeMemoryBase(function, *baseOperand, defBlock, defs);
 }
 
 std::optional<AffineIvExpr> matchAffineIvExprImpl(
     const Function& function, const Loop& loop, const std::vector<int>& defBlock,
-    const InductionVariableInfo& info, const ValueRef& value,
-    AffineMatchCache& cache) {
+    const std::unordered_map<int, Instruction>& defs,
+    const CanonicalInductionVariable& info, const DominatorTree& domTree,
+    const ValueRef& value, AffineMatchCache& cache) {
   if (auto constant = getConstantInt(value); constant.has_value()) {
-    return AffineIvExpr{0, *constant};
+    return AffineIvExpr{0, ValueRef::Invalid(), 0, *constant};
   }
-  if (!value.isSSA()) return std::nullopt;
-  if (value.value_id == info.phi_value) return AffineIvExpr{1, 0};
+  if (!value.isSSA()) {
+    if (isPreheaderAvailableOperand(function, loop, defBlock, domTree, value) &&
+        value.type == Type::I32()) {
+      return AffineIvExpr{0, value, 1, 0};
+    }
+    return std::nullopt;
+  }
+  if (value.value_id == info.phi_value) return AffineIvExpr{1, ValueRef::Invalid(), 0, 0};
   if (value.value_id < 0 || value.value_id >= static_cast<int>(cache.values.size())) {
     return std::nullopt;
   }
@@ -529,43 +419,83 @@ std::optional<AffineIvExpr> matchAffineIvExprImpl(
   if (cache.known_miss[value.value_id]) return std::nullopt;
   if (cache.visiting[value.value_id]) return std::nullopt;
 
+  if (isPreheaderAvailableOperand(function, loop, defBlock, domTree, value) &&
+      value.type == Type::I32()) {
+    AffineIvExpr invariantExpr{0, value, 1, 0};
+    cache.values[value.value_id] = invariantExpr;
+    return invariantExpr;
+  }
+
   int defBlockIndex = -1;
-  const Instruction* def = findDefInstruction(function, value.value_id, defBlockIndex);
-  if (def == nullptr || !loopContainsBlock(loop, defBlockIndex) ||
-      def->kind != InstKind::Binary || def->operands.size() != 2 ||
-      def->operand_type != Type::I32() || def->result_type != Type::I32()) {
+  const Instruction* def = findDefInstruction(defBlock, defs, value.value_id, defBlockIndex);
+  if (def == nullptr || !loopContainsBlock(loop, defBlockIndex)) {
     cache.known_miss[value.value_id] = 1;
     return std::nullopt;
   }
 
   cache.visiting[value.value_id] = 1;
-  auto lhs = matchAffineIvExprImpl(function, loop, defBlock, info, def->operands[0], cache);
-  auto rhs = matchAffineIvExprImpl(function, loop, defBlock, info, def->operands[1], cache);
-  cache.visiting[value.value_id] = 0;
-
   std::optional<AffineIvExpr> result;
-  switch (def->binary_op) {
-    case ir::BinaryOp::Add:
-      if (lhs.has_value() && rhs.has_value()) {
-        result = AffineIvExpr{lhs->scale + rhs->scale, lhs->bias + rhs->bias};
+
+  if (def->kind == InstKind::Copy && def->operands.size() == 1 &&
+      def->operand_type == Type::I32() && def->result_type == Type::I32()) {
+    result = matchAffineIvExprImpl(function, loop, defBlock, defs, info, domTree,
+                                   def->operands[0], cache);
+  } else if (def->kind == InstKind::Phi && def->result_type == Type::I32() &&
+             !def->incomings.empty()) {
+    std::optional<AffineIvExpr> merged;
+    bool ok = true;
+    for (const auto& incoming : def->incomings) {
+      auto incomingExpr =
+          matchAffineIvExprImpl(function, loop, defBlock, defs, info, domTree,
+                               incoming.value, cache);
+      if (!incomingExpr.has_value()) {
+        ok = false;
+        break;
       }
-      break;
-    case ir::BinaryOp::Sub:
-      if (lhs.has_value() && rhs.has_value()) {
-        result = AffineIvExpr{lhs->scale - rhs->scale, lhs->bias - rhs->bias};
+      if (!merged.has_value()) {
+        merged = incomingExpr;
+        continue;
       }
-      break;
-    case ir::BinaryOp::Mul:
-      if (lhs.has_value() && lhs->scale == 0 && rhs.has_value()) {
-        result = AffineIvExpr{rhs->scale * lhs->bias, rhs->bias * lhs->bias};
-      } else if (rhs.has_value() && rhs->scale == 0 && lhs.has_value()) {
-        result = AffineIvExpr{lhs->scale * rhs->bias, lhs->bias * rhs->bias};
+      if (merged->scale != incomingExpr->scale ||
+          merged->invariant_scale != incomingExpr->invariant_scale ||
+          merged->bias != incomingExpr->bias ||
+          !sameValueRef(merged->invariant, incomingExpr->invariant)) {
+        ok = false;
+        break;
       }
-      break;
-    default:
-      break;
+    }
+    if (ok) result = merged;
+  } else if (def->kind == InstKind::Binary && def->operands.size() == 2 &&
+             def->operand_type == Type::I32() && def->result_type == Type::I32()) {
+    auto lhs = matchAffineIvExprImpl(function, loop, defBlock, defs, info, domTree,
+                                     def->operands[0], cache);
+    auto rhs = matchAffineIvExprImpl(function, loop, defBlock, defs, info, domTree,
+                                     def->operands[1], cache);
+
+    switch (def->binary_op) {
+      case ir::BinaryOp::Add:
+        if (lhs.has_value() && rhs.has_value()) {
+          result = combineAffineAdd(*lhs, *rhs);
+        }
+        break;
+      case ir::BinaryOp::Sub:
+        if (lhs.has_value() && rhs.has_value()) {
+          result = combineAffineSub(*lhs, *rhs);
+        }
+        break;
+      case ir::BinaryOp::Mul:
+        if (lhs.has_value() && lhs->scale == 0 && rhs.has_value()) {
+          result = multiplyAffineByConstant(*rhs, lhs->bias);
+        } else if (rhs.has_value() && rhs->scale == 0 && lhs.has_value()) {
+          result = multiplyAffineByConstant(*lhs, rhs->bias);
+        }
+        break;
+      default:
+        break;
+    }
   }
 
+  cache.visiting[value.value_id] = 0;
   if (result.has_value()) {
     cache.values[value.value_id] = result;
   } else {
@@ -577,15 +507,19 @@ std::optional<AffineIvExpr> matchAffineIvExprImpl(
 std::optional<AffineIvExpr> matchAffineIvExpr(const Function& function,
                                             const Loop& loop,
                                             const std::vector<int>& defBlock,
-                                            const InductionVariableInfo& info,
+                                            const std::unordered_map<int, Instruction>& defs,
+                                            const CanonicalInductionVariable& info,
+                                            const DominatorTree& domTree,
                                             const ValueRef& value,
                                             AffineMatchCache& cache) {
-  return matchAffineIvExprImpl(function, loop, defBlock, info, value, cache);
+  return matchAffineIvExprImpl(function, loop, defBlock, defs, info, domTree,
+                               value, cache);
 }
 
 std::optional<ValueRef> collectInvariantPointerBase(
     const Function& function, const Loop& loop, const std::vector<int>& defBlock,
-    const ValueRef& value, std::vector<char>& visiting) {
+    const std::unordered_map<int, Instruction>& defs,
+    const DominatorTree& domTree, const ValueRef& value, std::vector<char>& visiting) {
   if (!value.isSSA()) {
     if (value.isPointerLike()) return value;
     return std::nullopt;
@@ -597,20 +531,23 @@ std::optional<ValueRef> collectInvariantPointerBase(
 
   const int blockIndex = defBlock[value.value_id];
   if (blockIndex < 0 || !loopContainsBlock(loop, blockIndex)) {
-    if (value.type == Type::Ptr()) return value;
+    if (value.type == Type::Ptr() &&
+        (blockIndex < 0 || loop.header < 0 || dominates(domTree, blockIndex, loop.header))) {
+      return value;
+    }
     return std::nullopt;
   }
 
   if (value.type == Type::Ptr()) {
     std::vector<char> invariantVisiting(function.next_value_id, 0);
-    if (isLoopInvariantValue(function, loop, defBlock, value.value_id,
-                             invariantVisiting)) {
+    if (isLoopInvariantValue(function, loop, defBlock, defs, value.value_id,
+                             invariantVisiting, &domTree)) {
       return value;
     }
   }
 
   int defBlockIndex = -1;
-  const Instruction* def = findDefInstruction(function, value.value_id, defBlockIndex);
+  const Instruction* def = findDefInstruction(defBlock, defs, value.value_id, defBlockIndex);
   if (def == nullptr || def->kind != InstKind::Binary || def->operands.size() != 2 ||
       def->binary_op != ir::BinaryOp::Add || def->result_type != Type::Ptr()) {
     return std::nullopt;
@@ -618,7 +555,8 @@ std::optional<ValueRef> collectInvariantPointerBase(
 
   visiting[value.value_id] = 1;
   for (const auto& operand : def->operands) {
-    auto base = collectInvariantPointerBase(function, loop, defBlock, operand, visiting);
+    auto base = collectInvariantPointerBase(function, loop, defBlock, defs, domTree,
+                                            operand, visiting);
     if (base.has_value()) {
       visiting[value.value_id] = 0;
       return base;
@@ -630,9 +568,12 @@ std::optional<ValueRef> collectInvariantPointerBase(
 
 std::optional<ValueRef> getInvariantPointerBase(const Function& function, const Loop& loop,
                                                 const std::vector<int>& defBlock,
+                                                const std::unordered_map<int, Instruction>& defs,
+                                                const DominatorTree& domTree,
                                                 const ValueRef& value) {
   std::vector<char> visiting(function.next_value_id, 0);
-  return collectInvariantPointerBase(function, loop, defBlock, value, visiting);
+  return collectInvariantPointerBase(function, loop, defBlock, defs, domTree,
+                                     value, visiting);
 }
 
 bool loopTreeContainsBlock(const LoopInfo& loopInfo, int loopIndex, int blockIndex) {
@@ -650,24 +591,13 @@ bool loopTreeContainsBlock(const LoopInfo& loopInfo, int loopIndex, int blockInd
   return false;
 }
 
-bool allUsesStayInsideLoopTree(const Function& function, const LoopInfo& loopInfo,
+bool allUsesStayInsideLoopTree(const UseLists& uses,
+                               const LoopInfo& loopInfo,
                                int currentLoopIndex, int valueId) {
-  for (int blockIndex = 0; blockIndex < static_cast<int>(function.blocks.size());
-       ++blockIndex) {
-    const auto& block = function.blocks[blockIndex];
-    for (const auto& inst : block.instructions) {
-      for (const auto& operand : inst.operands) {
-        if (!(operand.isSSA() && operand.value_id == valueId)) continue;
-        if (!loopTreeContainsBlock(loopInfo, currentLoopIndex, blockIndex)) {
-          return false;
-        }
-      }
-      for (const auto& incoming : inst.incomings) {
-        if (!(incoming.value.isSSA() && incoming.value.value_id == valueId)) continue;
-        if (!loopTreeContainsBlock(loopInfo, currentLoopIndex, blockIndex)) {
-          return false;
-        }
-      }
+  if (valueId < 0 || valueId >= static_cast<int>(uses.size())) return false;
+  for (int blockIndex : uses[valueId]) {
+    if (!loopTreeContainsBlock(loopInfo, currentLoopIndex, blockIndex)) {
+      return false;
     }
   }
   return true;
@@ -675,8 +605,9 @@ bool allUsesStayInsideLoopTree(const Function& function, const LoopInfo& loopInf
 
 std::optional<AddressRecurrenceCandidate> matchAddressRecurrenceCandidate(
     const Function& function, const Loop& loop, const std::vector<int>& defBlock,
-    const InductionVariableInfo& info, const Instruction& inst,
-    AffineMatchCache& affineCache) {
+    const std::unordered_map<int, Instruction>& defs,
+    const CanonicalInductionVariable& info, const DominatorTree& domTree,
+    const Instruction& inst, AffineMatchCache& affineCache) {
   if (inst.kind != InstKind::Binary || inst.binary_op != ir::BinaryOp::Add ||
       !inst.has_result || inst.result_id < 0 || inst.operands.size() != 2 ||
       inst.result_type != Type::Ptr()) {
@@ -687,18 +618,22 @@ std::optional<AddressRecurrenceCandidate> matchAddressRecurrenceCandidate(
     const ValueRef& base = inst.operands[baseSide];
     const ValueRef& offset = inst.operands[1 - baseSide];
     if (!base.isPointerLike()) continue;
-    if (!isLoopInvariantOperand(function, loop, defBlock, base)) continue;
-    auto invariantBase = getInvariantPointerBase(function, loop, defBlock, base);
+    if (!isPreheaderAvailableOperand(function, loop, defBlock, domTree, base)) continue;
+    auto invariantBase = getInvariantPointerBase(function, loop, defBlock, defs,
+                                                 domTree, base);
     if (!invariantBase.has_value()) continue;
-    if (!analyzeMemoryBase(function, *invariantBase, defBlock).isIdentifiable()) {
+    if (!analyzeMemoryBase(function, *invariantBase, defBlock, defs).isIdentifiable()) {
       continue;
     }
-    auto affine = matchAffineIvExpr(function, loop, defBlock, info, offset, affineCache);
+    auto affine = matchAffineIvExpr(function, loop, defBlock, defs, info, domTree,
+                                     offset, affineCache);
     if (!affine.has_value() || affine->scale == 0) continue;
     return AddressRecurrenceCandidate{inst.result_id,
                                       inst.result_type,
                                       inst.operand_type,
                                       *invariantBase,
+                                      affine->invariant,
+                                      affine->invariant_scale,
                                       affine->scale,
                                       affine->bias};
   }
@@ -709,43 +644,59 @@ std::optional<AddressRecurrenceCandidate> matchAddressRecurrenceCandidate(
 ValueRef materializeInitialAddress(Function& function, int preheaderBlock,
                                    int& insertIndex,
                                    const AddressRecurrenceCandidate& candidate,
-                                   const InductionVariableInfo& info) {
-  if (auto initInt = getConstantInt(info.init_value); initInt.has_value()) {
-    const int initialDelta = (*initInt) * candidate.stride + candidate.bias;
-    if (initialDelta == 0) return candidate.invariant_base;
-
-    const int initId = function.newValue(candidate.result_type);
-    Instruction initAdd = makeBinaryInstruction(
-        candidate.result_type, ir::BinaryOp::Add, candidate.operand_type, initId,
-        candidate.invariant_base, ValueRef::ImmediateInt(initialDelta));
-    auto& preheaderInsts = function.blocks[preheaderBlock].instructions;
-    preheaderInsts.insert(preheaderInsts.begin() + insertIndex, std::move(initAdd));
-    ++insertIndex;
-    return ValueRef::SSA(initId, candidate.result_type);
-  }
-
-  ValueRef scaledInit = info.init_value;
+                                   const CanonicalInductionVariable& info) {
+  ValueRef totalOffset = info.init_value;
   if (candidate.stride != 1) {
     const int scaleId = function.newValue(Type::I32());
     Instruction scaleInst =
         makeBinaryInstruction(Type::I32(), ir::BinaryOp::Mul, Type::I32(), scaleId,
-                              info.init_value, ValueRef::ImmediateInt(candidate.stride));
+                              totalOffset, ValueRef::ImmediateInt(candidate.stride));
     auto& preheaderInsts = function.blocks[preheaderBlock].instructions;
     preheaderInsts.insert(preheaderInsts.begin() + insertIndex, std::move(scaleInst));
     ++insertIndex;
-    scaledInit = ValueRef::SSA(scaleId, Type::I32());
+    totalOffset = ValueRef::SSA(scaleId, Type::I32());
   }
 
-  ValueRef totalOffset = scaledInit;
+  if (candidate.invariant_offset_scale != 0 && candidate.invariant_offset.isValid()) {
+    ValueRef scaledInvariant = candidate.invariant_offset;
+    if (candidate.invariant_offset_scale != 1) {
+      const int invariantScaleId = function.newValue(Type::I32());
+      Instruction invariantScaleInst = makeBinaryInstruction(
+          Type::I32(), ir::BinaryOp::Mul, Type::I32(), invariantScaleId,
+          candidate.invariant_offset,
+          ValueRef::ImmediateInt(candidate.invariant_offset_scale));
+      auto& preheaderInsts = function.blocks[preheaderBlock].instructions;
+      preheaderInsts.insert(preheaderInsts.begin() + insertIndex,
+                            std::move(invariantScaleInst));
+      ++insertIndex;
+      scaledInvariant = ValueRef::SSA(invariantScaleId, Type::I32());
+    }
+
+    const int invariantAddId = function.newValue(Type::I32());
+    Instruction invariantAdd = makeBinaryInstruction(
+        Type::I32(), ir::BinaryOp::Add, Type::I32(), invariantAddId, totalOffset,
+        scaledInvariant);
+    auto& preheaderInsts = function.blocks[preheaderBlock].instructions;
+    preheaderInsts.insert(preheaderInsts.begin() + insertIndex, std::move(invariantAdd));
+    ++insertIndex;
+    totalOffset = ValueRef::SSA(invariantAddId, Type::I32());
+  }
+
   if (candidate.bias != 0) {
     const int biasId = function.newValue(Type::I32());
     Instruction biasInst = makeBinaryInstruction(
-        Type::I32(), ir::BinaryOp::Add, Type::I32(), biasId, scaledInit,
+        Type::I32(), ir::BinaryOp::Add, Type::I32(), biasId, totalOffset,
         ValueRef::ImmediateInt(candidate.bias));
     auto& preheaderInsts = function.blocks[preheaderBlock].instructions;
     preheaderInsts.insert(preheaderInsts.begin() + insertIndex, std::move(biasInst));
     ++insertIndex;
     totalOffset = ValueRef::SSA(biasId, Type::I32());
+  }
+
+  if (auto initInt = getConstantInt(info.init_value); initInt.has_value() &&
+      candidate.invariant_offset_scale == 0) {
+    const int initialDelta = (*initInt) * candidate.stride + candidate.bias;
+    if (initialDelta == 0) return candidate.invariant_base;
   }
 
   const int initId = function.newValue(candidate.result_type);
@@ -775,9 +726,12 @@ ValueRef materializeStepAddress(Function& function, int latchBlock, int& insertI
 }
 
 bool rewriteAddressRecurrences(Function& function, const Loop& loop,
-                               const InductionVariableInfo& info,
-                               const LoopInfo& loopInfo) {
-  const std::vector<int> defBlock = buildDefBlocks(function);
+                               const std::vector<int>& defBlock,
+                               const std::unordered_map<int, Instruction>& defs,
+                               const CanonicalInductionVariable& info,
+                               const DominatorTree& domTree,
+                               const LoopInfo& loopInfo,
+                               const UseLists& uses) {
   std::vector<AddressRecurrenceCandidate> candidates;
   const int currentLoopIndex =
       loop.header >= 0 && loop.header < static_cast<int>(loopInfo.block_loop.size())
@@ -791,10 +745,10 @@ bool rewriteAddressRecurrences(Function& function, const Loop& loop,
   for (int blockIndex : loop.blocks) {
     const auto& block = function.blocks[blockIndex];
     for (const auto& inst : block.instructions) {
-      auto candidate = matchAddressRecurrenceCandidate(function, loop, defBlock, info,
-                                                       inst, affineCache);
+      auto candidate = matchAddressRecurrenceCandidate(function, loop, defBlock, defs,
+                                                       info, domTree, inst, affineCache);
       if (!candidate.has_value()) continue;
-      if (!allUsesStayInsideLoopTree(function, loopInfo, currentLoopIndex,
+      if (!allUsesStayInsideLoopTree(uses, loopInfo, currentLoopIndex,
                                      candidate->address_result)) {
         continue;
       }
@@ -896,6 +850,10 @@ PassResult IndVarSimplifyPass::run(Function& function,
                                    AnalysisManager& analysisManager) {
   rebuildEdges(function);
   const LoopInfo& loopInfo = analysisManager.getLoopInfo(function);
+  const DominatorTree& domTree = analysisManager.getDominatorTree(function);
+  const UseLists uses = buildUseLists(function);
+  const std::vector<int> defBlock = buildDefBlocks(function);
+  const std::unordered_map<int, Instruction> defs = buildInstructionDefs(function);
 
   std::vector<int> order(loopInfo.loops.size());
   std::iota(order.begin(), order.end(), 0);
@@ -906,12 +864,13 @@ PassResult IndVarSimplifyPass::run(Function& function,
   bool changed = false;
   for (int loopIndex : order) {
     const Loop& loop = loopInfo.loops[loopIndex];
-    auto info = matchInductionVariable(function, loop);
+    auto info = matchCanonicalInductionVariable(function, loop);
     if (!info.has_value()) continue;
     bool loopChanged = false;
     loopChanged = simplifyDerivedUsers(function, loop, *info) || loopChanged;
     loopChanged =
-        rewriteAddressRecurrences(function, loop, *info, loopInfo) || loopChanged;
+        rewriteAddressRecurrences(function, loop, defBlock, defs, *info, domTree,
+                                  loopInfo, uses) || loopChanged;
     changed = loopChanged || changed;
   }
 

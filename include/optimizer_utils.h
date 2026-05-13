@@ -2,9 +2,10 @@
 #define OPTIMIZER_UTILS_H
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
-#include "midir.h"
+#include "analysis.h"
 
 namespace midir {
 
@@ -16,6 +17,16 @@ bool isValidCopyTypes(Type dst, Type src);
 bool isCommutativeBinaryOp(ir::BinaryOp op);
 bool hasSideEffects(const Instruction& inst);
 bool isPureComputingInstruction(const Instruction& inst);
+bool isTrackableLocation(const MemoryLocation& location);
+std::string valueIdentityKey(const ValueRef& value);
+std::string aliasClassKey(const MemoryLocation& location);
+std::vector<std::string> affectedAliasClassKeys(const MemoryLocation& location);
+int currentAliasVersion(const std::unordered_map<std::string, int>& aliasVersions,
+                        const MemoryLocation& location);
+void bumpAliasVersions(std::unordered_map<std::string, int>& aliasVersions,
+                       const MemoryLocation& location);
+std::string memoryAccessKey(const ValueRef& addr, const MemoryLocation& location,
+                            Type accessType);
 
 void validateValueRefShape(const Function& function, const ValueRef& value,
                            const std::string& context);
