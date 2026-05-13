@@ -205,12 +205,15 @@ int main(int argc, char** argv) {
       passManager.addFunctionPass(std::make_unique<midir::GVNPass>());
       passManager.addFunctionPass(std::make_unique<midir::EarlyCSEPass>());
       passManager.addFunctionPass(std::make_unique<midir::DSEPass>());
+      passManager.addFunctionPass(std::make_unique<midir::DeadLoadElimPass>());
       passManager.addFunctionPass(std::make_unique<midir::ADCEPass>());
+      passManager.addFunctionPass(std::make_unique<midir::GCMPass>());
       passManager.addFunctionPass(std::make_unique<midir::SimplifyCFGPass>());
       passManager.addFunctionPass(std::make_unique<midir::InstCombinePass>());
       passManager.addFunctionPass(std::make_unique<midir::GVNPass>());
       passManager.addFunctionPass(std::make_unique<midir::EarlyCSEPass>());
       passManager.addFunctionPass(std::make_unique<midir::DSEPass>());
+      passManager.addFunctionPass(std::make_unique<midir::DeadLoadElimPass>());
       passManager.addFunctionPass(std::make_unique<midir::ADCEPass>());
       passManager.addFunctionPass(std::make_unique<midir::SimplifyCFGPass>());
       passManager.addFunctionPass(std::make_unique<midir::InstCombinePass>());

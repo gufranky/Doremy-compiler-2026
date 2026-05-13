@@ -86,6 +86,12 @@ class LICMPass : public FunctionPass {
   PassResult run(Function& function, AnalysisManager& analysisManager) override;
 };
 
+class GCMPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
 class IndVarSimplifyPass : public FunctionPass {
  public:
   std::string name() const override;
@@ -116,6 +122,12 @@ class EarlyCSEPass : public FunctionPass {
 };
 
 class DSEPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
+class DeadLoadElimPass : public FunctionPass {
  public:
   std::string name() const override;
   PassResult run(Function& function, AnalysisManager& analysisManager) override;
