@@ -3,7 +3,9 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <queue>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "ast.h"
@@ -92,6 +94,47 @@ bool parseCommandLine(int argc, char** argv, CommandLineOptions& options) {
   return true;
 }
 
+void removeUnusedFunctions(midir::Module& module) {
+  if (module.functions.empty()) return;
+
+  std::unordered_map<std::string, int> functionIndexByName;
+  functionIndexByName.reserve(module.functions.size());
+  for (int i = 0; i < static_cast<int>(module.functions.size()); ++i) {
+    functionIndexByName[module.functions[i].name] = i;
+  }
+
+  auto entryIt = functionIndexByName.find("main");
+  if (entryIt == functionIndexByName.end()) return;
+
+  std::vector<char> reachable(module.functions.size(), 0);
+  std::queue<int> worklist;
+  reachable[entryIt->second] = 1;
+  worklist.push(entryIt->second);
+
+  while (!worklist.empty()) {
+    const int functionIndex = worklist.front();
+    worklist.pop();
+    const auto& function = module.functions[functionIndex];
+    for (const auto& block : function.blocks) {
+      for (const auto& inst : block.instructions) {
+        if (inst.kind != midir::InstKind::Call) continue;
+        auto calleeIt = functionIndexByName.find(inst.callee);
+        if (calleeIt == functionIndexByName.end()) continue;
+        if (reachable[calleeIt->second]) continue;
+        reachable[calleeIt->second] = 1;
+        worklist.push(calleeIt->second);
+      }
+    }
+  }
+
+  std::vector<midir::Function> keptFunctions;
+  keptFunctions.reserve(module.functions.size());
+  for (int i = 0; i < static_cast<int>(module.functions.size()); ++i) {
+    if (reachable[i]) keptFunctions.push_back(std::move(module.functions[i]));
+  }
+  module.functions = std::move(keptFunctions);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -129,7 +172,7 @@ int main(int argc, char** argv) {
     midir::MidIRBuilder midirBuilder;
     midir::Module midirModule = midirBuilder.build(root);
 
-    if (options.midirBuildOnly || options.stopAfterSSA) {
+    if (options.midirBuildOnly) {
       std::ofstream output(options.outputFile, std::ios::binary);
       if (!output) {
         std::cerr << "Error: Cannot open output file " << options.outputFile
@@ -145,16 +188,35 @@ int main(int argc, char** argv) {
     if (!options.lowerOnly) {
       midir::PassManager passManager;
       passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
+      passManager.addFunctionPass(std::make_unique<midir::InlinePass>(&midirModule));
+      passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
       passManager.addFunctionPass(std::make_unique<midir::SimplifyCFGPass>());
+      passManager.addFunctionPass(std::make_unique<midir::LoopSimplifyPass>());
+      passManager.addFunctionPass(std::make_unique<midir::LoopRotatePass>());
       passManager.addFunctionPass(std::make_unique<midir::LoopSimplifyPass>());
       passManager.addFunctionPass(std::make_unique<midir::LCSSAPass>());
       passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
       passManager.addFunctionPass(std::make_unique<midir::LICMPass>());
       passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
       passManager.addFunctionPass(std::make_unique<midir::IndVarSimplifyPass>());
+      passManager.addFunctionPass(std::make_unique<midir::SimpleLoopUnrollPass>());
       passManager.addFunctionPass(std::make_unique<midir::InstCombinePass>());
+      passManager.addFunctionPass(std::make_unique<midir::ConstDivRemPass>(&midirModule));
+      passManager.addFunctionPass(std::make_unique<midir::GVNPass>());
       passManager.addFunctionPass(std::make_unique<midir::EarlyCSEPass>());
+      passManager.addFunctionPass(std::make_unique<midir::DSEPass>());
+      passManager.addFunctionPass(std::make_unique<midir::DeadLoadElimPass>());
       passManager.addFunctionPass(std::make_unique<midir::ADCEPass>());
+      passManager.addFunctionPass(std::make_unique<midir::GCMPass>());
+      passManager.addFunctionPass(std::make_unique<midir::SimplifyCFGPass>());
+      passManager.addFunctionPass(std::make_unique<midir::InstCombinePass>());
+      passManager.addFunctionPass(std::make_unique<midir::GVNPass>());
+      passManager.addFunctionPass(std::make_unique<midir::EarlyCSEPass>());
+      passManager.addFunctionPass(std::make_unique<midir::DSEPass>());
+      passManager.addFunctionPass(std::make_unique<midir::DeadLoadElimPass>());
+      passManager.addFunctionPass(std::make_unique<midir::ADCEPass>());
+      passManager.addFunctionPass(std::make_unique<midir::SimplifyCFGPass>());
+      passManager.addFunctionPass(std::make_unique<midir::InstCombinePass>());
       passManager.addFunctionPass(std::make_unique<midir::VerifySSAPass>());
       try {
         passManager.run(midirModule);
@@ -163,6 +225,20 @@ int main(int argc, char** argv) {
         delete root;
         return 1;
       }
+      removeUnusedFunctions(midirModule);
+    }
+
+    if (options.stopAfterSSA) {
+      std::ofstream output(options.outputFile, std::ios::binary);
+      if (!output) {
+        std::cerr << "Error: Cannot open output file " << options.outputFile
+                  << "\n";
+        delete root;
+        return 1;
+      }
+      output << midir::dumpModule(midirModule);
+      delete root;
+      return 0;
     }
 
     midir::LowerMidIR lowerMidIR;

@@ -39,6 +39,17 @@ class VerifySSAPass : public FunctionPass {
   PassResult run(Function& function, AnalysisManager& analysisManager) override;
 };
 
+class InlinePass : public FunctionPass {
+ public:
+  explicit InlinePass(Module* module) : module_(module) {}
+
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+
+ private:
+  Module* module_ = nullptr;
+};
+
 class SimplifyCFGPass : public FunctionPass {
  public:
   std::string name() const override;
@@ -46,6 +57,18 @@ class SimplifyCFGPass : public FunctionPass {
 };
 
 class LoopSimplifyPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
+class LoopRotatePass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
+class SimpleLoopUnrollPass : public FunctionPass {
  public:
   std::string name() const override;
   PassResult run(Function& function, AnalysisManager& analysisManager) override;
@@ -63,6 +86,12 @@ class LICMPass : public FunctionPass {
   PassResult run(Function& function, AnalysisManager& analysisManager) override;
 };
 
+class GCMPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
 class IndVarSimplifyPass : public FunctionPass {
  public:
   std::string name() const override;
@@ -75,7 +104,36 @@ class InstCombinePass : public FunctionPass {
   PassResult run(Function& function, AnalysisManager& analysisManager) override;
 };
 
+class ConstDivRemPass : public FunctionPass {
+ public:
+  explicit ConstDivRemPass(Module* module) : module_(module) {}
+
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+
+ private:
+  Module* module_ = nullptr;
+};
+
 class EarlyCSEPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
+class DSEPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
+class DeadLoadElimPass : public FunctionPass {
+ public:
+  std::string name() const override;
+  PassResult run(Function& function, AnalysisManager& analysisManager) override;
+};
+
+class GVNPass : public FunctionPass {
  public:
   std::string name() const override;
   PassResult run(Function& function, AnalysisManager& analysisManager) override;

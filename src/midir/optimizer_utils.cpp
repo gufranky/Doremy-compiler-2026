@@ -43,6 +43,119 @@ bool isPureComputingInstruction(const Instruction& inst) {
          inst.kind == InstKind::Load;
 }
 
+bool isTrackableLocation(const MemoryLocation& location) {
+  return location.isIdentifiable() && location.access_size > 0;
+}
+
+std::string valueIdentityKey(const ValueRef& value) {
+  switch (value.kind) {
+    case ValueRef::Kind::SSA:
+      return "s" + std::to_string(value.value_id) + ":" +
+             std::to_string(static_cast<int>(value.type.kind));
+    case ValueRef::Kind::ImmediateInt:
+      return "i" + std::to_string(value.int_value);
+    case ValueRef::Kind::ImmediateFloat:
+      return "f" + std::to_string(value.float_value);
+    case ValueRef::Kind::GlobalSymbol:
+      return "g" + value.symbol;
+    case ValueRef::Kind::FrameAddress:
+      return "fa" + std::to_string(value.frame_offset);
+    case ValueRef::Kind::StackPointer:
+      return "sp";
+    case ValueRef::Kind::Undef:
+      return "u" + std::to_string(static_cast<int>(value.type.kind));
+    case ValueRef::Kind::Invalid:
+      return "invalid";
+  }
+  return "invalid";
+}
+
+std::string aliasClassKey(const MemoryLocation& location) {
+  if (!isTrackableLocation(location)) return {};
+  switch (location.base_kind) {
+    case MemoryLocation::BaseKind::Global:
+      return "g:" + location.symbol;
+    case MemoryLocation::BaseKind::Frame:
+      return "f:" + std::to_string(location.frame_offset);
+    case MemoryLocation::BaseKind::Stack:
+      return "sp";
+    case MemoryLocation::BaseKind::Param:
+      return "p:" + std::to_string(location.param_index);
+    case MemoryLocation::BaseKind::Invalid:
+    case MemoryLocation::BaseKind::Unknown:
+      return {};
+  }
+  return {};
+}
+
+std::vector<std::string> affectedAliasClassKeys(const MemoryLocation& location) {
+  std::vector<std::string> keys;
+  if (!isTrackableLocation(location)) return keys;
+
+  const std::string current = aliasClassKey(location);
+  switch (location.base_kind) {
+    case MemoryLocation::BaseKind::Global:
+    case MemoryLocation::BaseKind::Frame:
+      if (!current.empty()) keys.push_back(current);
+      break;
+    case MemoryLocation::BaseKind::Stack:
+      keys.push_back("sp");
+      break;
+    case MemoryLocation::BaseKind::Param:
+      keys.push_back("params");
+      break;
+    case MemoryLocation::BaseKind::Invalid:
+    case MemoryLocation::BaseKind::Unknown:
+      break;
+  }
+  return keys;
+}
+
+int currentAliasVersion(const std::unordered_map<std::string, int>& aliasVersions,
+                        const MemoryLocation& location) {
+  if (!isTrackableLocation(location)) return 0;
+
+  const auto readVersion = [&](const std::string& key) -> int {
+    auto it = aliasVersions.find(key);
+    return it == aliasVersions.end() ? 0 : it->second;
+  };
+
+  switch (location.base_kind) {
+    case MemoryLocation::BaseKind::Global:
+    case MemoryLocation::BaseKind::Frame:
+      return readVersion(aliasClassKey(location));
+    case MemoryLocation::BaseKind::Stack:
+      return readVersion("sp");
+    case MemoryLocation::BaseKind::Param: {
+      const int exact = readVersion(aliasClassKey(location));
+      const int broad = readVersion("params");
+      return std::max(exact, broad);
+    }
+    case MemoryLocation::BaseKind::Invalid:
+    case MemoryLocation::BaseKind::Unknown:
+      return 0;
+  }
+  return 0;
+}
+
+void bumpAliasVersions(std::unordered_map<std::string, int>& aliasVersions,
+                       const MemoryLocation& location) {
+  for (const std::string& key : affectedAliasClassKeys(location)) {
+    ++aliasVersions[key];
+  }
+}
+
+std::string memoryAccessKey(const ValueRef& addr, const MemoryLocation& location,
+                            Type accessType) {
+  if (!isTrackableLocation(location)) return {};
+  std::string key = memoryLocationKey(location);
+  key += ":ty=" + std::to_string(static_cast<int>(accessType.kind));
+  if (!location.offset_known) {
+    key += ":addr=" + valueIdentityKey(addr);
+  }
+  return key;
+}
+
 void validateValueRefShape(const Function& function, const ValueRef& value,
                            const std::string& context) {
   switch (value.kind) {
